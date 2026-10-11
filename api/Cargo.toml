@@ -50,4 +50,4 @@ description = "Stable public contracts for the TinyCortex memory system"
 #   tinymemory-api = { path = "api" }
 #
 # tinymemory's own workspace root carries exactly that.
-tinymemory-api = { git = "https://github.com/tinyhumansai/tinymemory", rev = "4549cda222de3891b95e2fa58e2565bb2c194328" }
+tinymemory-api = { git = "https://github.com/tinyhumansai/tinymemory", rev = "1a03a00c11f68beea63a743bb369d947f98fcde1" }

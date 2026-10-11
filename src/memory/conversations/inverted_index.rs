@@ -228,13 +228,17 @@ impl InvertedIndex {
         if limit == 0 {
             return Vec::new();
         }
-        let query_lower = normalize(query);
-        // Filter terms by raw byte length (matches the historical
-        // 3-byte threshold; single CJK chars are 3 bytes and pass).
-        let terms: Vec<String> = query_lower
+        // Preserve the historical byte threshold before normalization. A
+        // short normalized term such as full-width `ＡＢ` → `ab` has no
+        // trigram postings, so it uses the exact-verification scan just as
+        // the original full-width form did.
+        let terms: Vec<String> = query
             .split_whitespace()
-            .filter(|t| t.len() >= MIN_TERM_BYTES)
-            .map(|s| s.to_string())
+            .filter_map(|term| {
+                let normalized = normalize(term);
+                (term.len() >= MIN_TERM_BYTES || normalized.len() >= MIN_TERM_BYTES)
+                    .then_some(normalized)
+            })
             .collect();
         if terms.is_empty() {
             return Vec::new();

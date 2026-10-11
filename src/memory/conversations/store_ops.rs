@@ -291,18 +291,21 @@ impl ConversationStore {
     /// should treat this as "nothing to truncate", not silently drop the
     /// whole log).
     ///
-    /// Evicts the thread from the cross-thread search index the same way
-    /// [`Self::delete_thread`] does: the index has no per-message removal, so
-    /// the conservative move is to drop the whole thread's postings rather
-    /// than search a stale truncated message back into a hit. The next
-    /// cross-thread search that touches this thread re-primes it from the
-    /// (now-truncated) file on disk.
+    /// Updates the cross-thread search index to retain only the messages that
+    /// remain in the transcript. The index has no per-message removal, so the
+    /// thread's postings are removed and rebuilt from the retained messages.
+    /// The index-build lock prevents a concurrent cold scan from publishing
+    /// the pre-truncation contents after the transcript has been rewritten.
     pub fn delete_messages_from(
         &self,
         thread_id: &str,
         message_id: &str,
     ) -> Result<Option<usize>, String> {
         let _lifecycle = self.locks.lifecycle.read();
+        // Match the cold-prime lock order: index build before thread. This
+        // keeps a scan from publishing messages after their transcript was
+        // truncated, while avoiding a thread -> index-build lock cycle.
+        let _build = self.locks.index_build.lock();
         let thread_lock = self.locks.thread(thread_id);
         let _thread = thread_lock.lock();
         let path = self.thread_messages_path(thread_id);
@@ -313,6 +316,18 @@ impl ConversationStore {
         let removed = messages.len() - cut_at;
         let kept = &messages[..cut_at];
         rewrite_jsonl(&path, kept)?;
+        // The transcript rewrite is durable even if writing its derived stats
+        // fails. Keep a warm search index consistent with that source of truth
+        // before any later fallible operation.
+        {
+            let mut cache = CONVERSATION_INDEX_CACHE.lock();
+            if let Some(idx) = cache.get_mut(&self.root_dir()) {
+                idx.remove_thread(thread_id);
+                for message in kept {
+                    idx.insert(thread_id, message.clone());
+                }
+            }
+        }
         // The compact stat trail in `threads.jsonl` (`MessageAppended`/
         // `Stats`) only ever grows via `append_message`'s increment — it has
         // no notion of a truncation. Append an authoritative `Stats` snapshot
@@ -339,12 +354,6 @@ impl ConversationStore {
                     last_message_at: resolved_last,
                 },
             )?;
-        }
-        {
-            let mut cache = CONVERSATION_INDEX_CACHE.lock();
-            if let Some(idx) = cache.get_mut(&self.root_dir()) {
-                idx.remove_thread(thread_id);
-            }
         }
         Ok(Some(removed))
     }
