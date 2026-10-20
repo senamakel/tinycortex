@@ -26,6 +26,11 @@ use anyhow::Result;
 use async_trait::async_trait;
 use serde::de::DeserializeOwned;
 
+use crate::memory::chunks::collections::{
+    BUFFERS, CHUNK_LIFECYCLE, ENTITY_EDGES, ENTITY_HOTNESS, ENTITY_INDEX, SCORES, SUMMARIES,
+    TREES,
+};
+use crate::memory::chunks::versioned::StateChange;
 use crate::memory::config::MemoryConfig;
 use crate::memory::queue::ops::set_backfill_in_progress;
 use crate::memory::queue::store;
@@ -107,6 +112,74 @@ pub enum ReembedProgress {
     NoProvider,
     /// The active signature changed since this chain started — finish.
     StaleSignature,
+}
+
+/// A supported memory collection that a queue delegate may change as the
+/// result of one job.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JobStateCollection {
+    /// Per-chunk lifecycle status.
+    ChunkLifecycle,
+    /// Chunk admission and extraction scores.
+    ChunkScores,
+    /// Tree roots and scope bindings.
+    Trees,
+    /// Sealed tree summaries.
+    Summaries,
+    /// Mutable tree buffers.
+    TreeBuffers,
+    /// Entity-to-node occurrences.
+    EntityIndex,
+    /// Entity co-occurrence edges.
+    EntityEdges,
+    /// Entity hotness summaries.
+    EntityHotness,
+}
+
+impl JobStateCollection {
+    fn name(self) -> &'static str {
+        match self {
+            Self::ChunkLifecycle => CHUNK_LIFECYCLE,
+            Self::ChunkScores => SCORES,
+            Self::Trees => TREES,
+            Self::Summaries => SUMMARIES,
+            Self::TreeBuffers => BUFFERS,
+            Self::EntityIndex => ENTITY_INDEX,
+            Self::EntityEdges => ENTITY_EDGES,
+            Self::EntityHotness => ENTITY_HOTNESS,
+        }
+    }
+}
+
+/// One domain mutation returned by a compute-only queue delegate.
+#[derive(Clone, Debug, PartialEq)]
+pub struct JobMutation {
+    /// The owner collection changed by the job.
+    pub collection: JobStateCollection,
+    /// Stable logical record key in that collection.
+    pub key: String,
+    /// The replacement record, or `None` to tombstone it.
+    pub value: Option<serde_json::Value>,
+}
+
+impl JobMutation {
+    fn into_state_change(self) -> StateChange {
+        StateChange {
+            collection: self.collection.name().to_owned(),
+            key: self.key,
+            value: self.value,
+        }
+    }
+}
+
+/// A delegate's computed result and the records it wants committed with the
+/// job receipt and follow-up intents.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DelegateOutput<T> {
+    /// Computed decision returned to the handler.
+    pub result: T,
+    /// Domain changes that the queue owner commits under the same head CAS.
+    pub mutations: Vec<JobMutation>,
 }
 
 /// The external, heavy-work seam for the queue handlers. Every method is the
