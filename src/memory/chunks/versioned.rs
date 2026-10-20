@@ -72,6 +72,12 @@ pub(crate) struct StateChange {
     pub(crate) value: Option<Value>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct StateKey {
+    pub(crate) collection: String,
+    pub(crate) key: String,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 struct StateVersion {
     collection: String,
@@ -915,6 +921,29 @@ pub(crate) async fn read_states_async(
         .map_err(anyhow::Error::from)
 }
 
+/// Read state keys spanning collections against one captured owner head.
+pub(crate) async fn read_state_keys_async(
+    config: &MemoryConfig,
+    keys: &[StateKey],
+) -> Result<Vec<Option<Value>>> {
+    let snapshot = capture_head_async(config).await?;
+    let documents = config.storage()?.documents().clone();
+    let keys = keys.to_vec();
+    config
+        .storage_blocking()?
+        .run_async(async move {
+            let mut values = Vec::with_capacity(keys.len());
+            for key in keys {
+                values.push(
+                    read_state_at(&*documents, &snapshot, &key.collection, &key.key).await?,
+                );
+            }
+            Ok::<_, tinystoragedrivers_types::StorageError>(values)
+        })
+        .await?
+        .map_err(anyhow::Error::from)
+}
+
 /// Read multiple state keys against one captured head revision.
 pub(crate) fn read_states(
     config: &MemoryConfig,
@@ -937,6 +966,25 @@ pub(crate) fn read_states(
                 }
             }
             Ok::<_, tinystoragedrivers_types::StorageError>(result)
+        })?
+        .map_err(anyhow::Error::from)
+}
+
+/// Synchronous counterpart of [`read_state_keys_async`].
+pub(crate) fn read_state_keys(config: &MemoryConfig, keys: &[StateKey]) -> Result<Vec<Option<Value>>> {
+    let snapshot = capture_head(config)?;
+    let documents = config.storage()?.documents().clone();
+    let keys = keys.to_vec();
+    config
+        .storage_blocking()?
+        .run(async move {
+            let mut values = Vec::with_capacity(keys.len());
+            for key in keys {
+                values.push(
+                    read_state_at(&*documents, &snapshot, &key.collection, &key.key).await?,
+                );
+            }
+            Ok::<_, tinystoragedrivers_types::StorageError>(values)
         })?
         .map_err(anyhow::Error::from)
 }
