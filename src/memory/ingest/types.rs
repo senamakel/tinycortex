@@ -4,7 +4,6 @@
 use crate::memory::chunks::RawRef;
 use crate::memory::config::MemoryConfig;
 use anyhow::Result;
-use tinystoragedrivers_types::NewMessage;
 
 /// Durable queue intent included in the owner-scoped ingest commit.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -72,10 +71,11 @@ impl TreeJobSink for NullJobSink {
     }
 }
 
-/// Production sink backed by the host's scoped durable queue.
+/// Production sink backed by the versioned owner queue.
 ///
-/// Publication requires the queue's dedupe feature so replaying an outbox
-/// intent after a lost acknowledgement cannot enqueue a second active hint.
+/// The owner job record is authoritative; the host queue receives only its
+/// repairable `job_id` hint. Stable intent ids make outbox replay idempotent
+/// without requiring the host queue to implement deduplication.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct QueueJobSink;
 
@@ -88,27 +88,22 @@ impl TreeJobSink for QueueJobSink {
         chunk_id: &str,
         default_max_attempts: u32,
     ) -> Result<QueuePublication> {
-        let payload = serde_json::json!({
-            "kind": crate::memory::queue::types::JobKind::ExtractChunk.as_str(),
-            "chunk_id": chunk_id,
-            "max_attempts": default_max_attempts,
-        });
-        let message = NewMessage::new(payload).dedupe_key(intent_id.to_owned());
-        let queues = config.storage()?.queues().clone();
-        if !queues.features().dedupe {
-            anyhow::bail!("host queue must support dedupe for recoverable ingest publication");
-        }
-        let enqueued = queues
-            .enqueue(crate::memory::queue::QUEUE_NAME, &[message])
-            .await?;
-        let result = enqueued
-            .first()
-            .ok_or_else(|| anyhow::anyhow!("host queue returned no enqueue result"))?;
-        Ok(if !result.duplicate {
-            QueuePublication::Published
-        } else {
-            QueuePublication::AlreadyPublished
-        })
+        let payload = crate::memory::queue::types::ExtractChunkPayload {
+            chunk_id: chunk_id.to_owned(),
+        };
+        let mut job = crate::memory::queue::types::NewJob::extract_chunk(&payload)?;
+        job.id = Some(intent_id.to_owned());
+        job.max_attempts = Some(default_max_attempts);
+        Ok(
+            if crate::memory::queue::store::enqueue_async(config, &job)
+                .await?
+                .is_some()
+            {
+                QueuePublication::Published
+            } else {
+                QueuePublication::AlreadyPublished
+            },
+        )
     }
 }
 

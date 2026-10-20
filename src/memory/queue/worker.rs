@@ -29,10 +29,10 @@ use crate::memory::config::MemoryConfig;
 use crate::memory::queue::gate::{LlmGate, Permit};
 use crate::memory::queue::handlers::{self, QueueDelegates};
 use crate::memory::queue::ops::set_backfill_in_progress;
-use crate::memory::queue::store::purge_retired_jobs;
-use crate::memory::queue::store_settle::{mark_failed_typed, recover_stale_locks};
 #[cfg(test)]
 use crate::memory::queue::store::claim_next;
+use crate::memory::queue::store::purge_retired_jobs;
+use crate::memory::queue::store_settle::{mark_failed_typed, recover_stale_locks};
 use crate::memory::queue::types::{
     Job, JobFailure, JobKind, JobOutcome, JobStatus, NewJob, SealPayload,
 };
@@ -64,6 +64,7 @@ pub fn bootstrap(config: &MemoryConfig) -> Result<(usize, usize)> {
     Ok((purged, recovered))
 }
 
+#[cfg(feature = "tokio")]
 pub(crate) async fn bootstrap_async(config: &MemoryConfig) -> Result<(usize, usize)> {
     let purged = crate::memory::queue::store::purge_retired_jobs_async(config).await?;
     let recovered = crate::memory::queue::store_settle::recover_stale_locks_async(config).await?;
@@ -74,17 +75,10 @@ pub(crate) async fn bootstrap_async(config: &MemoryConfig) -> Result<(usize, usi
 /// Claim and run a single job. Returns `true` when work was processed, `false`
 /// when no eligible row was available.
 ///
-/// The job's configured lease starts counting at claim
-/// time, before the LLM gate is acquired below — a job that waits a long time
-/// for a free permit eats into its own lease window before its handler even
-/// starts.
-///
-/// See [`LlmGate::acquire`] for the blocking-wait caveat: this function calls
-/// it from inside an `async fn`, which is the exact pattern that caveat warns
-/// about. On a `current_thread` runtime, two concurrent `run_once` calls can
-/// deadlock (one holds the only permit and needs the executor to finish its
-/// handler and drop it; the other blocks the only executor thread inside
-/// `acquire`).
+/// LLM-bound jobs use [`LlmGate::try_acquire`] and defer when no permit is
+/// available, so this async entry point does not block a Tokio executor while
+/// waiting for capacity. All queue-state reads, writes, and settlements use
+/// the async versioned-store path, including on current-thread runtimes.
 pub async fn run_once(config: &MemoryConfig, delegates: &dyn QueueDelegates) -> Result<bool> {
     if config.storage().is_ok() {
         crate::memory::ingest::pipeline::dispatch_pending_extract_jobs_async(

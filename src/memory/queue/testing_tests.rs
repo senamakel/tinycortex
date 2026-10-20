@@ -1,7 +1,9 @@
 use super::*;
 use crate::memory::config::MemoryConfig;
 use crate::memory::queue::handlers::{ExtractDecision, ReembedProgress};
-use crate::memory::queue::store::{count_by_status, count_total, enqueue, purge_retired_jobs};
+use crate::memory::queue::store::{
+    count_by_status_async, count_total_async, enqueue_async, insert_test_record_async,
+};
 use crate::memory::queue::test_support::RecordingDelegates;
 use crate::memory::queue::types::{ExtractChunkPayload, JobStatus, NewJob};
 use tempfile::TempDir;
@@ -38,7 +40,7 @@ async fn drain_runs_the_full_extract_append_seal_pipeline() {
         chunk_id: "c1".into(),
     })
     .unwrap();
-    enqueue(&cfg, &nj).unwrap().unwrap();
+    enqueue_async(&cfg, &nj).await.unwrap().unwrap();
 
     drain_until_idle(&cfg, &d).await.unwrap();
 
@@ -47,8 +49,14 @@ async fn drain_runs_the_full_extract_append_seal_pipeline() {
     assert_eq!(d.counts.append.load(Relaxed), 1, "appended once");
     assert_eq!(d.counts.seal.load(Relaxed), 1, "sealed once");
     // extract + append + seal all settled done; nothing left ready/running.
-    assert_eq!(count_by_status(&cfg, JobStatus::Done).unwrap(), 3);
-    assert_eq!(count_by_status(&cfg, JobStatus::Ready).unwrap(), 0);
+    assert_eq!(
+        count_by_status_async(&cfg, JobStatus::Done).await.unwrap(),
+        3
+    );
+    assert_eq!(
+        count_by_status_async(&cfg, JobStatus::Ready).await.unwrap(),
+        0
+    );
 }
 
 /// A deferring job parks itself and the drain terminates (it is no longer
@@ -65,7 +73,7 @@ async fn drain_terminates_on_a_deferred_job() {
         signature: d.signature.clone(),
     })
     .unwrap();
-    enqueue(&cfg, &nj).unwrap().unwrap();
+    enqueue_async(&cfg, &nj).await.unwrap().unwrap();
 
     drain_until_idle(&cfg, &d).await.unwrap();
     // The reembed batch ran exactly once, then the deferred row parked.
@@ -73,7 +81,10 @@ async fn drain_terminates_on_a_deferred_job() {
         d.counts.reembed.load(std::sync::atomic::Ordering::Relaxed),
         1
     );
-    assert_eq!(count_by_status(&cfg, JobStatus::Ready).unwrap(), 1);
+    assert_eq!(
+        count_by_status_async(&cfg, JobStatus::Ready).await.unwrap(),
+        1
+    );
 }
 
 /// Retired-kind rows left in an old queue must not crash the drain: they are
@@ -84,7 +95,7 @@ async fn drain_tolerates_retired_kind_rows() {
     let (_tmp, cfg) = test_config();
     let d = RecordingDelegates::admitting();
 
-    crate::memory::queue::store::insert_test_record(
+    insert_test_record_async(
         &cfg,
         &crate::memory::queue::store::JobRecord {
             id: "retired".to_owned(),
@@ -102,10 +113,12 @@ async fn drain_tolerates_retired_kind_rows() {
             created_at_ms: 0,
             started_at_ms: None,
             completed_at_ms: None,
+            hint_generation: 0,
             lease_epoch: 0,
             lease_token: None,
         },
     )
+    .await
     .unwrap();
 
     // A live, terminal job (drops → no follow-ups) so the drain is bounded.
@@ -119,16 +132,24 @@ async fn drain_tolerates_retired_kind_rows() {
         chunk_id: "c1".into(),
     })
     .unwrap();
-    enqueue(&cfg, &nj).unwrap().unwrap();
+    enqueue_async(&cfg, &nj).await.unwrap().unwrap();
 
     // Drain must not panic on the retired row.
     drain_until_idle(&cfg, &dd).await.unwrap();
-    assert_eq!(count_by_status(&cfg, JobStatus::Done).unwrap(), 1);
+    assert_eq!(
+        count_by_status_async(&cfg, JobStatus::Done).await.unwrap(),
+        1
+    );
 
     // The retired row is still present (skipped, not processed) until purged.
-    assert_eq!(count_total(&cfg).unwrap(), 2);
-    assert_eq!(purge_retired_jobs(&cfg).unwrap(), 1);
-    assert_eq!(count_total(&cfg).unwrap(), 1);
+    assert_eq!(count_total_async(&cfg).await.unwrap(), 2);
+    assert_eq!(
+        crate::memory::queue::store::purge_retired_jobs_async(&cfg)
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(count_total_async(&cfg).await.unwrap(), 1);
 
     let _ = &d; // silence unused in case of edits
 }

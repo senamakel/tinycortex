@@ -9,7 +9,7 @@ use anyhow::{Context, Result};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use tinystoragedrivers_types::NewMessage;
+use tinystoragedrivers_types::{NewMessage, Retry};
 use uuid::Uuid;
 
 use crate::memory::chunks::versioned::{self, StateChange};
@@ -47,6 +47,10 @@ pub(crate) struct JobRecord {
     pub(crate) created_at_ms: i64,
     pub(crate) started_at_ms: Option<i64>,
     pub(crate) completed_at_ms: Option<i64>,
+    /// Identity of the current Ready-state queue publication. This is
+    /// separate from `lease_epoch`, which changes on every worker claim.
+    #[serde(default)]
+    pub(crate) hint_generation: u64,
     #[serde(default)]
     pub(crate) lease_epoch: u64,
     #[serde(default)]
@@ -71,6 +75,7 @@ impl JobRecord {
             created_at_ms: job.created_at_ms,
             started_at_ms: job.started_at_ms,
             completed_at_ms: job.completed_at_ms,
+            hint_generation: 0,
             lease_epoch: job.lease_epoch,
             lease_token: job
                 .queue_receipt
@@ -203,11 +208,16 @@ pub(crate) async fn publish_record_async(config: &MemoryConfig, record: &JobReco
 
 fn hint_message(record: &JobRecord, now_ms: i64) -> NewMessage {
     let delay_ms = record.available_at_ms.saturating_sub(now_ms).max(0) as u64;
-    NewMessage::new(json!({"job_id": record.id}))
+    NewMessage::new(json!({"job_id": record.id, "generation": record.lease_epoch}))
         .priority(queue_priority(&record.kind))
         .delay_ms(delay_ms)
         // This is only a finite-window optimization. Duplicate hints are
-        // harmless because the durable job's lease generation is authoritative.
+        // harmless because the durable lease generation is authoritative.
+        // Acknowledge consumes the current hint, but queue backends may retain
+        // its finite-window dedupe key. Use the durable lease generation so a
+        // failed/deferred/recovered job can immediately publish its next hint;
+        // republishing the same ready generation after a lost publish-ACK is
+        // still idempotent.
         .dedupe_key(format!("job:{}", record.id))
 }
 
@@ -268,6 +278,7 @@ fn record_from_new(config: &MemoryConfig, job: &NewJob, id: String) -> JobRecord
         created_at_ms: now,
         started_at_ms: None,
         completed_at_ms: None,
+        hint_generation: 0,
         lease_epoch: 0,
         lease_token: None,
     }
@@ -288,6 +299,14 @@ pub fn enqueue(config: &MemoryConfig, job: &NewJob) -> Result<Option<String>> {
         let existing = versioned::read_state(config, JOBS, &key)?;
         if let Some(value) = &existing {
             let current = decode_job(value)?;
+            if job.id.is_some()
+                && (current.kind != record.kind
+                    || current.payload_json != record.payload_json
+                    || current.dedupe_key != record.dedupe_key
+                    || current.max_attempts != record.max_attempts)
+            {
+                anyhow::bail!("stable queue job ID was reused with a different intent");
+            }
             if current.status()? == JobStatus::Ready {
                 enqueue_hint(config, &current)?;
             }
@@ -347,6 +366,14 @@ pub(crate) async fn enqueue_async(config: &MemoryConfig, job: &NewJob) -> Result
         let existing = versioned::read_state_async(config, JOBS, &key).await?;
         if let Some(value) = &existing {
             let current = decode_job(value)?;
+            if job.id.is_some()
+                && (current.kind != record.kind
+                    || current.payload_json != record.payload_json
+                    || current.dedupe_key != record.dedupe_key
+                    || current.max_attempts != record.max_attempts)
+            {
+                anyhow::bail!("stable queue job ID was reused with a different intent");
+            }
             if current.status()? == JobStatus::Ready {
                 enqueue_hint_async(config, &current).await?;
             }
@@ -397,6 +424,7 @@ pub fn claim_next(config: &MemoryConfig, lock_duration_ms: i64) -> Result<Option
     let queues = config.storage()?.queues().clone();
     let consumer = format!("tinycortex:{}", Uuid::new_v4());
     let visibility = lock_duration_ms.max(1) as u64;
+    let mut repaired = false;
     for _ in 0..MAX_STALE_HINTS {
         let deliveries = config
             .storage_blocking()?
@@ -411,6 +439,12 @@ pub fn claim_next(config: &MemoryConfig, lock_duration_ms: i64) -> Result<Option
             })?
             .map_err(anyhow::Error::from)?;
         let Some(delivery) = deliveries.into_iter().next() else {
+            if !repaired {
+                repaired = true;
+                if repair_pending_hints(config)? > 0 {
+                    continue;
+                }
+            }
             return Ok(None);
         };
         let Some(id) = delivery.payload.get("job_id").and_then(Value::as_str) else {
@@ -421,6 +455,15 @@ pub fn claim_next(config: &MemoryConfig, lock_duration_ms: i64) -> Result<Option
             ack(config, &delivery.receipt)?;
             continue;
         };
+        if delivery
+            .payload
+            .get("generation")
+            .and_then(Value::as_u64)
+            .is_some_and(|generation| generation != record.lease_epoch)
+        {
+            ack(config, &delivery.receipt)?;
+            continue;
+        }
         let status = record.status()?;
         if !matches!(status, JobStatus::Ready | JobStatus::Running) {
             ack(config, &delivery.receipt)?;
@@ -438,8 +481,11 @@ pub fn claim_next(config: &MemoryConfig, lock_duration_ms: i64) -> Result<Option
             continue;
         }
         if record.available_at_ms > now_ms {
-            ack(config, &delivery.receipt)?;
-            enqueue_hint(config, &record)?;
+            nack(
+                config,
+                &delivery.receipt,
+                (record.available_at_ms - now_ms) as u64,
+            )?;
             continue;
         }
         record.status = JobStatus::Running.as_str().to_owned();
@@ -470,6 +516,7 @@ pub(crate) async fn claim_next_async(
     let queues = config.storage()?.queues().clone();
     let consumer = format!("tinycortex:{}", Uuid::new_v4());
     let visibility = lock_duration_ms.max(1) as u64;
+    let mut repaired = false;
     for _ in 0..MAX_STALE_HINTS {
         let deliveries = config
             .storage_blocking()?
@@ -485,6 +532,12 @@ pub(crate) async fn claim_next_async(
             .await?
             .map_err(anyhow::Error::from)?;
         let Some(delivery) = deliveries.into_iter().next() else {
+            if !repaired {
+                repaired = true;
+                if repair_pending_hints_async(config).await? > 0 {
+                    continue;
+                }
+            }
             return Ok(None);
         };
         let Some(id) = delivery.payload.get("job_id").and_then(Value::as_str) else {
@@ -495,6 +548,15 @@ pub(crate) async fn claim_next_async(
             ack_async(config, &delivery.receipt).await?;
             continue;
         };
+        if delivery
+            .payload
+            .get("generation")
+            .and_then(Value::as_u64)
+            .is_some_and(|generation| generation != record.lease_epoch)
+        {
+            ack_async(config, &delivery.receipt).await?;
+            continue;
+        }
         let status = record.status()?;
         if !matches!(status, JobStatus::Ready | JobStatus::Running) {
             ack_async(config, &delivery.receipt).await?;
@@ -510,8 +572,12 @@ pub(crate) async fn claim_next_async(
             continue;
         }
         if record.available_at_ms > now_ms {
-            ack_async(config, &delivery.receipt).await?;
-            enqueue_hint_async(config, &record).await?;
+            nack_async(
+                config,
+                &delivery.receipt,
+                (record.available_at_ms - now_ms) as u64,
+            )
+            .await?;
             continue;
         }
         record.status = JobStatus::Running.as_str().to_owned();
@@ -562,6 +628,49 @@ async fn ack_async(
         .map_err(anyhow::Error::from)
 }
 
+fn nack(
+    config: &MemoryConfig,
+    receipt: &tinystoragedrivers_types::Receipt,
+    delay_ms: u64,
+) -> Result<bool> {
+    let queues = config.storage()?.queues().clone();
+    let receipt = receipt.clone();
+    config
+        .storage_blocking()?
+        .run(async move {
+            queues
+                .nack(
+                    crate::memory::queue::QUEUE_NAME,
+                    &receipt,
+                    Retry::After(delay_ms.max(1)),
+                )
+                .await
+        })?
+        .map_err(anyhow::Error::from)
+}
+
+async fn nack_async(
+    config: &MemoryConfig,
+    receipt: &tinystoragedrivers_types::Receipt,
+    delay_ms: u64,
+) -> Result<bool> {
+    let queues = config.storage()?.queues().clone();
+    let receipt = receipt.clone();
+    config
+        .storage_blocking()?
+        .run_async(async move {
+            queues
+                .nack(
+                    crate::memory::queue::QUEUE_NAME,
+                    &receipt,
+                    Retry::After(delay_ms.max(1)),
+                )
+                .await
+        })
+        .await?
+        .map_err(anyhow::Error::from)
+}
+
 /// Commit a claimed job transition, domain mutations and follow-up rows under
 /// one versioned-head CAS. Follow-up queue hints are published afterwards and
 /// are repaired from durable ready rows on bootstrap if publication fails.
@@ -591,6 +700,7 @@ pub(crate) fn commit_claimed(
         return Ok(false);
     }
     next.lease_epoch = current.lease_epoch;
+    next.hint_generation = current.hint_generation;
     next.lease_token = None;
     let mut expected = vec![StateChange {
         collection: JOBS.to_owned(),
@@ -726,6 +836,7 @@ pub(crate) async fn commit_claimed_async(
         return Ok(false);
     }
     next.lease_epoch = current.lease_epoch;
+    next.hint_generation = current.hint_generation;
     next.lease_token = None;
     let mut expected = vec![StateChange {
         collection: JOBS.to_owned(),
@@ -900,14 +1011,22 @@ pub(crate) async fn purge_retired_jobs_async(config: &MemoryConfig) -> Result<us
 pub(crate) fn repair_pending_hints(config: &MemoryConfig) -> Result<usize> {
     let records = versioned::list_state(config, JOBS)?;
     let mut count = 0;
+    let now_ms = Utc::now().timestamp_millis();
     for (key, value) in records {
         if !key.starts_with(JOB_PREFIX) {
             continue;
         }
-        let record = decode_job(&value)?;
-        if record.status()? == JobStatus::Ready {
-            enqueue_hint(config, &record)?;
-            count += 1;
+        let mut record = decode_job(&value)?;
+        if record.status()? == JobStatus::Ready && record.available_at_ms <= now_ms {
+            // Advance the durable publication generation before publishing so
+            // repair can recover even when the backend still remembers the
+            // previous hint's finite-window dedupe key (for example after a
+            // hint expired or was dead-lettered).
+            record.lease_epoch = record.lease_epoch.saturating_add(1);
+            if replace_record(config, &value, &record)? {
+                enqueue_hint(config, &record)?;
+                count += 1;
+            }
         }
     }
     Ok(count)
@@ -916,14 +1035,29 @@ pub(crate) fn repair_pending_hints(config: &MemoryConfig) -> Result<usize> {
 pub(crate) async fn repair_pending_hints_async(config: &MemoryConfig) -> Result<usize> {
     let records = versioned::list_state_async(config, JOBS).await?;
     let mut count = 0;
+    let now_ms = Utc::now().timestamp_millis();
     for (key, value) in records {
         if !key.starts_with(JOB_PREFIX) {
             continue;
         }
-        let record = decode_job(&value)?;
-        if record.status()? == JobStatus::Ready {
-            enqueue_hint_async(config, &record).await?;
-            count += 1;
+        let mut record = decode_job(&value)?;
+        if record.status()? == JobStatus::Ready && record.available_at_ms <= now_ms {
+            record.lease_epoch = record.lease_epoch.saturating_add(1);
+            if versioned::commit_if_state_matches_async(
+                config,
+                &[StateChange {
+                    collection: JOBS.to_owned(),
+                    key: key.clone(),
+                    value: Some(value),
+                }],
+                &[],
+                &[state_change(&record)?],
+            )
+            .await?
+            {
+                enqueue_hint_async(config, &record).await?;
+                count += 1;
+            }
         }
     }
     Ok(count)
@@ -944,6 +1078,11 @@ pub(crate) async fn count_by_status_async(config: &MemoryConfig, status: JobStat
         .into_iter()
         .filter(|job| job.status == status)
         .count() as u64)
+}
+
+#[cfg(test)]
+pub(crate) async fn count_total_async(config: &MemoryConfig) -> Result<u64> {
+    Ok(all_jobs_async(config).await?.len() as u64)
 }
 
 pub fn count_failed_unrecoverable(config: &MemoryConfig) -> Result<u64> {
@@ -1000,6 +1139,15 @@ pub(crate) fn insert_test_record(config: &MemoryConfig, record: &JobRecord) -> R
 }
 
 #[cfg(test)]
+pub(crate) async fn insert_test_record_async(
+    config: &MemoryConfig,
+    record: &JobRecord,
+) -> Result<()> {
+    versioned::commit_if_state_matches_async(config, &[], &[], &[state_change(record)?]).await?;
+    Ok(())
+}
+
+#[cfg(test)]
 pub(crate) fn update_test_record(
     config: &MemoryConfig,
     id: &str,
@@ -1010,6 +1158,40 @@ pub(crate) fn update_test_record(
     };
     update(&mut record);
     if !replace_record(config, &old_value, &record)? {
+        anyhow::bail!("test queue record changed during update")
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+pub(crate) fn expire_test_lease(config: &MemoryConfig, id: &str) -> Result<()> {
+    update_test_record(config, id, |record| {
+        record.locked_until_ms = Some(0);
+    })
+}
+
+#[cfg(test)]
+pub(crate) async fn update_test_record_async(
+    config: &MemoryConfig,
+    id: &str,
+    update: impl FnOnce(&mut JobRecord),
+) -> Result<()> {
+    let Some((old_value, mut record)) = read_record_async(config, id).await? else {
+        anyhow::bail!("test queue record {id} does not exist")
+    };
+    update(&mut record);
+    if !versioned::commit_if_state_matches_async(
+        config,
+        &[StateChange {
+            collection: JOBS.to_owned(),
+            key: job_key(id),
+            value: Some(old_value),
+        }],
+        &[],
+        &[state_change(&record)?],
+    )
+    .await?
+    {
         anyhow::bail!("test queue record changed during update")
     }
     Ok(())

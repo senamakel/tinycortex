@@ -146,6 +146,7 @@ fn mark_failed_retries_then_terminates() {
     // Force the row available again so the test doesn't hinge on sleep.
     crate::memory::queue::store::update_test_record(&cfg, &id, |record| {
         record.available_at_ms = 0;
+        record.lease_epoch = record.lease_epoch.saturating_add(1);
     })
     .unwrap();
 
@@ -410,7 +411,8 @@ fn recover_stale_locks_resets_running_rows() {
     let (_tmp, cfg) = test_config();
     let id = enqueue(&cfg, &extract_job("c1", 5)).unwrap().unwrap();
     // Claim with a lock window already in the past so recovery sees it expired.
-    let _ = claim_next(&cfg, -1).unwrap().unwrap();
+    let _claimed = claim_next(&cfg, DEFAULT_LOCK_DURATION_MS).unwrap().unwrap();
+    crate::memory::queue::store::expire_test_lease(&cfg, &id).unwrap();
     let recovered = recover_stale_locks(&cfg).unwrap();
     assert_eq!(recovered, 1);
     assert_eq!(
@@ -444,7 +446,8 @@ fn stale_worker_settlement_is_noop() {
         .expect("inserted");
 
     // Worker A claims with an already-expired lock.
-    let worker_a_job = claim_next(&cfg, -1).unwrap().unwrap();
+    let worker_a_job = claim_next(&cfg, DEFAULT_LOCK_DURATION_MS).unwrap().unwrap();
+    crate::memory::queue::store::expire_test_lease(&cfg, &id).unwrap();
     assert_eq!(worker_a_job.attempts, 1);
     // Lease expires; recover; Worker B re-claims (attempts=2).
     assert_eq!(recover_stale_locks(&cfg).unwrap(), 1);
@@ -464,7 +467,8 @@ fn stale_worker_mark_failed_is_noop() {
     let id = enqueue(&cfg, &extract_job("c-stale-fail", 5))
         .unwrap()
         .expect("inserted");
-    let worker_a_job = claim_next(&cfg, -1).unwrap().unwrap();
+    let worker_a_job = claim_next(&cfg, DEFAULT_LOCK_DURATION_MS).unwrap().unwrap();
+    crate::memory::queue::store::expire_test_lease(&cfg, &id).unwrap();
     assert_eq!(recover_stale_locks(&cfg).unwrap(), 1);
     let worker_b_job = claim_next(&cfg, DEFAULT_LOCK_DURATION_MS).unwrap().unwrap();
     assert_eq!(worker_b_job.attempts, 2);
@@ -507,13 +511,13 @@ fn mark_deferred_parks_jobs_that_exceed_the_defer_age_bound() {
     let id = enqueue(&cfg, &extract_job("c-defer-expired", 5))
         .unwrap()
         .expect("inserted");
-    let claimed = claim_next(&cfg, DEFAULT_LOCK_DURATION_MS).unwrap().unwrap();
     crate::memory::queue::store::update_test_record(&cfg, &id, |record| {
         record.created_at_ms = Utc::now()
             .timestamp_millis()
             .saturating_sub(max_defer_age_ms + 1);
     })
     .unwrap();
+    let claimed = claim_next(&cfg, DEFAULT_LOCK_DURATION_MS).unwrap().unwrap();
 
     mark_deferred(&cfg, &claimed, i64::MAX, "still blocked").unwrap();
 
@@ -543,6 +547,7 @@ fn deferred_row_not_claimable_until_until_ms() {
 
     crate::memory::queue::store::update_test_record(&cfg, &id, |record| {
         record.available_at_ms = 0;
+        record.lease_epoch = record.lease_epoch.saturating_add(1);
     })
     .unwrap();
     let claim2 = claim_next(&cfg, DEFAULT_LOCK_DURATION_MS).unwrap().unwrap();
@@ -593,7 +598,8 @@ fn mark_deferred_stale_lease_is_noop() {
     let id = enqueue(&cfg, &extract_job("c-defer-stale", 5))
         .unwrap()
         .expect("inserted");
-    let worker_a_job = claim_next(&cfg, -1).unwrap().unwrap();
+    let worker_a_job = claim_next(&cfg, DEFAULT_LOCK_DURATION_MS).unwrap().unwrap();
+    crate::memory::queue::store::expire_test_lease(&cfg, &id).unwrap();
     assert_eq!(recover_stale_locks(&cfg).unwrap(), 1);
     let worker_b_job = claim_next(&cfg, DEFAULT_LOCK_DURATION_MS).unwrap().unwrap();
     assert_eq!(worker_b_job.attempts, 2);

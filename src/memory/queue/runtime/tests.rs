@@ -2,8 +2,9 @@ use std::time::Duration;
 
 use super::*;
 use crate::memory::config::MemoryConfig;
-use crate::memory::queue::store::get_job;
-use crate::memory::queue::store::{count_by_status, enqueue};
+use crate::memory::queue::store::{
+    count_by_status_async, enqueue_async, get_job_async, update_test_record_async,
+};
 use crate::memory::queue::test_support::RecordingDelegates;
 use crate::memory::queue::types::{FlushStalePayload, JobStatus, NewJob};
 use tempfile::TempDir;
@@ -32,7 +33,10 @@ async fn worker_loop_drains_queued_jobs_then_stops_on_shutdown() {
     let (_tmp, cfg) = test_config();
     let d = RecordingDelegates::admitting();
     let new_job = NewJob::flush_stale(&FlushStalePayload::default(), "2026-05-24", 3).unwrap();
-    enqueue(&cfg, &new_job).unwrap().expect("enqueued");
+    enqueue_async(&cfg, &new_job)
+        .await
+        .unwrap()
+        .expect("enqueued");
 
     let opts = fast_worker_opts();
     let shutdown = Shutdown::new();
@@ -41,7 +45,7 @@ async fn worker_loop_drains_queued_jobs_then_stops_on_shutdown() {
     // stop. `join!` polls both on this task, so no `Send` bound is required.
     let stopper = async {
         loop {
-            if count_by_status(&cfg, JobStatus::Done).unwrap() >= 1 {
+            if count_by_status_async(&cfg, JobStatus::Done).await.unwrap() >= 1 {
                 shutdown.trigger();
                 return;
             }
@@ -52,7 +56,10 @@ async fn worker_loop_drains_queued_jobs_then_stops_on_shutdown() {
     let (worker_res, ()) = tokio::join!(run_worker(&cfg, &d, &opts, &shutdown), stopper);
     worker_res.unwrap();
 
-    assert_eq!(count_by_status(&cfg, JobStatus::Done).unwrap(), 1);
+    assert_eq!(
+        count_by_status_async(&cfg, JobStatus::Done).await.unwrap(),
+        1
+    );
 }
 
 #[tokio::test]
@@ -78,7 +85,7 @@ async fn scheduler_loop_enqueues_flush_stale_then_stops() {
 
     let stopper = async {
         loop {
-            let queued = count_by_status(&cfg, JobStatus::Ready).unwrap();
+            let queued = count_by_status_async(&cfg, JobStatus::Ready).await.unwrap();
             if queued >= 1 {
                 shutdown.trigger();
                 return;
@@ -91,19 +98,20 @@ async fn scheduler_loop_enqueues_flush_stale_then_stops() {
     sched_res.unwrap();
 
     // At least one flush_stale job was enqueued by the loop.
-    assert!(count_by_status(&cfg, JobStatus::Ready).unwrap() >= 1);
+    assert!(count_by_status_async(&cfg, JobStatus::Ready).await.unwrap() >= 1);
 }
 
 #[tokio::test]
 async fn scheduler_tick_recovers_an_expired_running_job() {
     let (_tmp, cfg) = test_config();
     let new_job = NewJob::flush_stale(&FlushStalePayload::default(), "expired", 1).unwrap();
-    let id = enqueue(&cfg, &new_job).unwrap().unwrap();
-    crate::memory::queue::store::update_test_record(&cfg, &id, |record| {
+    let id = enqueue_async(&cfg, &new_job).await.unwrap().unwrap();
+    update_test_record_async(&cfg, &id, |record| {
         record.status = JobStatus::Running.as_str().to_owned();
         record.locked_until_ms = Some(0);
         record.started_at_ms = Some(0);
     })
+    .await
     .unwrap();
 
     let shutdown = Shutdown::new();
@@ -112,7 +120,7 @@ async fn scheduler_tick_recovers_an_expired_running_job() {
     };
     let stop_after_first_tick = async {
         loop {
-            if get_job(&cfg, &id).unwrap().unwrap().status == JobStatus::Ready {
+            if get_job_async(&cfg, &id).await.unwrap().unwrap().status == JobStatus::Ready {
                 shutdown.trigger();
                 return;
             }
@@ -122,7 +130,7 @@ async fn scheduler_tick_recovers_an_expired_running_job() {
     let (result, ()) = tokio::join!(run_scheduler(&cfg, &opts, &shutdown), stop_after_first_tick);
     result.unwrap();
     assert_eq!(
-        get_job(&cfg, &id).unwrap().unwrap().status,
+        get_job_async(&cfg, &id).await.unwrap().unwrap().status,
         JobStatus::Ready
     );
 }

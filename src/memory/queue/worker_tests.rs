@@ -3,7 +3,9 @@ use crate::memory::config::MemoryConfig;
 use crate::memory::queue::gate::DEFAULT_LLM_PERMITS;
 use crate::memory::queue::handlers::ReembedProgress;
 use crate::memory::queue::store::DEFAULT_LOCK_DURATION_MS;
-use crate::memory::queue::store::{count_by_status, enqueue, get_job};
+use crate::memory::queue::store::{
+    count_by_status, count_by_status_async, enqueue, enqueue_async, get_job, get_job_async,
+};
 use crate::memory::queue::test_support::RecordingDelegates;
 use crate::memory::queue::types::{FlushStalePayload, JobStatus, NewJob, ReembedBackfillPayload};
 use tempfile::TempDir;
@@ -75,12 +77,15 @@ async fn run_once_parks_unparseable_payload_as_unrecoverable() {
         available_at_ms: None,
         max_attempts: Some(5),
     };
-    let id = enqueue(&cfg, &poison).unwrap().expect("enqueued");
+    let id = enqueue_async(&cfg, &poison)
+        .await
+        .unwrap()
+        .expect("enqueued");
 
     // One worker step: claim → parse fails → settle.
     assert!(run_once(&cfg, &d).await.unwrap());
 
-    let job = get_job(&cfg, &id).unwrap().unwrap();
+    let job = get_job_async(&cfg, &id).await.unwrap().unwrap();
     assert_eq!(
         job.status,
         JobStatus::Failed,
@@ -90,10 +95,10 @@ async fn run_once_parks_unparseable_payload_as_unrecoverable() {
 
     // self_heal (requeue_transient_failed) must NOT resurrect it — that was the
     // infinite-requeue-every-tick bug (QI-2).
-    let requeued = scheduler::self_heal(&cfg).unwrap();
+    let requeued = scheduler::self_heal_async(&cfg).await.unwrap();
     assert_eq!(requeued, 0, "unrecoverable poison job must stay parked");
     assert_eq!(
-        get_job(&cfg, &id).unwrap().unwrap().status,
+        get_job_async(&cfg, &id).await.unwrap().unwrap().status,
         JobStatus::Failed
     );
 }
@@ -143,14 +148,20 @@ async fn run_once_claims_and_completes_a_flush_stale_job() {
     let (_tmp, cfg) = test_config();
     let d = RecordingDelegates::admitting();
     let new_job = NewJob::flush_stale(&FlushStalePayload::default(), "2026-05-24", 3).unwrap();
-    let id = enqueue(&cfg, &new_job).unwrap().expect("enqueued");
+    let id = enqueue_async(&cfg, &new_job)
+        .await
+        .unwrap()
+        .expect("enqueued");
 
     assert!(run_once(&cfg, &d).await.unwrap());
-    let job = get_job(&cfg, &id).unwrap().unwrap();
+    let job = get_job_async(&cfg, &id).await.unwrap().unwrap();
     assert_eq!(job.status, JobStatus::Done);
     assert!(job.completed_at_ms.is_some());
     assert!(job.locked_until_ms.is_none());
-    assert_eq!(count_by_status(&cfg, JobStatus::Done).unwrap(), 1);
+    assert_eq!(
+        count_by_status_async(&cfg, JobStatus::Done).await.unwrap(),
+        1
+    );
 }
 
 #[tokio::test]
@@ -165,10 +176,13 @@ async fn run_once_reschedules_reembed_jobs_that_defer() {
         signature: d.signature.clone(),
     })
     .unwrap();
-    let id = enqueue(&cfg, &new_job).unwrap().expect("enqueued");
+    let id = enqueue_async(&cfg, &new_job)
+        .await
+        .unwrap()
+        .expect("enqueued");
 
     assert!(run_once(&cfg, &d).await.unwrap());
-    let job = get_job(&cfg, &id).unwrap().unwrap();
+    let job = get_job_async(&cfg, &id).await.unwrap().unwrap();
     assert_eq!(job.status, JobStatus::Ready);
     assert_eq!(job.attempts, 0, "defer reverts the claim attempt bump");
     assert!(job.started_at_ms.is_none());
@@ -304,7 +318,7 @@ async fn run_once_holds_an_llm_permit_for_llm_bound_jobs() {
         signature: "sig".into(),
     })
     .unwrap();
-    enqueue(&cfg, &new_job).unwrap().unwrap();
+    enqueue_async(&cfg, &new_job).await.unwrap().unwrap();
     assert!(run_once(&cfg, &d).await.unwrap());
     assert_eq!(
         llm_gate().available_permits(),
@@ -323,12 +337,12 @@ async fn run_once_defers_instead_of_blocking_when_llm_gate_is_full() {
         signature: "sig".into(),
     })
     .unwrap();
-    let id = enqueue(&cfg, &new_job).unwrap().unwrap();
+    let id = enqueue_async(&cfg, &new_job).await.unwrap().unwrap();
 
     // This would deadlock a current-thread runtime if the worker used the
     // gate's blocking acquire path.
     assert!(run_once_with_gate(&cfg, &d, &gate).await.unwrap());
-    let job = get_job(&cfg, &id).unwrap().unwrap();
+    let job = get_job_async(&cfg, &id).await.unwrap().unwrap();
     assert_eq!(job.status, JobStatus::Ready);
     assert_eq!(job.attempts, 0);
     assert_eq!(gate.available_permits(), 0);
@@ -356,6 +370,7 @@ fn bootstrap_purges_retired_and_recovers_locks() {
             created_at_ms: 0,
             started_at_ms: None,
             completed_at_ms: None,
+            hint_generation: 0,
             lease_epoch: 0,
             lease_token: None,
         },

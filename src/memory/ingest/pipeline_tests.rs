@@ -16,6 +16,7 @@ use crate::memory::ingest::canonicalize::document::DocumentInput;
 use crate::memory::ingest::canonicalize::email::{EmailMessage, EmailThread};
 use crate::memory::ingest::types::{NullJobSink, QueueJobSink, QueuePublication, TreeJobSink};
 use crate::memory::queue::QUEUE_NAME;
+use crate::memory::queue::test_support::RecordingDelegates;
 use crate::memory::score::ScoringConfig;
 
 /// Records every enqueued extract job id for assertions.
@@ -405,7 +406,7 @@ async fn ingest_head_failure_does_not_publish_or_expose_its_outbox_intent() {
 }
 
 #[tokio::test]
-async fn current_thread_queue_sink_repairs_lost_hint_ack_without_duplicate_jobs() {
+async fn current_thread_ingest_repairs_lost_hint_ack_and_worker_claims_owner_job() {
     let (_tmp, cfg) = test_config();
     let sink = LostQueueAckSink {
         lose_next_ack: AtomicBool::new(true),
@@ -448,6 +449,32 @@ async fn current_thread_queue_sink_repairs_lost_hint_ack_without_duplicate_jobs(
         .unwrap();
     assert_eq!(published_before_repair + repaired as u64, expected_jobs);
     assert_eq!(ready_queue_messages(&cfg).await, expected_jobs);
+    let records =
+        crate::memory::chunks::versioned::list_state_async(&cfg, crate::memory::queue::store::JOBS)
+            .await
+            .unwrap();
+    let extract_records: Vec<_> = records
+        .into_iter()
+        .filter(|(_, record)| record["kind"] == "extract_chunk")
+        .collect();
+    assert_eq!(extract_records.len() as u64, expected_jobs);
+
+    let delegates = RecordingDelegates::admitting();
+    assert!(
+        crate::memory::queue::worker::run_once(&cfg, &delegates)
+            .await
+            .unwrap()
+    );
+    assert_eq!(delegates.counts.extract.load(Ordering::Relaxed), 1);
+    let job_id = extract_records[0].1["id"].as_str().unwrap();
+    assert_eq!(
+        crate::memory::queue::store::get_job_async(&cfg, job_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        crate::memory::queue::types::JobStatus::Done
+    );
     let gate_key = crate::memory::chunks::store_sources::source_gate_key(
         SourceKind::Document,
         "notion:current-thread",

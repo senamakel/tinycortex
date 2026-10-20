@@ -218,6 +218,7 @@ pub fn recover_stale_locks(config: &MemoryConfig) -> Result<usize> {
             continue;
         }
         record.status = JobStatus::Ready.as_str().to_owned();
+        record.hint_generation = record.hint_generation.saturating_add(1);
         record.locked_until_ms = None;
         record.lease_token = None;
         record
@@ -242,6 +243,7 @@ pub(crate) async fn recover_stale_locks_async(config: &MemoryConfig) -> Result<u
             continue;
         }
         record.status = JobStatus::Ready.as_str().to_owned();
+        record.hint_generation = record.hint_generation.saturating_add(1);
         record.locked_until_ms = None;
         record.lease_token = None;
         record
@@ -276,6 +278,7 @@ pub fn release_running_locks(config: &MemoryConfig) -> Result<usize> {
             continue;
         }
         record.status = JobStatus::Ready.as_str().to_owned();
+        record.hint_generation = record.hint_generation.saturating_add(1);
         record.attempts = record.attempts.saturating_sub(1);
         record.locked_until_ms = None;
         record.started_at_ms = None;
@@ -486,6 +489,7 @@ fn requeue(config: &MemoryConfig, transient_only: bool) -> Result<u64> {
 
 fn reset_for_retry(job: &mut JobRecord, now: i64) {
     job.status = JobStatus::Ready.as_str().to_owned();
+    job.hint_generation = job.hint_generation.saturating_add(1);
     job.attempts = 0;
     job.available_at_ms = now;
     job.locked_until_ms = None;

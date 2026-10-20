@@ -102,6 +102,72 @@ fn stable_outbox_hint_id_suppresses_republication_after_job_completion() {
     assert_eq!(get_job(&cfg, &id).unwrap().unwrap().status, JobStatus::Done);
 }
 
+#[tokio::test]
+async fn a_deferred_job_can_be_reclaimed_before_queue_dedupe_expires() {
+    use crate::memory::queue::store_settle::mark_deferred_async;
+    use tinystoragedrivers_types::QueueSpec;
+
+    let (_tmp, cfg) = test_config();
+    cfg.storage()
+        .unwrap()
+        .queues()
+        .ensure_queue(
+            super::super::QUEUE_NAME,
+            &QueueSpec {
+                max_attempts: cfg.queue.max_attempts.max(1),
+                dedupe_window_ms: 60_000,
+            },
+        )
+        .await
+        .unwrap();
+    let mut new_job = NewJob::extract_chunk(&ExtractChunkPayload {
+        chunk_id: "c-immediate-retry".into(),
+    })
+    .unwrap();
+    new_job.id = Some("job:immediate-retry".into());
+    let id = enqueue_async(&cfg, &new_job).await.unwrap().unwrap();
+
+    let first = claim_next_async(&cfg, DEFAULT_LOCK_DURATION_MS)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(first.id, id);
+    mark_deferred_async(
+        &cfg,
+        &first,
+        chrono::Utc::now().timestamp_millis() - 1,
+        "retry now",
+    )
+    .await
+    .unwrap();
+
+    let retry = claim_next_async(&cfg, DEFAULT_LOCK_DURATION_MS)
+        .await
+        .unwrap()
+        .expect("a new ready-generation hint must not be suppressed by the old ACKed hint");
+    assert_eq!(retry.id, id);
+    assert_eq!(retry.attempts, 1);
+}
+
+#[test]
+fn stable_job_id_rejects_a_different_payload() {
+    let (_tmp, cfg) = test_config();
+    let mut original = NewJob::extract_chunk(&ExtractChunkPayload {
+        chunk_id: "original".into(),
+    })
+    .unwrap();
+    original.id = Some("job:stable-intent".into());
+    enqueue(&cfg, &original).unwrap();
+
+    let mut conflicting = NewJob::extract_chunk(&ExtractChunkPayload {
+        chunk_id: "different".into(),
+    })
+    .unwrap();
+    conflicting.id = original.id.clone();
+    let error = enqueue(&cfg, &conflicting).unwrap_err();
+    assert!(error.to_string().contains("different intent"));
+}
+
 #[test]
 fn bootstrap_republishes_ready_jobs_even_without_an_outbox_hint() {
     let (_tmp, cfg) = test_config();
@@ -118,6 +184,22 @@ fn bootstrap_republishes_ready_jobs_even_without_an_outbox_hint() {
     );
     let claimed = claim_next(&cfg, DEFAULT_LOCK_DURATION_MS).unwrap().unwrap();
     assert_eq!(claimed.id, "job:lost-hint");
+}
+
+#[test]
+fn idle_worker_repairs_a_ready_job_whose_hint_was_lost() {
+    let (_tmp, cfg) = test_config();
+    let new_job = NewJob::extract_chunk(&ExtractChunkPayload {
+        chunk_id: "c-idle-repair".into(),
+    })
+    .unwrap();
+    let record = super::record_from_new(&cfg, &new_job, "job:idle-repair".into());
+    insert_test_record(&cfg, &record).unwrap();
+
+    let claimed = claim_next(&cfg, DEFAULT_LOCK_DURATION_MS)
+        .unwrap()
+        .expect("a later poll must repair the missing hint without process restart");
+    assert_eq!(claimed.id, "job:idle-repair");
 }
 
 #[test]
@@ -320,6 +402,7 @@ fn retired_kind_rows_are_skipped_then_purged() {
                 created_at_ms: 0,
                 started_at_ms: None,
                 completed_at_ms: None,
+                hint_generation: 0,
                 lease_epoch: 0,
                 lease_token: None,
             },
