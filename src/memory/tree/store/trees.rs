@@ -8,13 +8,50 @@ use rusqlite::{params, Connection, OptionalExtension, Transaction};
 
 use super::common::ms_to_utc;
 use super::types::{Tree, TreeKind, TreeStatus};
-use crate::memory::chunks::with_connection;
 use crate::memory::config::MemoryConfig;
 
 /// Insert a new tree row. Fails if `(kind, scope)` already exists; callers that
 /// want "get or create" semantics should go through the registry.
 pub fn insert_tree(config: &MemoryConfig, tree: &Tree) -> Result<()> {
-    with_connection(config, |conn| insert_tree_conn(conn, tree))
+    let tree_key = tree_state_key(&tree.id);
+    let scope_key = scope_state_key(tree.kind, &tree.scope);
+    let expected = vec![
+        crate::memory::chunks::versioned::StateChange {
+            collection: crate::memory::chunks::collections::TREES.to_owned(),
+            key: tree_key.clone(),
+            value: None,
+        },
+        crate::memory::chunks::versioned::StateChange {
+            collection: crate::memory::chunks::collections::TREES.to_owned(),
+            key: scope_key.clone(),
+            value: None,
+        },
+    ];
+    let changes = vec![
+        crate::memory::chunks::versioned::StateChange {
+            collection: crate::memory::chunks::collections::TREES.to_owned(),
+            key: tree_key,
+            value: Some(serde_json::to_value(tree)?),
+        },
+        crate::memory::chunks::versioned::StateChange {
+            collection: crate::memory::chunks::collections::TREES.to_owned(),
+            key: scope_key,
+            value: Some(serde_json::Value::String(tree.id.clone())),
+        },
+    ];
+    if crate::memory::chunks::versioned::commit_if_state_matches(config, &expected, &[], &changes)? {
+        Ok(())
+    } else {
+        anyhow::bail!("UNIQUE constraint failed: trees(kind, scope)")
+    }
+}
+
+fn tree_state_key(id: &str) -> String {
+    format!("tree:{id}")
+}
+
+fn scope_state_key(kind: TreeKind, scope: &str) -> String {
+    format!("scope:{}:{scope}", kind.as_str())
 }
 
 pub fn insert_tree_conn(conn: &Connection, tree: &Tree) -> Result<()> {
@@ -87,7 +124,16 @@ pub fn get_tree_by_scope(
     kind: TreeKind,
     scope: &str,
 ) -> Result<Option<Tree>> {
-    with_connection(config, |conn| get_tree_by_scope_conn(conn, kind, scope))
+    let scope_key = scope_state_key(kind, scope);
+    let tree_key = crate::memory::chunks::versioned::read_state(
+        config,
+        crate::memory::chunks::collections::TREES,
+        &scope_key,
+    )?;
+    let Some(tree_id) = tree_key.and_then(|value| value.as_str().map(str::to_owned)) else {
+        return Ok(None);
+    };
+    get_tree(config, &tree_id)
 }
 
 pub fn get_tree_by_scope_conn(
@@ -109,18 +155,12 @@ pub fn get_tree_by_scope_conn(
 
 /// Fetch a tree by primary key id.
 pub fn get_tree(config: &MemoryConfig, id: &str) -> Result<Option<Tree>> {
-    with_connection(config, |conn| {
-        let mut stmt = conn.prepare(
-            "SELECT id, kind, scope, root_id, max_level, status,
-                    created_at_ms, last_sealed_at_ms, ask
-               FROM mem_tree_trees WHERE id = ?1",
-        )?;
-        let row = stmt
-            .query_row(params![id], row_to_tree)
-            .optional()
-            .context("Failed to query tree by id")?;
-        Ok(row)
-    })
+    let value = crate::memory::chunks::versioned::read_state(
+        config,
+        crate::memory::chunks::collections::TREES,
+        &tree_state_key(id),
+    )?;
+    value.map(serde_json::from_value).transpose().map_err(Into::into)
 }
 
 /// Per-batch cap on `?` placeholders — well under SQLite's compile-time
@@ -136,51 +176,31 @@ pub fn get_trees_batch(
     if tree_ids.is_empty() {
         return Ok(HashMap::new());
     }
-    with_connection(config, |conn| {
-        let mut out: HashMap<String, Tree> = HashMap::with_capacity(tree_ids.len());
-        for window in tree_ids.chunks(TREES_MAX_FETCH_BATCH) {
-            // Only the placeholder *count* is interpolated; ids are bound.
-            let placeholders = (1..=window.len())
-                .map(|i| format!("?{i}"))
-                .collect::<Vec<_>>()
-                .join(",");
-            let sql = format!(
-                "SELECT id, kind, scope, root_id, max_level, status,
-                        created_at_ms, last_sealed_at_ms, ask
-                   FROM mem_tree_trees
-                  WHERE id IN ({placeholders})"
-            );
-            let mut stmt = conn.prepare(&sql)?;
-            let params: Vec<&dyn rusqlite::ToSql> =
-                window.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
-            let rows = stmt
-                .query_map(params.as_slice(), row_to_tree)?
-                .collect::<rusqlite::Result<Vec<_>>>()
-                .context("Failed to collect trees batch")?;
-            for t in rows {
-                out.insert(t.id.clone(), t);
+    let mut out = HashMap::with_capacity(tree_ids.len());
+    for window in tree_ids.chunks(TREES_MAX_FETCH_BATCH) {
+        for id in window {
+            if let Some(tree) = get_tree(config, id)? {
+                out.insert(tree.id.clone(), tree);
             }
         }
-        Ok(out)
-    })
+    }
+    Ok(out)
 }
 
 /// List every tree of a given kind, ordered by `created_at_ms` ASC.
 pub fn list_trees_by_kind(config: &MemoryConfig, kind: TreeKind) -> Result<Vec<Tree>> {
-    with_connection(config, |conn| {
-        let mut stmt = conn.prepare(
-            "SELECT id, kind, scope, root_id, max_level, status,
-                    created_at_ms, last_sealed_at_ms, ask
-               FROM mem_tree_trees
-              WHERE kind = ?1
-              ORDER BY created_at_ms ASC",
-        )?;
-        let rows = stmt
-            .query_map(params![kind.as_str()], row_to_tree)?
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .context("Failed to collect trees by kind")?;
-        Ok(rows)
-    })
+    let rows = crate::memory::chunks::versioned::list_state(
+        config,
+        crate::memory::chunks::collections::TREES,
+    )?;
+    let mut trees = rows
+        .into_iter()
+        .filter(|(key, _)| key.starts_with("tree:"))
+        .map(|(_, value)| serde_json::from_value::<Tree>(value))
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    trees.retain(|tree| tree.kind == kind);
+    trees.sort_by_key(|tree| tree.created_at);
+    Ok(trees)
 }
 
 /// Update a tree's root / max_level / last_sealed after a seal climbed a level.
@@ -219,14 +239,32 @@ pub fn refresh_last_sealed_tx(
 
 /// Flip a tree's status to `archived`. Idempotent.
 pub fn archive_tree(config: &MemoryConfig, tree_id: &str) -> Result<()> {
-    with_connection(config, |conn| {
-        conn.execute(
-            "UPDATE mem_tree_trees SET status = ?1 WHERE id = ?2",
-            params![TreeStatus::Archived.as_str(), tree_id],
-        )
-        .with_context(|| format!("failed to archive tree {tree_id}"))?;
-        Ok(())
-    })
+    let key = tree_state_key(tree_id);
+    for _ in 0..8 {
+        let Some(current) = crate::memory::chunks::versioned::read_state(
+            config,
+            crate::memory::chunks::collections::TREES,
+            &key,
+        )? else {
+            return Ok(());
+        };
+        let mut tree: Tree = serde_json::from_value(current.clone())?;
+        tree.status = TreeStatus::Archived;
+        let expected = [crate::memory::chunks::versioned::StateChange {
+            collection: crate::memory::chunks::collections::TREES.to_owned(),
+            key: key.clone(),
+            value: Some(current),
+        }];
+        let changes = [crate::memory::chunks::versioned::StateChange {
+            collection: crate::memory::chunks::collections::TREES.to_owned(),
+            key: key.clone(),
+            value: Some(serde_json::to_value(tree)?),
+        }];
+        if crate::memory::chunks::versioned::commit_if_state_matches(config, &expected, &[], &changes)? {
+            return Ok(());
+        }
+    }
+    anyhow::bail!("failed to archive tree {tree_id}: state changed repeatedly")
 }
 
 pub(crate) fn row_to_tree(row: &rusqlite::Row<'_>) -> rusqlite::Result<Tree> {

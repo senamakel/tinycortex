@@ -453,6 +453,10 @@ pub fn claim_next(config: &MemoryConfig, lock_duration_ms: i64) -> Result<Option
             ack(config, &delivery.receipt)?;
             continue;
         };
+        if is_retired_kind(&record.kind) {
+            ack(config, &delivery.receipt)?;
+            continue;
+        }
         if delivery
             .payload
             .get("generation")
@@ -546,6 +550,10 @@ pub(crate) async fn claim_next_async(
             ack_async(config, &delivery.receipt).await?;
             continue;
         };
+        if is_retired_kind(&record.kind) {
+            ack_async(config, &delivery.receipt).await?;
+            continue;
+        }
         if delivery
             .payload
             .get("generation")
@@ -1021,7 +1029,10 @@ pub(crate) fn repair_pending_hints(config: &MemoryConfig) -> Result<usize> {
             continue;
         }
         let mut record = decode_job(&value)?;
-        if record.status()? == JobStatus::Ready && record.available_at_ms <= now_ms {
+        if !is_retired_kind(&record.kind)
+            && record.status()? == JobStatus::Ready
+            && record.available_at_ms <= now_ms
+        {
             // Advance the durable publication generation before publishing so
             // repair can recover even when the backend still remembers the
             // previous hint's finite-window dedupe key (for example after a
@@ -1045,7 +1056,10 @@ pub(crate) async fn repair_pending_hints_async(config: &MemoryConfig) -> Result<
             continue;
         }
         let mut record = decode_job(&value)?;
-        if record.status()? == JobStatus::Ready && record.available_at_ms <= now_ms {
+        if !is_retired_kind(&record.kind)
+            && record.status()? == JobStatus::Ready
+            && record.available_at_ms <= now_ms
+        {
             record.hint_generation = record.hint_generation.saturating_add(1);
             if versioned::commit_if_state_matches_async(
                 config,
