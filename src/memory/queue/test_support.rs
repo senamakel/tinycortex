@@ -6,8 +6,8 @@
 //! re-embed progress sequence.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -15,8 +15,8 @@ use parking_lot::Mutex;
 
 use crate::memory::config::MemoryConfig;
 use crate::memory::queue::handlers::{
-    AppendDecision, DelegateOutput, ExtractDecision, JobMutation, QueueDelegates,
-    ReembedProgress, StaleBuffer,
+    AppendDecision, DelegateOutput, ExtractDecision, JobMutation, QueueDelegates, ReembedProgress,
+    StaleBuffer,
 };
 use crate::memory::queue::types::{AppendTarget, NodeRef, SealDocumentPayload, SealPayload};
 

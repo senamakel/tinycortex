@@ -27,8 +27,7 @@ use async_trait::async_trait;
 use serde::de::DeserializeOwned;
 
 use crate::memory::chunks::collections::{
-    BUFFERS, CHUNK_LIFECYCLE, ENTITY_EDGES, ENTITY_HOTNESS, ENTITY_INDEX, SCORES, SUMMARIES,
-    TREES,
+    BUFFERS, CHUNK_LIFECYCLE, ENTITY_EDGES, ENTITY_HOTNESS, ENTITY_INDEX, SCORES, SUMMARIES, TREES,
 };
 use crate::memory::chunks::versioned::StateChange;
 use crate::memory::config::MemoryConfig;
@@ -276,6 +275,9 @@ pub async fn handle_job(
     delegates: &dyn QueueDelegates,
 ) -> Result<JobOutcome> {
     let plan = plan_job(config, job, delegates).await?;
+    if !plan.mutations.is_empty() {
+        anyhow::bail!("domain mutations require lease-fenced worker settlement");
+    }
     for follow_up in &plan.follow_ups {
         if store::enqueue(config, follow_up)?.is_some()
             && follow_up.kind == JobKind::ReembedBackfill

@@ -63,15 +63,16 @@ pub const QUEUE_NAME: &str = "memory-tree-jobs";
 #[cfg(test)]
 pub(crate) mod test_support;
 
-pub use gate::{LlmGate, Permit, DEFAULT_LLM_PERMITS};
+pub use gate::{DEFAULT_LLM_PERMITS, LlmGate, Permit};
 pub use handlers::{
-    handle_job, AppendDecision, ExtractDecision, QueueDelegates, ReembedProgress, StaleBuffer,
+    AppendDecision, DelegateOutput, ExtractDecision, JobMutation, JobStateCollection,
+    QueueDelegates, ReembedProgress, StaleBuffer, handle_job,
 };
 pub use ops::{backfill_in_progress, ensure_reembed_backfill, set_backfill_in_progress};
 pub use redact::scrub_for_log;
 pub use store::{
-    claim_next, count_by_status, count_failed_unrecoverable, count_total, enqueue, enqueue_tx,
-    get_job, is_retired_kind, purge_retired_jobs, DEFAULT_LOCK_DURATION_MS,
+    DEFAULT_LOCK_DURATION_MS, claim_next, count_by_status, count_failed_unrecoverable, count_total,
+    enqueue, enqueue_tx, get_job, is_retired_kind, purge_retired_jobs,
 };
 pub use store_settle::{
     mark_deferred, mark_done, mark_failed, mark_failed_typed, recover_stale_locks,

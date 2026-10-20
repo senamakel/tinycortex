@@ -65,6 +65,37 @@ async fn extract_admits_and_enqueues_append_buffer() {
 }
 
 #[tokio::test]
+async fn extract_plan_returns_domain_mutations_without_persisting_followups() {
+    let (_tmp, cfg) = test_config();
+    let mut delegates = RecordingDelegates::admitting();
+    delegates.extract_mutations.push(JobMutation {
+        collection: JobStateCollection::ChunkScores,
+        key: "c1".into(),
+        value: Some(serde_json::json!({"score": 0.75})),
+    });
+    let job = mk_running_job(
+        JobKind::ExtractChunk,
+        serde_json::to_string(&ExtractChunkPayload {
+            chunk_id: "c1".into(),
+        })
+        .unwrap(),
+    );
+
+    let plan = plan_job(&cfg, &job, &delegates).await.unwrap();
+
+    assert_eq!(plan.outcome, JobOutcome::Done);
+    assert_eq!(plan.follow_ups.len(), 1);
+    assert_eq!(plan.mutations.len(), 1);
+    assert_eq!(plan.mutations[0].collection, "memory_chunk_scores");
+    assert_eq!(plan.mutations[0].key, "c1");
+    assert_eq!(
+        plan.mutations[0].value,
+        Some(serde_json::json!({"score": 0.75}))
+    );
+    assert_eq!(count_jobs_of_kind(&cfg, "append_buffer"), 0);
+}
+
+#[tokio::test]
 async fn extract_missing_chunk_is_noop_done() {
     let (_tmp, cfg) = test_config();
     let mut d = RecordingDelegates::admitting();
