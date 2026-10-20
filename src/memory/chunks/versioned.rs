@@ -18,7 +18,7 @@ use sha2::{Digest, Sha256};
 use tinystoragedrivers_types::{Filter, Precondition, Query, Sort, Version, WriteOptions};
 
 use super::collections::{
-    CHUNKS, CHUNK_CONTENT_POINTERS, CHUNK_VERSIONS, COMMIT_HEADS, OPERATIONS, STATE_VERSIONS,
+    CHUNK_CONTENT_POINTERS, CHUNK_VERSIONS, CHUNKS, COMMIT_HEADS, OPERATIONS, STATE_VERSIONS,
 };
 use super::types::{Chunk, StagedChunk};
 use crate::memory::config::MemoryConfig;
@@ -130,6 +130,39 @@ pub(crate) fn capture_head(config: &MemoryConfig) -> Result<HeadSnapshot> {
     }))
 }
 
+async fn capture_head_async(config: &MemoryConfig) -> Result<HeadSnapshot> {
+    let documents = config.storage()?.documents().clone();
+    let snapshot = config
+        .storage_blocking()?
+        .run_async(async move {
+            documents
+                .get(COMMIT_HEADS, "head")
+                .await?
+                .map(|record| {
+                    if record.meta.schema != RECORD_SCHEMA || record.meta.expires_ms.is_some() {
+                        return Err(tinystoragedrivers_types::StorageError::backend(
+                            "commit head has unexpected schema or expiry metadata",
+                        ));
+                    }
+                    let head: CommitHead = serde_json::from_value(record.doc)
+                        .map_err(tinystoragedrivers_types::StorageError::from)?;
+                    Ok::<HeadSnapshot, tinystoragedrivers_types::StorageError>(HeadSnapshot {
+                        op_id: Some(head.op_id),
+                        version: Some(record.version),
+                        revision: head.revision,
+                    })
+                })
+                .transpose()
+        })
+        .await?
+        .map_err(anyhow::Error::from)?;
+    Ok(snapshot.unwrap_or(HeadSnapshot {
+        op_id: None,
+        version: None,
+        revision: 0,
+    }))
+}
+
 /// Write a chunk batch as immutable versions and commit them in one head CAS.
 ///
 /// # Errors
@@ -189,6 +222,34 @@ pub(crate) fn commit_staged_chunks_if_state_matches(
     }
     all_changes.extend_from_slice(changes);
     commit_if_state_matches(config, expected, &chunks, &all_changes)
+}
+
+/// Async counterpart used by async host workflows that must also work on a
+/// current-thread Tokio runtime.
+pub(crate) async fn commit_staged_chunks_if_state_matches_async(
+    config: &MemoryConfig,
+    staged: &[StagedChunk],
+    expected: &[StateChange],
+    changes: &[StateChange],
+) -> Result<bool> {
+    let mut chunks = Vec::with_capacity(staged.len());
+    let mut all_changes = Vec::with_capacity(staged.len() + changes.len());
+    for item in staged {
+        let mut chunk = item.chunk.clone();
+        chunk.content = chunk.content.chars().take(500).collect();
+        all_changes.push(StateChange {
+            collection: CHUNK_CONTENT_POINTERS.into(),
+            key: item.chunk.id.clone(),
+            value: Some(serde_json::to_value(ChunkContentPointer {
+                chunk_id: item.chunk.id.clone(),
+                content_path: item.content_path.clone(),
+                content_sha256: item.content_sha256.clone(),
+            })?),
+        });
+        chunks.push(chunk);
+    }
+    all_changes.extend_from_slice(changes);
+    commit_if_state_matches_async(config, expected, &chunks, &all_changes).await
 }
 
 /// Update the hash metadata for an existing staged chunk pointer.
@@ -379,6 +440,75 @@ fn upsert_chunks_at(
             .await?;
         Ok::<_, tinystoragedrivers_types::StorageError>(())
     })?;
+    result.context("commit chunk version batch")?;
+    Ok(chunks.len())
+}
+
+async fn upsert_chunks_at_async(
+    config: &MemoryConfig,
+    snapshot: &HeadSnapshot,
+    chunks: &[Chunk],
+    final_chunks: &[Chunk],
+    changes: &[StateChange],
+) -> Result<usize> {
+    let (revision, ancestors) = next_revision_async(config, snapshot).await?;
+    let operation = make_manifest(snapshot, revision, ancestors, final_chunks, changes)?;
+    let expected_parent = snapshot.clone();
+    let final_chunks = final_chunks.to_vec();
+    let changes = changes.to_vec();
+    let documents = config.storage()?.documents().clone();
+    let result = config
+        .storage_blocking()?
+        .run_async(async move {
+            let op_value = serde_json::to_value(&operation)
+                .map_err(tinystoragedrivers_types::StorageError::from)?;
+            put_immutable(&*documents, OPERATIONS, &operation.op_id, op_value).await?;
+
+            for chunk in final_chunks.iter().cloned() {
+                let id = version_id(&chunk.id, &operation.op_id);
+                let body = serde_json::to_value(ChunkVersion {
+                    logical_id: chunk.id.clone(),
+                    operation_id: operation.op_id.clone(),
+                    revision,
+                    chunk,
+                })
+                .map_err(tinystoragedrivers_types::StorageError::from)?;
+                put_immutable(&*documents, CHUNK_VERSIONS, &id, body).await?;
+            }
+            for change in changes {
+                let id = state_version_id(&change.collection, &change.key, &operation.op_id);
+                let body = serde_json::to_value(StateVersion {
+                    collection: change.collection,
+                    key: change.key,
+                    operation_id: operation.op_id.clone(),
+                    revision,
+                    value: change.value,
+                })
+                .map_err(tinystoragedrivers_types::StorageError::from)?;
+                put_immutable(&*documents, STATE_VERSIONS, &id, body).await?;
+            }
+
+            let head_value = serde_json::to_value(CommitHead {
+                op_id: operation.op_id,
+                revision,
+            })
+            .map_err(tinystoragedrivers_types::StorageError::from)?;
+            let precondition = expected_parent
+                .version
+                .map(Precondition::Version)
+                .unwrap_or(Precondition::Absent);
+            documents
+                .put_with(
+                    COMMIT_HEADS,
+                    "head",
+                    head_value,
+                    precondition,
+                    WriteOptions::new().schema(RECORD_SCHEMA),
+                )
+                .await?;
+            Ok::<_, tinystoragedrivers_types::StorageError>(())
+        })
+        .await?;
     result.context("commit chunk version batch")?;
     Ok(chunks.len())
 }
@@ -741,6 +871,50 @@ pub(crate) fn read_state(
         .map_err(anyhow::Error::from)
 }
 
+/// Async state read through one captured commit head.
+pub(crate) async fn read_state_async(
+    config: &MemoryConfig,
+    collection: &str,
+    key: &str,
+) -> Result<Option<Value>> {
+    let snapshot = capture_head_async(config).await?;
+    let documents = config.storage()?.documents().clone();
+    let collection = collection.to_owned();
+    let key = key.to_owned();
+    config
+        .storage_blocking()?
+        .run_async(async move { read_state_at(&*documents, &snapshot, &collection, &key).await })
+        .await?
+        .map_err(anyhow::Error::from)
+}
+
+/// Read multiple state keys against one captured commit head.
+pub(crate) async fn read_states_async(
+    config: &MemoryConfig,
+    collection: &str,
+    keys: &[String],
+) -> Result<HashMap<String, Value>> {
+    let snapshot = capture_head_async(config).await?;
+    let documents = config.storage()?.documents().clone();
+    let collection = collection.to_owned();
+    let keys = keys.to_vec();
+    config
+        .storage_blocking()?
+        .run_async(async move {
+            let mut values = HashMap::with_capacity(keys.len());
+            for key in keys {
+                if let Some(value) =
+                    read_state_at(&*documents, &snapshot, &collection, &key).await?
+                {
+                    values.insert(key, value);
+                }
+            }
+            Ok::<_, tinystoragedrivers_types::StorageError>(values)
+        })
+        .await?
+        .map_err(anyhow::Error::from)
+}
+
 /// Read multiple state keys against one captured head revision.
 pub(crate) fn read_states(
     config: &MemoryConfig,
@@ -806,6 +980,53 @@ pub(crate) fn commit_if_state_matches(
             return Ok(false);
         }
         match upsert_chunks_at(config, &snapshot, chunks, chunks, changes) {
+            Ok(_) => return Ok(true),
+            Err(error) if is_storage_conflict(&error) => last_conflict = Some(error),
+            Err(error) => return Err(error),
+        }
+    }
+    Err(last_conflict.unwrap_or_else(|| {
+        anyhow::anyhow!("conditional state commit did not succeed within the retry budget")
+    }))
+}
+
+/// Async conditional commit for async host workflows, preserving current-
+/// thread runtime compatibility while retaining the same captured-head CAS.
+pub(crate) async fn commit_if_state_matches_async(
+    config: &MemoryConfig,
+    expected: &[StateChange],
+    chunks: &[Chunk],
+    changes: &[StateChange],
+) -> Result<bool> {
+    let mut last_conflict = None;
+    for _ in 0..CAS_RETRIES {
+        let snapshot = capture_head_async(config).await?;
+        let documents = config.storage()?.documents().clone();
+        let conditions = expected.to_vec();
+        let read_snapshot = snapshot.clone();
+        let matches = config
+            .storage_blocking()?
+            .run_async(async move {
+                for condition in conditions {
+                    if read_state_at(
+                        &*documents,
+                        &read_snapshot,
+                        &condition.collection,
+                        &condition.key,
+                    )
+                    .await?
+                        != condition.value
+                    {
+                        return Ok::<_, tinystoragedrivers_types::StorageError>(false);
+                    }
+                }
+                Ok(true)
+            })
+            .await??;
+        if !matches {
+            return Ok(false);
+        }
+        match upsert_chunks_at_async(config, &snapshot, chunks, chunks, changes).await {
             Ok(_) => return Ok(true),
             Err(error) if is_storage_conflict(&error) => last_conflict = Some(error),
             Err(error) => return Err(error),
@@ -904,6 +1125,55 @@ pub(crate) fn list_state(config: &MemoryConfig, collection: &str) -> Result<Vec<
             }
             Ok::<_, tinystoragedrivers_types::StorageError>(values)
         })?
+        .map_err(anyhow::Error::from)
+}
+
+/// Async materialization of current values in a state collection under one
+/// captured commit head.
+pub(crate) async fn list_state_async(
+    config: &MemoryConfig,
+    collection: &str,
+) -> Result<Vec<(String, Value)>> {
+    let snapshot = capture_head_async(config).await?;
+    let documents = config.storage()?.documents().clone();
+    let collection = collection.to_owned();
+    config
+        .storage_blocking()?
+        .run_async(async move {
+            let mut query = Query::filter(Filter::eq("collection", collection.clone()))
+                .sort(Sort::asc("key"))
+                .limit(PAGE_SIZE);
+            let mut keys = HashSet::new();
+            loop {
+                let page = documents.query(STATE_VERSIONS, &query).await?;
+                for row in page.items {
+                    if row.meta.schema != RECORD_SCHEMA || row.meta.expires_ms.is_some() {
+                        return Err(tinystoragedrivers_types::StorageError::backend(
+                            "state version has unexpected schema or expiry metadata",
+                        ));
+                    }
+                    let version: StateVersion = serde_json::from_value(row.doc)
+                        .map_err(tinystoragedrivers_types::StorageError::from)?;
+                    if version.collection == collection {
+                        keys.insert(version.key);
+                    }
+                }
+                match page.next {
+                    Some(cursor) => query = query.clone().after(cursor),
+                    None => break,
+                }
+            }
+            let mut values = Vec::new();
+            for key in keys {
+                if let Some(value) =
+                    read_state_at(&*documents, &snapshot, &collection, &key).await?
+                {
+                    values.push((key, value));
+                }
+            }
+            Ok::<_, tinystoragedrivers_types::StorageError>(values)
+        })
+        .await?
         .map_err(anyhow::Error::from)
 }
 
@@ -1134,6 +1404,64 @@ fn next_revision(config: &MemoryConfig, snapshot: &HeadSnapshot) -> Result<(u64,
             }
             Ok::<_, tinystoragedrivers_types::StorageError>((revision, ancestors))
         })?
+        .map_err(anyhow::Error::from)
+}
+
+async fn next_revision_async(
+    config: &MemoryConfig,
+    snapshot: &HeadSnapshot,
+) -> Result<(u64, Vec<String>)> {
+    let Some(head) = snapshot.op_id.clone() else {
+        return Ok((1, Vec::new()));
+    };
+    let documents = config.storage()?.documents().clone();
+    let expected_revision = snapshot.revision;
+    config
+        .storage_blocking()?
+        .run_async(async move {
+            let record = documents.get(OPERATIONS, &head).await?.ok_or_else(|| {
+                tinystoragedrivers_types::StorageError::backend(
+                    "commit head references a missing operation manifest",
+                )
+            })?;
+            if record.meta.schema != RECORD_SCHEMA || record.meta.expires_ms.is_some() {
+                return Err(tinystoragedrivers_types::StorageError::backend(
+                    "operation manifest has unexpected schema or expiry metadata",
+                ));
+            }
+            let operation: OperationManifest = serde_json::from_value(record.doc)
+                .map_err(tinystoragedrivers_types::StorageError::from)?;
+            if operation.op_id != head || operation.revision != expected_revision {
+                return Err(tinystoragedrivers_types::StorageError::backend(
+                    "commit head does not match its operation manifest",
+                ));
+            }
+            let revision = operation.revision.checked_add(1).ok_or_else(|| {
+                tinystoragedrivers_types::StorageError::backend("commit revision overflow")
+            })?;
+            let mut ancestors = vec![head];
+            for level in 1..u64::BITS as usize {
+                let previous_distance = 1_u64 << (level - 1);
+                if previous_distance >= revision {
+                    break;
+                }
+                let previous_id = ancestors[level - 1].clone();
+                let previous_revision = revision - previous_distance;
+                let previous = manifest_at_revision(&*documents, &previous_id, previous_revision)
+                    .await?
+                    .ok_or_else(|| {
+                        tinystoragedrivers_types::StorageError::backend(
+                            "operation manifest references a missing ancestor",
+                        )
+                    })?;
+                let Some(ancestor) = previous.ancestors.get(level - 1) else {
+                    break;
+                };
+                ancestors.push(ancestor.clone());
+            }
+            Ok::<_, tinystoragedrivers_types::StorageError>((revision, ancestors))
+        })
+        .await?
         .map_err(anyhow::Error::from)
 }
 

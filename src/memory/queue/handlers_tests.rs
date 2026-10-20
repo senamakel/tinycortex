@@ -1,15 +1,13 @@
 use super::*;
-use crate::memory::chunks::with_connection;
 use crate::memory::config::MemoryConfig;
 use crate::memory::queue::test_support::RecordingDelegates;
 use crate::memory::queue::types::{JobStatus, ReembedBackfillPayload};
-use rusqlite::params;
 use std::collections::VecDeque;
 use tempfile::TempDir;
 
 fn test_config() -> (TempDir, MemoryConfig) {
     let tmp = TempDir::new().unwrap();
-    let cfg = MemoryConfig::new(tmp.path());
+    let cfg = crate::memory::chunks::test_support::host_config(tmp.path());
     (tmp, cfg)
 }
 
@@ -29,25 +27,15 @@ fn mk_running_job(kind: JobKind, payload_json: String) -> Job {
         created_at_ms: now_ms,
         started_at_ms: Some(now_ms),
         completed_at_ms: None,
+        lease_epoch: 1,
+        queue_receipt: None,
         failure_reason: None,
         failure_class: None,
     }
 }
 
-fn count_jobs_of_kind(cfg: &MemoryConfig, kind: &str) -> u64 {
-    with_connection(cfg, |conn| {
-        let n: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM mem_tree_jobs WHERE kind = ?1",
-            params![kind],
-            |r| r.get(0),
-        )?;
-        Ok(n.max(0) as u64)
-    })
-    .unwrap()
-}
-
 #[tokio::test]
-async fn extract_admits_and_enqueues_append_buffer() {
+async fn extract_admits_and_plans_append_buffer() {
     let (_tmp, cfg) = test_config();
     let d = RecordingDelegates::admitting();
     let job = mk_running_job(
@@ -57,20 +45,27 @@ async fn extract_admits_and_enqueues_append_buffer() {
         })
         .unwrap(),
     );
-    let out = handle_job(&cfg, &job, &d).await.unwrap();
-    assert_eq!(out, JobOutcome::Done);
-    assert_eq!(count_jobs_of_kind(&cfg, "append_buffer"), 1);
+    let plan = plan_job(&cfg, &job, &d).await.unwrap();
+    assert_eq!(plan.outcome, JobOutcome::Done);
+    assert_eq!(plan.follow_ups.len(), 1);
+    assert_eq!(plan.follow_ups[0].kind, JobKind::AppendBuffer);
     // Covered space → no reembed chain armed.
-    assert_eq!(count_jobs_of_kind(&cfg, "reembed_backfill"), 0);
+    assert!(
+        !plan
+            .follow_ups
+            .iter()
+            .any(|job| job.kind == JobKind::ReembedBackfill)
+    );
 }
 
-#[tokio::test]
-async fn extract_plan_returns_domain_mutations_without_persisting_followups() {
+#[test]
+fn extract_plan_returns_domain_mutations_without_persisting_followups() {
     let (_tmp, cfg) = test_config();
     let mut delegates = RecordingDelegates::admitting();
     delegates.extract_mutations.push(JobMutation {
         collection: JobStateCollection::ChunkScores,
         key: "c1".into(),
+        expected: None,
         value: Some(serde_json::json!({"score": 0.75})),
     });
     let job = mk_running_job(
@@ -81,18 +76,27 @@ async fn extract_plan_returns_domain_mutations_without_persisting_followups() {
         .unwrap(),
     );
 
-    let plan = plan_job(&cfg, &job, &delegates).await.unwrap();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let plan = runtime.block_on(plan_job(&cfg, &job, &delegates)).unwrap();
 
     assert_eq!(plan.outcome, JobOutcome::Done);
     assert_eq!(plan.follow_ups.len(), 1);
     assert_eq!(plan.mutations.len(), 1);
     assert_eq!(plan.mutations[0].collection, "memory_chunk_scores");
     assert_eq!(plan.mutations[0].key, "c1");
+    assert_eq!(plan.expected[0].value, None);
     assert_eq!(
         plan.mutations[0].value,
         Some(serde_json::json!({"score": 0.75}))
     );
-    assert_eq!(count_jobs_of_kind(&cfg, "append_buffer"), 0);
+    // The returned append intent remains unpersisted until the worker commits
+    // it with this job's lease receipt.
+    drop(runtime);
+    let queued = crate::memory::queue::store::count_total(&cfg).unwrap();
+    assert_eq!(queued, 0);
 }
 
 #[tokio::test]
@@ -107,12 +111,13 @@ async fn extract_missing_chunk_is_noop_done() {
         })
         .unwrap(),
     );
-    assert_eq!(handle_job(&cfg, &job, &d).await.unwrap(), JobOutcome::Done);
-    assert_eq!(count_jobs_of_kind(&cfg, "append_buffer"), 0);
+    let plan = plan_job(&cfg, &job, &d).await.unwrap();
+    assert_eq!(plan.outcome, JobOutcome::Done);
+    assert!(plan.follow_ups.is_empty());
 }
 
 #[tokio::test]
-async fn extract_dropped_chunk_enqueues_nothing() {
+async fn extract_dropped_chunk_plans_nothing() {
     let (_tmp, cfg) = test_config();
     let mut d = RecordingDelegates::admitting();
     d.extract = Some(ExtractDecision {
@@ -127,8 +132,8 @@ async fn extract_dropped_chunk_enqueues_nothing() {
         })
         .unwrap(),
     );
-    handle_job(&cfg, &job, &d).await.unwrap();
-    assert_eq!(count_jobs_of_kind(&cfg, "append_buffer"), 0);
+    let plan = plan_job(&cfg, &job, &d).await.unwrap();
+    assert!(plan.follow_ups.is_empty());
 }
 
 #[tokio::test]
@@ -147,10 +152,9 @@ async fn extract_admits_doc_subtree_skips_flat_append() {
         })
         .unwrap(),
     );
-    handle_job(&cfg, &job, &d).await.unwrap();
-    assert_eq!(
-        count_jobs_of_kind(&cfg, "append_buffer"),
-        0,
+    let plan = plan_job(&cfg, &job, &d).await.unwrap();
+    assert!(
+        plan.follow_ups.is_empty(),
         "document-subtree sources don't use the flat L0 buffer"
     );
 }
@@ -167,12 +171,17 @@ async fn extract_arms_reembed_when_uncovered() {
         })
         .unwrap(),
     );
-    handle_job(&cfg, &job, &d).await.unwrap();
-    assert_eq!(count_jobs_of_kind(&cfg, "reembed_backfill"), 1);
+    let plan = plan_job(&cfg, &job, &d).await.unwrap();
+    assert_eq!(plan.follow_ups.len(), 2);
+    assert!(
+        plan.follow_ups
+            .iter()
+            .any(|job| job.kind == JobKind::ReembedBackfill)
+    );
 }
 
 #[tokio::test]
-async fn append_buffer_enqueues_seal_when_gate_met() {
+async fn append_buffer_plans_seal_when_gate_met() {
     let (_tmp, cfg) = test_config();
     let d = RecordingDelegates::admitting();
     let payload = AppendBufferPayload {
@@ -187,8 +196,9 @@ async fn append_buffer_enqueues_seal_when_gate_met() {
         JobKind::AppendBuffer,
         serde_json::to_string(&payload).unwrap(),
     );
-    handle_job(&cfg, &job, &d).await.unwrap();
-    assert_eq!(count_jobs_of_kind(&cfg, "seal"), 1);
+    let plan = plan_job(&cfg, &job, &d).await.unwrap();
+    assert_eq!(plan.follow_ups.len(), 1);
+    assert_eq!(plan.follow_ups[0].kind, JobKind::Seal);
 }
 
 #[tokio::test]
@@ -211,14 +221,20 @@ async fn append_buffer_no_seal_when_gate_unmet() {
         JobKind::AppendBuffer,
         serde_json::to_string(&payload).unwrap(),
     );
-    handle_job(&cfg, &job, &d).await.unwrap();
-    assert_eq!(count_jobs_of_kind(&cfg, "seal"), 0);
+    let plan = plan_job(&cfg, &job, &d).await.unwrap();
+    assert!(plan.follow_ups.is_empty());
 }
 
 #[tokio::test]
-async fn seal_enqueues_parent_when_cascading() {
+async fn seal_plans_parent_when_cascading() {
     let (_tmp, cfg) = test_config();
-    let d = RecordingDelegates::admitting();
+    let mut d = RecordingDelegates::admitting();
+    d.seal_mutations.push(JobMutation {
+        collection: JobStateCollection::Trees,
+        key: "tree:slack".into(),
+        expected: Some(serde_json::json!({"root_id": "summary:0"})),
+        value: Some(serde_json::json!({"root_id": "summary:1"})),
+    });
     *d.seal_parent.lock() = Some(SealPayload {
         tree_id: "tree:slack".into(),
         level: 1,
@@ -230,13 +246,22 @@ async fn seal_enqueues_parent_when_cascading() {
         force_now_ms: None,
     };
     let job = mk_running_job(JobKind::Seal, serde_json::to_string(&payload).unwrap());
-    handle_job(&cfg, &job, &d).await.unwrap();
-    // The level-1 parent seal is now queued (distinct dedupe key from level 0).
-    assert_eq!(count_jobs_of_kind(&cfg, "seal"), 1);
+    let plan = plan_job(&cfg, &job, &d).await.unwrap();
+    // The level-1 parent seal is represented as an intent for worker settlement.
+    assert_eq!(plan.follow_ups.len(), 1);
+    assert_eq!(plan.follow_ups[0].kind, JobKind::Seal);
+    assert_eq!(plan.mutations.len(), 1);
+    assert_eq!(plan.mutations[0].collection, "memory_trees");
+    assert_eq!(plan.expected[0].collection, plan.mutations[0].collection);
+    assert_eq!(plan.expected[0].key, plan.mutations[0].key);
+    assert_eq!(
+        plan.expected[0].value,
+        Some(serde_json::json!({"root_id": "summary:0"}))
+    );
 }
 
 #[tokio::test]
-async fn flush_stale_enqueues_a_seal_per_stale_buffer() {
+async fn flush_stale_plans_a_seal_per_stale_buffer() {
     let (_tmp, cfg) = test_config();
     let mut d = RecordingDelegates::admitting();
     d.stale = vec![
@@ -253,8 +278,26 @@ async fn flush_stale_enqueues_a_seal_per_stale_buffer() {
         JobKind::FlushStale,
         serde_json::to_string(&FlushStalePayload::default()).unwrap(),
     );
-    handle_job(&cfg, &job, &d).await.unwrap();
-    assert_eq!(count_jobs_of_kind(&cfg, "seal"), 2);
+    let plan = plan_job(&cfg, &job, &d).await.unwrap();
+    assert_eq!(plan.follow_ups.len(), 2);
+    assert!(plan.follow_ups.iter().all(|job| job.kind == JobKind::Seal));
+}
+
+#[tokio::test]
+async fn direct_handle_rejects_plans_with_effects() {
+    let (_tmp, cfg) = test_config();
+    let delegates = RecordingDelegates::admitting();
+    let job = mk_running_job(
+        JobKind::ExtractChunk,
+        serde_json::to_string(&ExtractChunkPayload {
+            chunk_id: "c1".into(),
+        })
+        .unwrap(),
+    );
+
+    let error = handle_job(&cfg, &job, &delegates).await.unwrap_err();
+
+    assert!(error.to_string().contains("lease-fenced worker settlement"));
 }
 
 #[tokio::test]
@@ -271,7 +314,9 @@ async fn seal_document_empty_is_noop() {
         JobKind::SealDocument,
         serde_json::to_string(&payload).unwrap(),
     );
-    assert_eq!(handle_job(&cfg, &job, &d).await.unwrap(), JobOutcome::Done);
+    let plan = plan_job(&cfg, &job, &d).await.unwrap();
+    assert_eq!(plan.outcome, JobOutcome::Done);
+    assert!(plan.follow_ups.is_empty());
     assert_eq!(
         d.counts
             .seal_document
@@ -283,7 +328,13 @@ async fn seal_document_empty_is_noop() {
 #[tokio::test]
 async fn seal_document_nonempty_calls_delegate() {
     let (_tmp, cfg) = test_config();
-    let d = RecordingDelegates::admitting();
+    let mut d = RecordingDelegates::admitting();
+    d.document_mutations.push(JobMutation {
+        collection: JobStateCollection::Summaries,
+        key: "summary:doc:v1".into(),
+        expected: None,
+        value: Some(serde_json::json!({"tree_id": "tree:doc"})),
+    });
     let payload = SealDocumentPayload {
         tree_scope: "notion:conn1".into(),
         doc_id: "notion:conn1:p".into(),
@@ -294,7 +345,10 @@ async fn seal_document_nonempty_calls_delegate() {
         JobKind::SealDocument,
         serde_json::to_string(&payload).unwrap(),
     );
-    handle_job(&cfg, &job, &d).await.unwrap();
+    let plan = plan_job(&cfg, &job, &d).await.unwrap();
+    assert_eq!(plan.outcome, JobOutcome::Done);
+    assert_eq!(plan.mutations.len(), 1);
+    assert_eq!(plan.mutations[0].collection, "memory_summaries");
     assert_eq!(
         d.counts
             .seal_document
@@ -306,7 +360,13 @@ async fn seal_document_nonempty_calls_delegate() {
 #[tokio::test]
 async fn reembed_defers_when_more_pending_then_done() {
     let (_tmp, cfg) = test_config();
-    let d = RecordingDelegates::admitting();
+    let mut d = RecordingDelegates::admitting();
+    d.reembed_mutations.push(JobMutation {
+        collection: JobStateCollection::ChunkEmbeddings,
+        key: "[\"c1\",\"sig\"]".into(),
+        expected: None,
+        value: Some(serde_json::json!({"dim": 3})),
+    });
     *d.reembed.lock() = VecDeque::from([
         ReembedProgress::Wrote { more_pending: true },
         ReembedProgress::Covered,
@@ -318,13 +378,19 @@ async fn reembed_defers_when_more_pending_then_done() {
         })
         .unwrap(),
     );
-    let out = handle_job(&cfg, &job, &d).await.unwrap();
+    let first_plan = plan_job(&cfg, &job, &d).await.unwrap();
+    let out = first_plan.outcome;
     assert!(
         matches!(out, JobOutcome::Defer { .. }),
         "more pending → Defer"
     );
+    assert_eq!(first_plan.mutations.len(), 1);
+    assert_eq!(
+        first_plan.mutations[0].collection,
+        "memory_chunk_embeddings"
+    );
 
-    let out2 = handle_job(&cfg, &job, &d).await.unwrap();
+    let out2 = plan_job(&cfg, &job, &d).await.unwrap().outcome;
     assert_eq!(out2, JobOutcome::Done, "covered → Done");
 }
 
@@ -340,5 +406,8 @@ async fn reembed_no_provider_completes_without_defer() {
         })
         .unwrap(),
     );
-    assert_eq!(handle_job(&cfg, &job, &d).await.unwrap(), JobOutcome::Done);
+    assert_eq!(
+        plan_job(&cfg, &job, &d).await.unwrap().outcome,
+        JobOutcome::Done
+    );
 }

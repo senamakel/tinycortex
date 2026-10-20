@@ -7,7 +7,6 @@ use anyhow::Result;
 
 use crate::memory::config::MemoryConfig;
 use crate::memory::queue::handlers::QueueDelegates;
-use crate::memory::queue::store;
 use crate::memory::queue::types::{NewJob, ReembedBackfillPayload};
 
 /// Set while a re-embed backfill chain has work pending.
@@ -30,25 +29,21 @@ pub fn backfill_in_progress() -> bool {
     BACKFILL_IN_PROGRESS.load(Ordering::Relaxed)
 }
 
-/// Ensure a re-embed backfill chain exists for the **current** active
-/// signature, if (and only if) there is uncovered work.
+/// Plan a re-embed backfill intent for the **current** active signature, if
+/// (and only if) there is uncovered work.
 ///
 /// This is the switch-path trigger: call it after the embedder config changes
 /// (a new signature → every prior row is missing at it). Idempotent: the
 /// per-signature dedupe key means at most one chain per space, and a covered
-/// space enqueues nothing. The "active signature" and "is there uncovered
-/// work?" probes are delegated, since they read the embedding store the queue
-/// does not own.
-pub fn ensure_reembed_backfill(
+/// space produces no intent. The caller commits the returned intent with the
+/// owner state that established the need; this helper never publishes a queue
+/// hint. The "active signature" and "is there uncovered work?" probes are
+/// delegated, since they read the embedding store the queue does not own.
+pub fn plan_reembed_backfill(
     config: &MemoryConfig,
     delegates: &dyn QueueDelegates,
-) -> Result<()> {
-    if let Some(job) = planned_reembed_backfill(config, delegates)? {
-        if store::enqueue(config, &job)?.is_some() {
-            set_backfill_in_progress(true);
-        }
-    }
-    Ok(())
+) -> Result<Option<NewJob>> {
+    planned_reembed_backfill(config, delegates)
 }
 
 /// Build the deduplicated re-embed follow-up without persisting it. Workers

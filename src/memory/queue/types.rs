@@ -1,9 +1,10 @@
 //! Job types for the async memory-tree pipeline.
 //!
-//! Each `Job` row in `mem_tree_jobs` stores its discriminator as a string
-//! `kind` plus a JSON-encoded `payload`. The strongly-typed payload structs
-//! below own (de)serialisation; handlers parse the payload by branching on
-//! [`JobKind`] and calling the matching `from_payload_json`.
+//! Each durable owner-state record in `memory_tree_jobs` stores its
+//! discriminator as a string `kind` plus a JSON-encoded `payload`. The
+//! strongly-typed payload structs below own (de)serialisation; handlers parse
+//! the payload by branching on [`JobKind`] and calling the matching
+//! `from_payload_json`.
 //!
 //! Ported from OpenHuman's `memory_queue::types`. The one substitution: the
 //! upstream typed-failure classifier lived in `memory_tree::health`
@@ -12,14 +13,14 @@
 //! contract the queue cares about: a machine-readable `code`, a `class`
 //! (`transient` / `unrecoverable`), and [`JobFailure::is_unrecoverable`].
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 
 pub use super::payloads::{
     AppendBufferPayload, AppendTarget, ExtractChunkPayload, FlushStalePayload, NodeRef,
     ReembedBackfillPayload, SealDocumentPayload, SealPayload,
 };
 
-/// Discriminator persisted in `mem_tree_jobs.kind`.
+/// Discriminator persisted in the `memory_tree_jobs` owner-state collection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum JobKind {
     /// Run LLM entity extraction over a single chunk and decide admission.
@@ -41,7 +42,7 @@ pub enum JobKind {
 }
 
 impl JobKind {
-    /// Snake-case wire string written to `mem_tree_jobs.kind`.
+    /// Snake-case wire string written to the durable job record.
     pub fn as_str(&self) -> &'static str {
         match self {
             JobKind::ExtractChunk => "extract_chunk",
@@ -67,7 +68,7 @@ impl JobKind {
             "topic_route" | "digest_daily" => {
                 return Err(anyhow!(
                     "retired JobKind '{s}' (global/topic trees removed)"
-                ))
+                ));
             }
             "reembed_backfill" => JobKind::ReembedBackfill,
             "seal_document" => JobKind::SealDocument,
@@ -118,10 +119,10 @@ pub enum JobOutcome {
     },
 }
 
-/// Lifecycle states persisted on `mem_tree_jobs.status`. Workers transition
+/// Lifecycle states persisted in the `memory_tree_jobs` owner-state records. Workers transition
 /// `ready → running → done|failed`. `Cancelled` settles a job outside the
-/// worker path — currently a failed row superseded by a newer one with the same
-/// `dedupe_key` during requeue (see `requeue_failed_where`).
+/// worker path when a failed row is superseded by a newer failed row with the
+/// same dedupe key during retry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JobStatus {
     /// Claimable: waiting for a worker (wire string `ready`).
@@ -140,7 +141,7 @@ pub enum JobStatus {
 }
 
 impl JobStatus {
-    /// Snake-case wire string written to `mem_tree_jobs.status`.
+    /// Snake-case wire string written to the durable job record.
     pub fn as_str(&self) -> &'static str {
         match self {
             JobStatus::Ready => "ready",
@@ -224,18 +225,18 @@ impl std::fmt::Display for JobFailure {
 
 impl std::error::Error for JobFailure {}
 
-/// One row in `mem_tree_jobs`. `payload_json` is left as a raw string so
-/// callers parse it lazily based on `kind`.
+/// One durable queue job. `payload_json` is left as a raw string so callers
+/// parse it lazily based on `kind`.
 #[derive(Clone, Debug)]
 pub struct Job {
-    /// Row id (primary key in `mem_tree_jobs`).
+    /// Durable job id.
     pub id: String,
     /// Job discriminator selecting the handler and payload shape.
     pub kind: JobKind,
     /// Raw JSON payload, parsed lazily by the handler based on `kind`.
     pub payload_json: String,
-    /// Optional dedupe key backing the partial unique index that suppresses
-    /// duplicate in-flight enqueues; `None` disables dedupe for this row.
+    /// Optional dedupe key used to suppress duplicate in-flight enqueues;
+    /// `None` disables dedupe for this job.
     pub dedupe_key: Option<String>,
     /// Current lifecycle state.
     pub status: JobStatus,
@@ -262,6 +263,13 @@ pub struct Job {
     pub started_at_ms: Option<i64>,
     /// UTC ms when the row reached a terminal status; `None` until settled.
     pub completed_at_ms: Option<i64>,
+    /// Monotonic durable claim generation. Handler writes compare this value
+    /// together with the state head, so an expired worker cannot publish after
+    /// a later delivery has claimed the same job.
+    pub lease_epoch: u64,
+    /// Queue-port receipt for the current delivery. Present only on a claimed
+    /// job; settlement acknowledges/nacks this hint after its state CAS.
+    pub queue_receipt: Option<tinystoragedrivers_types::Receipt>,
 }
 
 /// Caller-side bundle for `enqueue` — `Job` minus the persistence-only columns.

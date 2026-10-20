@@ -1,5 +1,4 @@
 use super::*;
-use crate::memory::chunks::with_connection;
 use crate::memory::config::MemoryConfig;
 use crate::memory::queue::types::{
     AppendBufferPayload, AppendTarget, ExtractChunkPayload, FlushStalePayload, NodeRef,
@@ -9,7 +8,7 @@ use tempfile::TempDir;
 
 fn test_config() -> (TempDir, MemoryConfig) {
     let tmp = TempDir::new().unwrap();
-    let cfg = MemoryConfig::new(tmp.path());
+    let cfg = crate::memory::chunks::test_support::host_config(tmp.path());
     (tmp, cfg)
 }
 
@@ -104,6 +103,169 @@ fn stable_outbox_hint_id_suppresses_republication_after_job_completion() {
 }
 
 #[test]
+fn bootstrap_republishes_ready_jobs_even_without_an_outbox_hint() {
+    let (_tmp, cfg) = test_config();
+    let new_job = NewJob::extract_chunk(&ExtractChunkPayload {
+        chunk_id: "c-lost-hint".into(),
+    })
+    .unwrap();
+    let record = super::record_from_new(&cfg, &new_job, "job:lost-hint".into());
+    insert_test_record(&cfg, &record).unwrap();
+
+    assert_eq!(
+        crate::memory::queue::worker::bootstrap(&cfg).unwrap(),
+        (0, 0)
+    );
+    let claimed = claim_next(&cfg, DEFAULT_LOCK_DURATION_MS).unwrap().unwrap();
+    assert_eq!(claimed.id, "job:lost-hint");
+}
+
+#[test]
+fn owner_head_commit_fences_domain_changes_and_follow_ups_together() {
+    use crate::memory::chunks::versioned::{self, StateChange};
+    use crate::memory::queue::store::{JobRecord, commit_claimed};
+    use serde_json::json;
+
+    let (_tmp, cfg) = test_config();
+    let id = enqueue(
+        &cfg,
+        &NewJob::extract_chunk(&ExtractChunkPayload {
+            chunk_id: "c-owner-cas".into(),
+        })
+        .unwrap(),
+    )
+    .unwrap()
+    .unwrap();
+    let claim = claim_next(&cfg, DEFAULT_LOCK_DURATION_MS).unwrap().unwrap();
+    let child = NewJob::seal(&SealPayload {
+        tree_id: "tree:owner-cas".into(),
+        level: 0,
+        force_now_ms: None,
+    })
+    .unwrap();
+    let mut child = child;
+    child.id = Some("job:owner-cas-child".into());
+    let expected = [StateChange {
+        collection: "test_domain".into(),
+        key: "record".into(),
+        value: None,
+    }];
+    versioned::write_state(
+        &cfg,
+        StateChange {
+            collection: "test_domain".into(),
+            key: "record".into(),
+            value: Some(json!({"writer": "raced"})),
+        },
+    )
+    .unwrap();
+    let mut next = JobRecord::from_public(&claim);
+    next.status = JobStatus::Done.as_str().into();
+    next.completed_at_ms = Some(Utc::now().timestamp_millis());
+
+    let committed = commit_claimed(
+        &cfg,
+        &claim,
+        next,
+        &expected,
+        &[StateChange {
+            collection: "test_domain".into(),
+            key: "record".into(),
+            value: Some(json!({"writer": "worker"})),
+        }],
+        &[child],
+    )
+    .unwrap();
+
+    assert!(!committed, "the stale delegate snapshot must lose the CAS");
+    assert_eq!(
+        get_job(&cfg, &id).unwrap().unwrap().status,
+        JobStatus::Running
+    );
+    assert_eq!(
+        versioned::read_state(&cfg, "test_domain", "record").unwrap(),
+        Some(json!({"writer": "raced"}))
+    );
+    assert!(get_job(&cfg, "job:owner-cas-child").unwrap().is_none());
+}
+
+#[test]
+fn same_parent_dedupe_follow_up_is_suppressed_while_parent_is_active() {
+    use crate::memory::queue::store_settle::mark_done_with_followups;
+
+    let (_tmp, cfg) = test_config();
+    let payload = ExtractChunkPayload {
+        chunk_id: "c-same-dedupe".into(),
+    };
+    let parent_id = enqueue(&cfg, &NewJob::extract_chunk(&payload).unwrap())
+        .unwrap()
+        .unwrap();
+    let claim = claim_next(&cfg, DEFAULT_LOCK_DURATION_MS).unwrap().unwrap();
+    let duplicate = NewJob::extract_chunk(&payload).unwrap();
+
+    assert!(mark_done_with_followups(&cfg, &claim, &[duplicate]).unwrap());
+    assert_eq!(
+        get_job(&cfg, &parent_id).unwrap().unwrap().status,
+        JobStatus::Done
+    );
+    assert_eq!(count_total(&cfg).unwrap(), 1);
+}
+
+#[test]
+fn expired_receipt_cannot_settle_after_a_new_claim_generation() {
+    let (_tmp, cfg) = test_config();
+    let id = enqueue(
+        &cfg,
+        &NewJob::extract_chunk(&ExtractChunkPayload {
+            chunk_id: "c-lease-epoch".into(),
+        })
+        .unwrap(),
+    )
+    .unwrap()
+    .unwrap();
+    let old_claim = claim_next(&cfg, DEFAULT_LOCK_DURATION_MS).unwrap().unwrap();
+    update_test_record(&cfg, &id, |record| record.locked_until_ms = Some(0)).unwrap();
+    assert!(
+        !crate::memory::queue::store_settle::mark_done_with_changes(
+            &cfg,
+            &old_claim,
+            &[],
+            &[],
+            &[StateChange {
+                collection: "test_domain".into(),
+                key: "expired-owner-write".into(),
+                value: Some(json!({"must_not_commit": true})),
+            }],
+        )
+        .unwrap(),
+        "an expired lease cannot settle or commit domain effects"
+    );
+    assert_eq!(
+        versioned::read_state(&cfg, "test_domain", "expired-owner-write").unwrap(),
+        None
+    );
+    // Make a fresh hint available after expiring the first test receipt.
+    ack(&cfg, old_claim.queue_receipt.as_ref().unwrap()).unwrap();
+    crate::memory::queue::store_settle::recover_stale_locks(&cfg).unwrap();
+    let new_claim = claim_next(&cfg, DEFAULT_LOCK_DURATION_MS).unwrap().unwrap();
+    assert!(new_claim.lease_epoch > old_claim.lease_epoch);
+
+    assert!(
+        !crate::memory::queue::store_settle::mark_done_with_followups(&cfg, &old_claim, &[],)
+            .unwrap()
+    );
+    assert_eq!(
+        get_job(&cfg, &id).unwrap().unwrap().status,
+        JobStatus::Running
+    );
+    assert!(
+        crate::memory::queue::store_settle::mark_done_with_followups(&cfg, &new_claim, &[],)
+            .unwrap()
+    );
+    assert_eq!(get_job(&cfg, &id).unwrap().unwrap().status, JobStatus::Done);
+}
+
+#[test]
 fn count_by_status_reports_each_state() {
     use crate::memory::queue::store_settle::mark_done;
     let (_tmp, cfg) = test_config();
@@ -139,21 +301,31 @@ fn retired_kind_rows_are_skipped_then_purged() {
     let (_tmp, cfg) = test_config();
 
     // Insert two raw retired rows directly (no NewJob path exists for them).
-    with_connection(&cfg, |conn| {
-        for (id, kind) in [
-            ("job:retired-1", "topic_route"),
-            ("job:retired-2", "digest_daily"),
-        ] {
-            conn.execute(
-                "INSERT INTO mem_tree_jobs (id, kind, payload_json, status, attempts,
-                    max_attempts, available_at_ms, created_at_ms)
-                 VALUES (?1, ?2, '{}', 'ready', 0, 5, 0, 0)",
-                params![id, kind],
-            )?;
-        }
-        Ok(())
-    })
-    .unwrap();
+    for (id, kind) in [("retired-1", "topic_route"), ("retired-2", "digest_daily")] {
+        insert_test_record(
+            &cfg,
+            &JobRecord {
+                id: id.to_owned(),
+                kind: kind.to_owned(),
+                payload_json: "{}".to_owned(),
+                dedupe_key: None,
+                status: JobStatus::Ready.as_str().to_owned(),
+                attempts: 0,
+                max_attempts: 5,
+                available_at_ms: 0,
+                locked_until_ms: None,
+                last_error: None,
+                failure_reason: None,
+                failure_class: None,
+                created_at_ms: 0,
+                started_at_ms: None,
+                completed_at_ms: None,
+                lease_epoch: 0,
+                lease_token: None,
+            },
+        )
+        .unwrap();
+    }
 
     // A live job alongside them.
     let live = NewJob::extract_chunk(&ExtractChunkPayload {
@@ -167,9 +339,11 @@ fn retired_kind_rows_are_skipped_then_purged() {
     assert_eq!(claimed.id, live_id);
     assert_eq!(claimed.kind, JobKind::ExtractChunk);
     // No further claimable rows (retired ones are excluded).
-    assert!(claim_next(&cfg, DEFAULT_LOCK_DURATION_MS)
-        .unwrap()
-        .is_none());
+    assert!(
+        claim_next(&cfg, DEFAULT_LOCK_DURATION_MS)
+            .unwrap()
+            .is_none()
+    );
 
     // Purge removes exactly the two retired rows; the live row stays.
     let purged = purge_retired_jobs(&cfg).unwrap();
@@ -217,9 +391,11 @@ fn claim_next_prefers_reembed_backfill_over_older_extract_chunk() {
     assert_eq!(second.id, extract_id);
     assert_eq!(second.kind, JobKind::ExtractChunk);
 
-    assert!(claim_next(&cfg, DEFAULT_LOCK_DURATION_MS)
-        .unwrap()
-        .is_none());
+    assert!(
+        claim_next(&cfg, DEFAULT_LOCK_DURATION_MS)
+            .unwrap()
+            .is_none()
+    );
 }
 
 /// Pins the whole claim ladder: `seal` > `reembed_backfill` > `flush_stale` >

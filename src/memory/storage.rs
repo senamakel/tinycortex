@@ -31,6 +31,7 @@ impl Blocking {
     /// Start the runtime thread used by this bridge.
     pub(crate) fn new() -> tinystoragedrivers_types::Result<Self> {
         let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
             .build()
             .map_err(|error| {
                 StorageError::backend("cannot build storage runtime").with_source(error)

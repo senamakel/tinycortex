@@ -11,7 +11,7 @@ use tokio::time::sleep;
 
 fn test_config() -> (TempDir, MemoryConfig) {
     let tmp = TempDir::new().unwrap();
-    let cfg = MemoryConfig::new(tmp.path());
+    let cfg = crate::memory::chunks::test_support::host_config(tmp.path());
     (tmp, cfg)
 }
 
@@ -96,19 +96,13 @@ async fn scheduler_loop_enqueues_flush_stale_then_stops() {
 
 #[tokio::test]
 async fn scheduler_tick_recovers_an_expired_running_job() {
-    use crate::memory::chunks::with_connection;
-
     let (_tmp, cfg) = test_config();
     let new_job = NewJob::flush_stale(&FlushStalePayload::default(), "expired", 1).unwrap();
     let id = enqueue(&cfg, &new_job).unwrap().unwrap();
-    with_connection(&cfg, |conn| {
-        conn.execute(
-            "UPDATE mem_tree_jobs
-                SET status = 'running', locked_until_ms = 0, started_at_ms = 0
-              WHERE id = ?1",
-            rusqlite::params![&id],
-        )?;
-        Ok(())
+    crate::memory::queue::store::update_test_record(&cfg, &id, |record| {
+        record.status = JobStatus::Running.as_str().to_owned();
+        record.locked_until_ms = Some(0);
+        record.started_at_ms = Some(0);
     })
     .unwrap();
 

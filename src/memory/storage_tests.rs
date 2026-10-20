@@ -29,9 +29,11 @@ async fn blocking_bridge_rejects_current_thread_runtime_without_deadlocking() {
 
     let error = blocking.run(async { 42 }).unwrap_err();
 
-    assert!(error
-        .to_string()
-        .contains("cannot run on a current-thread Tokio runtime"));
+    assert!(
+        error
+            .to_string()
+            .contains("cannot run on a current-thread Tokio runtime")
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -50,6 +52,27 @@ async fn async_bridge_keeps_caller_runtime_available_to_driver_work() {
     assert_eq!(value, 42);
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn bridge_runtime_drives_timer_and_loopback_io_futures() {
+    let blocking = Blocking::new().unwrap();
+
+    let result = blocking
+        .run_async(async {
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+            let address = listener.local_addr()?;
+            let client = tokio::net::TcpStream::connect(address);
+            let (accepted, connected) = tokio::join!(listener.accept(), client);
+            accepted?;
+            connected?;
+            Ok::<_, std::io::Error>(())
+        })
+        .await
+        .unwrap();
+
+    result.unwrap();
+}
+
 #[test]
 fn blocking_bridge_reports_a_future_panic() {
     let blocking = Blocking::new().unwrap();
@@ -58,9 +81,11 @@ fn blocking_bridge_reports_a_future_panic() {
         .run(async { panic!("bridge test panic") })
         .unwrap_err();
 
-    assert!(error
-        .to_string()
-        .contains("storage call stopped unexpectedly"));
+    assert!(
+        error
+            .to_string()
+            .contains("storage call stopped unexpectedly")
+    );
 }
 
 #[test]
@@ -72,7 +97,9 @@ fn blocking_bridge_rejects_reentrant_calls_instead_of_deadlocking() {
         .run(async move { nested.run(async {}).unwrap_err() })
         .unwrap();
 
-    assert!(error
-        .to_string()
-        .contains("called back into its own blocking bridge"));
+    assert!(
+        error
+            .to_string()
+            .contains("called back into its own blocking bridge")
+    );
 }

@@ -43,12 +43,12 @@ pub mod types;
 // ── Public API surface ──────────────────────────────────────────────────────
 
 pub use bucket_seal::{
-    append_leaf, append_leaf_deferred, append_to_buffer, cascade_all_from,
-    cascade_all_from_with_services, seal_document_subtree_with_services,
-    seal_one_level_with_services, should_seal, MERGE_LEVEL_BASE,
+    MERGE_LEVEL_BASE, SealLevelResult, append_leaf, append_leaf_deferred, append_to_buffer,
+    cascade_all_from, cascade_all_from_with_services, seal_document_subtree_with_services,
+    seal_one_level_with_services, should_seal,
 };
-pub use direct_ingest::{ingest_summary, SummaryIngestInput, SummaryIngestOutcome};
-pub use factory::{TreeFactory, TreeProfile, GLOBAL_SCOPE};
+pub use direct_ingest::{SummaryIngestInput, SummaryIngestOutcome, ingest_summary};
+pub use factory::{GLOBAL_SCOPE, TreeFactory, TreeProfile};
 pub use flavoured::{compile_flavoured_root, flavoured_root_abs_path, flavoured_root_rel_path};
 pub use flush::{
     flush_stale_buffers, flush_stale_buffers_default, flush_stale_buffers_with_services,
@@ -65,11 +65,11 @@ pub use registry::{
     new_tree_id,
 };
 pub use store::{
-    Buffer, SummaryNode, Tree, TreeKind, TreeStatus, INPUT_TOKEN_BUDGET, OUTPUT_TOKEN_BUDGET,
-    SUMMARY_FANOUT,
+    Buffer, INPUT_TOKEN_BUDGET, OUTPUT_TOKEN_BUDGET, SUMMARY_FANOUT, SummaryNode, Tree, TreeKind,
+    TreeStatus,
 };
 pub use summarise::{
-    fallback_summary, finish_provider_summary, prepare_summary_prompt, ConcatSummariser,
-    PreparedSummaryPrompt, Summariser, SummaryCall, SummaryContext, SummaryInput, SummaryOutput,
+    ConcatSummariser, PreparedSummaryPrompt, Summariser, SummaryCall, SummaryContext, SummaryInput,
+    SummaryOutput, fallback_summary, finish_provider_summary, prepare_summary_prompt,
 };
 pub use types::{LabelStrategy, LeafRef, SealObserver, SealServices};

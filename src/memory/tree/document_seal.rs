@@ -9,14 +9,14 @@ use super::hydrate::hydrate_inputs;
 use super::label_resolver::resolve_labels;
 use super::registry::new_summary_id;
 use super::store::{self, SummaryNode, Tree};
-use super::summarise::{fallback_summary, SummaryContext};
+use super::summarise::{SummaryContext, fallback_summary};
 use super::types::{LabelStrategy, SealServices};
 use crate::memory::chunks::with_connection;
 use crate::memory::config::MemoryConfig;
 use crate::memory::score::store::index_summary_entity_ids_tx;
 use crate::memory::store::content::{
-    slugify_source_id, stage_summary_with_layout, SummaryComposeInput, SummaryDiskLayout,
-    SummaryTreeKind,
+    SummaryComposeInput, SummaryDiskLayout, SummaryTreeKind, slugify_source_id,
+    stage_summary_with_layout,
 };
 
 /// Level offset reserved for cross-document merge nodes.
@@ -104,16 +104,8 @@ pub async fn seal_document_subtree_with_services(
         transaction.commit()?;
         Ok(())
     })?;
-    cascade_all_from_with_services(
-        config,
-        tree,
-        MERGE_LEVEL_BASE,
-        false,
-        services,
-        strategy,
-        false,
-    )
-    .await?;
+    cascade_all_from_with_services(config, tree, MERGE_LEVEL_BASE, false, services, strategy)
+        .await?;
     log::debug!("[memory_tree:seal_document] complete levels={level}");
     Ok(doc_root.id)
 }

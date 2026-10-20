@@ -1,16 +1,14 @@
 use super::*;
-use crate::memory::chunks::with_connection;
 use crate::memory::config::MemoryConfig;
 use crate::memory::queue::handlers::{ExtractDecision, ReembedProgress};
 use crate::memory::queue::store::{count_by_status, count_total, enqueue, purge_retired_jobs};
 use crate::memory::queue::test_support::RecordingDelegates;
 use crate::memory::queue::types::{ExtractChunkPayload, JobStatus, NewJob};
-use rusqlite::params;
 use tempfile::TempDir;
 
 fn test_config() -> (TempDir, MemoryConfig) {
     let tmp = TempDir::new().unwrap();
-    let mut cfg = MemoryConfig::new(tmp.path());
+    let mut cfg = crate::memory::chunks::test_support::host_config(tmp.path());
     // Drain tests enqueue LLM-bound jobs (ExtractChunk / ReembedBackfill /
     // Seal). `run_once` routes them to a process-wide gate keyed by
     // `queue.llm_permits`, so the default of `1` would share a single slot
@@ -86,15 +84,28 @@ async fn drain_tolerates_retired_kind_rows() {
     let (_tmp, cfg) = test_config();
     let d = RecordingDelegates::admitting();
 
-    with_connection(&cfg, |conn| {
-        conn.execute(
-            "INSERT INTO mem_tree_jobs (id, kind, payload_json, status, attempts,
-                max_attempts, available_at_ms, created_at_ms)
-             VALUES ('job:retired', 'digest_daily', '{}', 'ready', 0, 5, 0, 0)",
-            params![],
-        )?;
-        Ok(())
-    })
+    crate::memory::queue::store::insert_test_record(
+        &cfg,
+        &crate::memory::queue::store::JobRecord {
+            id: "retired".to_owned(),
+            kind: "digest_daily".to_owned(),
+            payload_json: "{}".to_owned(),
+            dedupe_key: None,
+            status: JobStatus::Ready.as_str().to_owned(),
+            attempts: 0,
+            max_attempts: 5,
+            available_at_ms: 0,
+            locked_until_ms: None,
+            last_error: None,
+            failure_reason: None,
+            failure_class: None,
+            created_at_ms: 0,
+            started_at_ms: None,
+            completed_at_ms: None,
+            lease_epoch: 0,
+            lease_token: None,
+        },
+    )
     .unwrap();
 
     // A live, terminal job (drops → no follow-ups) so the drain is bounded.

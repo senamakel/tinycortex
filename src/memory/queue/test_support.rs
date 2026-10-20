@@ -42,6 +42,12 @@ pub(crate) struct RecordingDelegates {
     /// `append_node` decision; `None` simulates a missing node / archived tree.
     pub append: Option<AppendDecision>,
     pub append_mutations: Vec<JobMutation>,
+    /// State changes computed by one seal step.
+    pub seal_mutations: Vec<JobMutation>,
+    /// State changes computed by one document seal.
+    pub document_mutations: Vec<JobMutation>,
+    /// State changes computed by one re-embed batch.
+    pub reembed_mutations: Vec<JobMutation>,
     /// `seal_level` follow-up parent (one-shot; consumed on first seal).
     pub seal_parent: Mutex<Option<SealPayload>>,
     /// Buffers `list_stale_buffers` returns.
@@ -71,6 +77,9 @@ impl RecordingDelegates {
                 should_seal: true,
             }),
             append_mutations: Vec::new(),
+            seal_mutations: Vec::new(),
+            document_mutations: Vec::new(),
+            reembed_mutations: Vec::new(),
             seal_parent: Mutex::new(None),
             stale: Vec::new(),
             reembed: Mutex::new(VecDeque::new()),
@@ -111,9 +120,12 @@ impl QueueDelegates for RecordingDelegates {
         &self,
         _config: &MemoryConfig,
         _payload: &SealPayload,
-    ) -> Result<Option<SealPayload>> {
+    ) -> Result<DelegateOutput<Option<SealPayload>>> {
         self.counts.seal.fetch_add(1, Ordering::Relaxed);
-        Ok(self.seal_parent.lock().take())
+        Ok(DelegateOutput {
+            result: self.seal_parent.lock().take(),
+            mutations: self.seal_mutations.clone(),
+        })
     }
 
     async fn list_stale_buffers(
@@ -129,22 +141,28 @@ impl QueueDelegates for RecordingDelegates {
         &self,
         _config: &MemoryConfig,
         _payload: &SealDocumentPayload,
-    ) -> Result<()> {
+    ) -> Result<DelegateOutput<()>> {
         self.counts.seal_document.fetch_add(1, Ordering::Relaxed);
-        Ok(())
+        Ok(DelegateOutput {
+            result: (),
+            mutations: self.document_mutations.clone(),
+        })
     }
 
     async fn reembed_batch(
         &self,
         _config: &MemoryConfig,
         _signature: &str,
-    ) -> Result<ReembedProgress> {
+    ) -> Result<DelegateOutput<ReembedProgress>> {
         self.counts.reembed.fetch_add(1, Ordering::Relaxed);
-        Ok(self
-            .reembed
-            .lock()
-            .pop_front()
-            .unwrap_or(ReembedProgress::Covered))
+        Ok(DelegateOutput {
+            result: self
+                .reembed
+                .lock()
+                .pop_front()
+                .unwrap_or(ReembedProgress::Covered),
+            mutations: self.reembed_mutations.clone(),
+        })
     }
 
     fn active_signature(&self, _config: &MemoryConfig) -> String {

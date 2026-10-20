@@ -93,21 +93,23 @@ pub async fn run_scheduler(
     shutdown: &Shutdown,
 ) -> Result<()> {
     while !shutdown.is_triggered() {
-        if let Err(err) = crate::memory::queue::store_settle::recover_stale_locks(config) {
+        if let Err(err) =
+            crate::memory::queue::store_settle::recover_stale_locks_async(config).await
+        {
             if worker::is_sqlite_corrupt(&err) {
                 crate::memory::chunks::recover_corrupt_db(config)
                     .context("recover corrupt queue database")?;
                 continue;
             }
         }
-        if let Err(err) = scheduler::enqueue_flush_stale(config) {
+        if let Err(err) = scheduler::enqueue_flush_stale_async(config).await {
             if worker::is_sqlite_corrupt(&err) {
                 crate::memory::chunks::recover_corrupt_db(config)
                     .context("recover corrupt queue database")?;
                 continue;
             }
         }
-        if let Err(err) = scheduler::self_heal(config) {
+        if let Err(err) = scheduler::self_heal_async(config).await {
             if worker::is_sqlite_corrupt(&err) {
                 crate::memory::chunks::recover_corrupt_db(config)
                     .context("recover corrupt queue database")?;
@@ -132,7 +134,7 @@ pub async fn run(
     scheduler_opts: &SchedulerLoopConfig,
     shutdown: &Shutdown,
 ) -> Result<()> {
-    worker::bootstrap(config)?;
+    worker::bootstrap_async(config).await?;
     tokio::try_join!(
         run_worker(config, delegates, worker_opts, shutdown),
         run_scheduler(config, scheduler_opts, shutdown),

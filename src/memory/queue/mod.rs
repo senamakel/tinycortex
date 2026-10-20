@@ -1,7 +1,7 @@
 //! Async job queue for memory-tree work.
 //!
 //! Replaces the synchronous `append_leaf → cascade_seal → LLM summarise` chain
-//! on the ingest hot path with a SQLite-backed job queue and a worker driver.
+//! on the ingest hot path with a host-backed job queue and a worker driver.
 //! The shape is:
 //!
 //! ```text
@@ -18,23 +18,23 @@
 //!   seal_document   → build one document version's subtree
 //! ```
 //!
-//! All persistence lives in the same `chunks.db` as `mem_tree_chunks` (the
-//! `mem_tree_jobs` table is owned by the shared chunks schema), so a producer
-//! can insert its side-effect and its follow-up job in one transaction — see
-//! [`store::enqueue_tx`].
+//! Queue jobs and chunk/tree state share one owner commit head. A worker
+//! computes domain changes and follow-up intents first, then settles the job
+//! lease and publishes those changes under one head compare-and-swap. The
+//! external queue is a delivery hint; the owner records remain authoritative.
 //!
 //! ## Differences from OpenHuman
 //!
-//! - The `tokio` worker pool + wall-clock scheduler are reduced to [`run_once`]
-//!   plus plain scheduler functions a host drives, since `tokio` is a dev-only
-//!   dependency and the spawn/shutdown/Sentry plumbing is out of this crate's
-//!   surface. [`drain_until_idle`] settles the queue deterministically.
+//! - The `tokio` worker pool and wall-clock scheduler are optional under the
+//!   `tokio` feature. Hosts can instead drive [`run_once`] and the plain
+//!   scheduler functions themselves; [`drain_until_idle`] settles the queue
+//!   deterministically in tests.
 //! - The heavy per-kind work (LLM scoring/extraction, buffer push, sealing,
 //!   embedding) sits behind the [`QueueDelegates`] trait because those
 //!   operations are exposed only `pub(crate)` to `memory::tree` / `memory::score`
 //!   / `memory::chunks` (and some are not part of the ported surface). The
-//!   queue keeps its own logic — payload parsing, follow-up enqueues, gating,
-//!   defer — in-crate.
+//!   queue keeps payload parsing, follow-up planning, gating and defer logic
+//!   in-crate; its worker commits returned mutations with the lease receipt.
 //! - The typed-failure classifier is the self-contained [`JobFailure`] rather
 //!   than the upstream `memory_tree::health::PipelineFailure`.
 
@@ -68,11 +68,11 @@ pub use handlers::{
     AppendDecision, DelegateOutput, ExtractDecision, JobMutation, JobStateCollection,
     QueueDelegates, ReembedProgress, StaleBuffer, handle_job,
 };
-pub use ops::{backfill_in_progress, ensure_reembed_backfill, set_backfill_in_progress};
+pub use ops::{backfill_in_progress, plan_reembed_backfill, set_backfill_in_progress};
 pub use redact::scrub_for_log;
 pub use store::{
     DEFAULT_LOCK_DURATION_MS, claim_next, count_by_status, count_failed_unrecoverable, count_total,
-    enqueue, enqueue_tx, get_job, is_retired_kind, purge_retired_jobs,
+    enqueue, get_job, is_retired_kind, purge_retired_jobs,
 };
 pub use store_settle::{
     mark_deferred, mark_done, mark_failed, mark_failed_typed, recover_stale_locks,

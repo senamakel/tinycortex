@@ -12,44 +12,40 @@
 //! append and summary seal happen in the async extract worker driven off the
 //! [`TreeJobSink`]; this hot path stops at enqueue.
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{Result, anyhow, bail};
 use chrono::Utc;
 
 use crate::memory::chunks::collections::{
-    CHUNK_LIFECYCLE, INGESTED_SOURCES, INGEST_OUTBOX, RAW_REFS, SCORES,
+    CHUNK_LIFECYCLE, INGEST_OUTBOX, INGESTED_SOURCES, RAW_REFS, SCORES,
 };
 use crate::memory::chunks::versioned::{
-    commit_if_state_matches, commit_staged_chunks_if_state_matches, list_state, read_state,
-    StateChange,
+    StateChange, commit_if_state_matches_async, commit_staged_chunks_if_state_matches_async,
+    list_state_async, read_state_async, read_states_async,
 };
 use crate::memory::chunks::{
-    self, chunk_markdown, is_source_ingested, ChunkerInput, ChunkerOptions, SourceKind,
-    CHUNK_STATUS_PENDING_EXTRACTION,
+    self, CHUNK_STATUS_PENDING_EXTRACTION, ChunkerInput, ChunkerOptions, SourceKind, chunk_markdown,
 };
 use crate::memory::config::MemoryConfig;
-use crate::memory::score::{score_chunks_fast, ScoringConfig};
+use crate::memory::score::{ScoringConfig, score_chunks_fast};
 use crate::memory::store::content;
 
+use super::canonicalize::CanonicalisedSource;
 use super::canonicalize::chat::{self, ChatBatch};
 use super::canonicalize::document::{self, DocumentInput};
 use super::canonicalize::email::{self, EmailThread};
-use super::canonicalize::CanonicalisedSource;
 use super::types::{ExtractJobIntent, IngestOptions, IngestSummary, QueuePublication, TreeJobSink};
 
 /// Publish queue hints for every committed ingest intent that has not yet
 /// received a durable publication receipt. Re-running this function is safe:
 /// queue adapters receive the same stable intent id, including after a lost
 /// enqueue acknowledgement.
-/// Async-facade variant that performs host-store reads and receipt writes on
-/// blocking workers while keeping the borrowed sink on the caller task.
+/// Async-facade variant that performs host-store reads and receipt writes via
+/// the storage bridge's async path while keeping the borrowed sink on caller.
 pub async fn dispatch_pending_extract_jobs_async(
     config: &MemoryConfig,
     sink: &dyn TreeJobSink,
 ) -> Result<usize> {
-    let read_config = config.clone();
-    let pending = tokio::task::spawn_blocking(move || list_state(&read_config, INGEST_OUTBOX))
-        .await
-        .map_err(anyhow::Error::from)??;
+    let pending = list_state_async(config, INGEST_OUTBOX).await?;
     let mut published_count = 0;
     for (key, value) in pending {
         let intent: ExtractJobIntent = serde_json::from_value(value.clone())?;
@@ -74,12 +70,7 @@ pub async fn dispatch_pending_extract_jobs_async(
             key,
             value: Some(serde_json::to_value(completed)?),
         };
-        let write_config = config.clone();
-        tokio::task::spawn_blocking(move || {
-            commit_if_state_matches(&write_config, &[expected], &[], &[update])
-        })
-        .await
-        .map_err(anyhow::Error::from)??;
+        commit_if_state_matches_async(config, &[expected], &[], &[update]).await?;
         published_count += usize::from(publication == QueuePublication::Published);
     }
     Ok(published_count)
@@ -153,27 +144,18 @@ async fn persist_score_enqueue(
         );
     }
 
-    let persist_config = config.clone();
-    let persist_source_id = source_id.to_owned();
-    let persist_chunks = chunks.clone();
-    let persist_staged = staged.clone();
-    let persist_scores = scores.clone();
-    let persist_opts = opts.clone();
     let publish_jobs = sink.accepts_extract_jobs();
-    let intent_ids = tokio::task::spawn_blocking(move || {
-        persist_ingest_operation(
-            &persist_config,
-            &persist_source_id,
-            source_kind,
-            &persist_chunks,
-            &persist_staged,
-            &persist_scores,
-            &persist_opts,
-            publish_jobs,
-        )
-    })
-    .await
-    .map_err(anyhow::Error::from)??;
+    let intent_ids = persist_ingest_operation(
+        config,
+        source_id,
+        source_kind,
+        &chunks,
+        &staged,
+        &scores,
+        opts,
+        publish_jobs,
+    )
+    .await?;
     let Some(intent_ids) = intent_ids else {
         let staged_paths = staged
             .iter()
@@ -183,23 +165,17 @@ async fn persist_score_enqueue(
         return Ok(IngestSummary::already_ingested(source_id));
     };
     dispatch_pending_extract_jobs_async(config, sink).await?;
-    let publication_config = config.clone();
-    let extract_jobs_enqueued = tokio::task::spawn_blocking(move || {
-        let wanted = intent_ids
-            .into_iter()
-            .collect::<std::collections::HashSet<_>>();
-        Ok::<usize, anyhow::Error>(
-            list_state(&publication_config, INGEST_OUTBOX)?
-                .into_iter()
-                .filter(|(key, value)| {
-                    wanted.contains(key)
-                        && value.get("published").and_then(serde_json::Value::as_bool) == Some(true)
-                })
-                .count(),
-        )
-    })
-    .await
-    .map_err(anyhow::Error::from)??;
+    let wanted = intent_ids
+        .into_iter()
+        .collect::<std::collections::HashSet<_>>();
+    let extract_jobs_enqueued = list_state_async(config, INGEST_OUTBOX)
+        .await?
+        .into_iter()
+        .filter(|(key, value)| {
+            wanted.contains(key)
+                && value.get("published").and_then(serde_json::Value::as_bool) == Some(true)
+        })
+        .count();
     let chunks_written = staged.len();
 
     let chunks_dropped = scores.iter().filter(|result| !result.kept).count();
@@ -215,7 +191,7 @@ async fn persist_score_enqueue(
     })
 }
 
-fn persist_ingest_operation(
+async fn persist_ingest_operation(
     config: &MemoryConfig,
     source_id: &str,
     source_kind: SourceKind,
@@ -231,7 +207,9 @@ fn persist_ingest_operation(
     };
     let source_key = crate::memory::chunks::store_sources::source_gate_key(source_kind, &gate_key);
     if source_kind == SourceKind::Document
-        && read_state(config, INGESTED_SOURCES, &source_key)?.is_some()
+        && read_state_async(config, INGESTED_SOURCES, &source_key)
+            .await?
+            .is_some()
     {
         return Ok(None);
     }
@@ -243,7 +221,10 @@ fn persist_ingest_operation(
         let mut changes = Vec::new();
         let mut intent_ids = Vec::new();
         if source_kind == SourceKind::Document {
-            if read_state(config, INGESTED_SOURCES, &source_key)?.is_some() {
+            if read_state_async(config, INGESTED_SOURCES, &source_key)
+                .await?
+                .is_some()
+            {
                 return Ok(None);
             }
             expected.push(StateChange {
@@ -262,18 +243,19 @@ fn persist_ingest_operation(
             });
         }
 
-        let current_lifecycle = chunks
+        let chunk_ids = chunks
             .iter()
-            .map(|chunk| read_state(config, CHUNK_LIFECYCLE, &chunk.id))
-            .collect::<Result<Vec<_>>>()?;
-        for ((chunk, score), lifecycle) in chunks.iter().zip(scores).zip(&current_lifecycle) {
+            .map(|chunk| chunk.id.clone())
+            .collect::<Vec<_>>();
+        let current_lifecycle = read_states_async(config, CHUNK_LIFECYCLE, &chunk_ids).await?;
+        for (chunk, score) in chunks.iter().zip(scores) {
+            let lifecycle = current_lifecycle.get(&chunk.id);
             expected.push(StateChange {
                 collection: CHUNK_LIFECYCLE.into(),
                 key: chunk.id.clone(),
-                value: lifecycle.clone(),
+                value: lifecycle.cloned(),
             });
             let status = lifecycle
-                .as_ref()
                 .and_then(|value| value.get("status"))
                 .and_then(serde_json::Value::as_str);
             let needs_processing = matches!(status, None | Some(CHUNK_STATUS_PENDING_EXTRACTION));
@@ -330,12 +312,14 @@ fn persist_ingest_operation(
                 });
             }
         }
-        if commit_staged_chunks_if_state_matches(config, staged, &expected, &changes)? {
+        if commit_staged_chunks_if_state_matches_async(config, staged, &expected, &changes).await? {
             return Ok(Some(intent_ids));
         }
     }
     if source_kind == SourceKind::Document
-        && read_state(config, INGESTED_SOURCES, &source_key)?.is_some()
+        && read_state_async(config, INGESTED_SOURCES, &source_key)
+            .await?
+            .is_some()
     {
         return Ok(None);
     }
@@ -487,7 +471,11 @@ pub async fn ingest_document_versioned(
         Some(v) => format!("{source_id}@{v}"),
         None => source_id.to_string(),
     };
-    if is_source_ingested(config, SourceKind::Document, &gate_key)? {
+    let source_key = chunks::store_sources::source_gate_key(SourceKind::Document, &gate_key);
+    if read_state_async(config, INGESTED_SOURCES, &source_key)
+        .await?
+        .is_some()
+    {
         return Ok(IngestSummary::already_ingested(source_id));
     }
 

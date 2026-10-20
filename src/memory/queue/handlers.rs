@@ -7,32 +7,31 @@
 //! handlers called directly into `memory_tree` / `memory_score` /
 //! `memory_store`, but those operations are exposed only `pub(crate)` to their
 //! own modules (and some — the write-path embedder, the re-embed worklist
-//! probe, the on-disk body reader — are not part of this crate's ported
-//! surface at all). The trait is that seam: a host that owns visibility into
-//! those modules supplies a real implementation; tests supply a deterministic
-//! one (see `handlers_tests.rs`).
+//! probe, the on-disk body reader — remain host-owned computations). The trait
+//! is that seam: a host that owns visibility into those modules supplies a
+//! real implementation; tests supply a deterministic one (see
+//! `handlers_tests.rs`).
 //!
 //! What stays in-crate (faithful to OpenHuman's pipeline shape):
-//! - `extract_chunk` admits → enqueues `append_buffer`, then arms the re-embed
+//! - `extract_chunk` admits → plans `append_buffer`, then arms the re-embed
 //!   backfill once anything was admitted.
-//! - `append_buffer` pushes a leaf → enqueues `seal` when the gate is met.
-//! - `seal` seals one level → enqueues the parent `seal` when cascading.
-//! - `flush_stale` enqueues a force-`seal` per stale buffer.
+//! - `append_buffer` plans a leaf push → plans `seal` when the gate is met.
+//! - `seal` seals one level → plans the parent `seal` when cascading.
+//! - `flush_stale` plans a force-`seal` per stale buffer.
 //! - `reembed_backfill` maps a bounded batch to `Defer` (more pending) or
-//!   `Done` (covered / no provider / stale signature), toggling the
-//!   process-global backfill flag.
+//!   `Done` (covered / no provider / stale signature); the worker updates the
+//!   process-global backfill hint after lease-fenced settlement.
 
 use anyhow::Result;
 use async_trait::async_trait;
 use serde::de::DeserializeOwned;
 
 use crate::memory::chunks::collections::{
-    BUFFERS, CHUNK_LIFECYCLE, ENTITY_EDGES, ENTITY_HOTNESS, ENTITY_INDEX, SCORES, SUMMARIES, TREES,
+    BUFFERS, CHUNK_EMBEDDINGS, CHUNK_LIFECYCLE, CHUNK_REEMBED_SKIPS, ENTITY_EDGES, ENTITY_HOTNESS,
+    ENTITY_INDEX, SCORES, SUMMARIES, TREES,
 };
 use crate::memory::chunks::versioned::StateChange;
 use crate::memory::config::MemoryConfig;
-use crate::memory::queue::ops::set_backfill_in_progress;
-use crate::memory::queue::store;
 use crate::memory::queue::types::{
     AppendBufferPayload, AppendTarget, ExtractChunkPayload, FlushStalePayload, Job, JobFailure,
     JobKind, JobOutcome, NewJob, NodeRef, ReembedBackfillPayload, SealDocumentPayload, SealPayload,
@@ -127,6 +126,10 @@ pub enum JobStateCollection {
     Summaries,
     /// Mutable tree buffers.
     TreeBuffers,
+    /// Per-model chunk vectors.
+    ChunkEmbeddings,
+    /// Chunk re-embedding skip records.
+    ChunkReembedSkips,
     /// Entity-to-node occurrences.
     EntityIndex,
     /// Entity co-occurrence edges.
@@ -143,6 +146,8 @@ impl JobStateCollection {
             Self::Trees => TREES,
             Self::Summaries => SUMMARIES,
             Self::TreeBuffers => BUFFERS,
+            Self::ChunkEmbeddings => CHUNK_EMBEDDINGS,
+            Self::ChunkReembedSkips => CHUNK_REEMBED_SKIPS,
             Self::EntityIndex => ENTITY_INDEX,
             Self::EntityEdges => ENTITY_EDGES,
             Self::EntityHotness => ENTITY_HOTNESS,
@@ -157,17 +162,28 @@ pub struct JobMutation {
     pub collection: JobStateCollection,
     /// Stable logical record key in that collection.
     pub key: String,
+    /// Value observed by the planner. The worker rechecks it at the commit
+    /// head so a slow delegate cannot overwrite a newer owner's update.
+    pub expected: Option<serde_json::Value>,
     /// The replacement record, or `None` to tombstone it.
     pub value: Option<serde_json::Value>,
 }
 
 impl JobMutation {
-    fn into_state_change(self) -> StateChange {
-        StateChange {
-            collection: self.collection.name().to_owned(),
-            key: self.key,
-            value: self.value,
-        }
+    fn into_state_changes(self) -> (StateChange, StateChange) {
+        let collection = self.collection.name().to_owned();
+        (
+            StateChange {
+                collection: collection.clone(),
+                key: self.key.clone(),
+                value: self.expected,
+            },
+            StateChange {
+                collection,
+                key: self.key,
+                value: self.value,
+            },
+        )
     }
 }
 
@@ -206,13 +222,13 @@ pub trait QueueDelegates: Send + Sync {
         target: &AppendTarget,
     ) -> Result<Option<DelegateOutput<AppendDecision>>>;
 
-    /// Seal one buffer level. Returns the parent-level `SealPayload` to enqueue
-    /// when the seal cascades, else `None`.
+    /// Compute one buffer-level seal and return its state mutations plus a
+    /// parent-level `SealPayload` when the seal cascades.
     async fn seal_level(
         &self,
         config: &MemoryConfig,
         payload: &SealPayload,
-    ) -> Result<Option<SealPayload>>;
+    ) -> Result<DelegateOutput<Option<SealPayload>>>;
 
     /// List buffers older than `max_age_secs` that should be force-sealed.
     async fn list_stale_buffers(
@@ -221,19 +237,19 @@ pub trait QueueDelegates: Send + Sync {
         max_age_secs: i64,
     ) -> Result<Vec<StaleBuffer>>;
 
-    /// Build + merge one document version's subtree.
+    /// Build + merge one document version's subtree and return its mutations.
     async fn seal_document(
         &self,
         config: &MemoryConfig,
         payload: &SealDocumentPayload,
-    ) -> Result<()>;
+    ) -> Result<DelegateOutput<()>>;
 
-    /// Embed one bounded re-embed batch at `signature`.
+    /// Embed one bounded re-embed batch at `signature` and return its mutations.
     async fn reembed_batch(
         &self,
         config: &MemoryConfig,
         signature: &str,
-    ) -> Result<ReembedProgress>;
+    ) -> Result<DelegateOutput<ReembedProgress>>;
 
     /// The active embedding signature (for the re-embed switch-path trigger).
     fn active_signature(&self, config: &MemoryConfig) -> String;
@@ -242,11 +258,12 @@ pub trait QueueDelegates: Send + Sync {
     fn has_uncovered_reembed_work(&self, config: &MemoryConfig, signature: &str) -> Result<bool>;
 }
 
-/// Handler outcome, compute-only domain mutations, and durable follow-up jobs.
-/// The worker commits all three with the lease-fenced job receipt.
+/// Handler outcome, expected state, compute-only mutations, and durable
+/// follow-up jobs. The worker commits them with the lease-fenced job receipt.
 pub(crate) struct JobPlan {
     pub outcome: JobOutcome,
     pub follow_ups: Vec<NewJob>,
+    pub expected: Vec<StateChange>,
     pub mutations: Vec<StateChange>,
 }
 
@@ -255,35 +272,29 @@ impl JobPlan {
         Self {
             outcome: JobOutcome::Done,
             follow_ups,
-            mutations: Vec::new(),
-        }
-    }
-
-    fn outcome(outcome: JobOutcome) -> Self {
-        Self {
-            outcome,
-            follow_ups: Vec::new(),
+            expected: Vec::new(),
             mutations: Vec::new(),
         }
     }
 }
 
-/// Dispatch a claimed job to the matching per-kind handler.
+/// Run a claimed job only when its plan has no persisted effects.
+///
+/// A plan with domain mutations or follow-up jobs must be settled by the
+/// lease-fenced worker; this compatibility entrypoint returns an error for
+/// those plans so it cannot publish state outside the owner commit.
 pub async fn handle_job(
     config: &MemoryConfig,
     job: &Job,
     delegates: &dyn QueueDelegates,
 ) -> Result<JobOutcome> {
     let plan = plan_job(config, job, delegates).await?;
-    if !plan.mutations.is_empty() {
-        anyhow::bail!("domain mutations require lease-fenced worker settlement");
-    }
-    for follow_up in &plan.follow_ups {
-        if store::enqueue(config, follow_up)?.is_some()
-            && follow_up.kind == JobKind::ReembedBackfill
-        {
-            set_backfill_in_progress(true);
-        }
+    if !plan.expected.is_empty()
+        || !plan.mutations.is_empty()
+        || !plan.follow_ups.is_empty()
+        || matches!(plan.outcome, JobOutcome::Defer { .. })
+    {
+        anyhow::bail!("job effects require lease-fenced worker settlement; use run_once");
     }
     Ok(plan.outcome)
 }
@@ -330,11 +341,11 @@ async fn handle_extract(
         return Ok(JobPlan::done(Vec::new()));
     };
     let decision = output.result;
-    let mutations = output
+    let (expected, mutations): (Vec<_>, Vec<_>) = output
         .mutations
         .into_iter()
-        .map(JobMutation::into_state_change)
-        .collect();
+        .map(JobMutation::into_state_changes)
+        .unzip();
 
     let mut follow_ups = Vec::new();
 
@@ -364,6 +375,7 @@ async fn handle_extract(
     Ok(JobPlan {
         outcome: JobOutcome::Done,
         follow_ups,
+        expected,
         mutations,
     })
 }
@@ -382,11 +394,11 @@ async fn handle_append_buffer(
         return Ok(JobPlan::done(Vec::new()));
     };
     let decision = output.result;
-    let mutations = output
+    let (expected, mutations): (Vec<_>, Vec<_>) = output
         .mutations
         .into_iter()
-        .map(JobMutation::into_state_change)
-        .collect();
+        .map(JobMutation::into_state_changes)
+        .unzip();
 
     let mut follow_ups = Vec::new();
     if decision.should_seal {
@@ -400,6 +412,7 @@ async fn handle_append_buffer(
     Ok(JobPlan {
         outcome: JobOutcome::Done,
         follow_ups,
+        expected,
         mutations,
     })
 }
@@ -420,14 +433,24 @@ async fn handle_seal(
     let payload: SealPayload = parse_payload(job, "Seal")?;
     // Seal exactly one level. A cascading seal returns the parent payload so
     // each level stays its own crash-recovery checkpoint.
-    let follow_ups = delegates
-        .seal_level(config, &payload)
-        .await?
+    let output = delegates.seal_level(config, &payload).await?;
+    let (expected, mutations): (Vec<_>, Vec<_>) = output
+        .mutations
+        .into_iter()
+        .map(JobMutation::into_state_changes)
+        .unzip();
+    let follow_ups = output
+        .result
         .map(|parent| NewJob::seal(&parent))
         .transpose()?
         .into_iter()
         .collect();
-    Ok(JobPlan::done(follow_ups))
+    Ok(JobPlan {
+        outcome: JobOutcome::Done,
+        follow_ups,
+        expected,
+        mutations,
+    })
 }
 
 async fn handle_flush_stale(
@@ -460,21 +483,25 @@ async fn handle_seal_document(
         // Empty version set — nothing to seal.
         return Ok(JobPlan::done(Vec::new()));
     }
-    delegates.seal_document(config, &payload).await?;
-    Ok(JobPlan::done(Vec::new()))
+    let output = delegates.seal_document(config, &payload).await?;
+    let (expected, mutations): (Vec<_>, Vec<_>) = output
+        .mutations
+        .into_iter()
+        .map(JobMutation::into_state_changes)
+        .unzip();
+    Ok(JobPlan {
+        outcome: JobOutcome::Done,
+        follow_ups: Vec::new(),
+        expected,
+        mutations,
+    })
 }
 
 /// Run one step of the `ReembedBackfill` chain.
 ///
-/// Only the success paths (`Wrote`, `Covered`, `NoProvider`,
-/// `StaleSignature`) clear [`set_backfill_in_progress`]; if
-/// `delegates.reembed_batch` returns `Err` the job instead flows through
-/// `settle_job` (in [`super::worker`]) and is marked `failed` — terminally so
-/// once its attempt budget is exhausted — without this function ever running
-/// again to clear the flag. [`crate::memory::queue::ops::backfill_in_progress`]
-/// then stays `true` until the process restarts, and retrieval keeps treating
-/// every empty vector-search result as "not searched yet" rather than "no
-/// such memory" for the remainder of the process's life.
+/// Computed embedding updates are returned with the job plan for atomic
+/// settlement. The worker updates the process-wide backfill hint only after it
+/// commits the receipt, so planning cannot expose an uncommitted completion.
 async fn handle_reembed_backfill(
     config: &MemoryConfig,
     job: &Job,
@@ -482,14 +509,25 @@ async fn handle_reembed_backfill(
 ) -> Result<JobPlan> {
     let payload: ReembedBackfillPayload = parse_payload(job, "ReembedBackfill")?;
 
-    match delegates.reembed_batch(config, &payload.signature).await? {
+    let output = delegates.reembed_batch(config, &payload.signature).await?;
+    let (expected, mutations): (Vec<_>, Vec<_>) = output
+        .mutations
+        .into_iter()
+        .map(JobMutation::into_state_changes)
+        .unzip();
+    let plan = |outcome| JobPlan {
+        outcome,
+        follow_ups: Vec::new(),
+        expected,
+        mutations,
+    };
+    match output.result {
         ReembedProgress::Wrote {
             more_pending: true, ..
         } => {
-            set_backfill_in_progress(true);
             // More rows may remain — reschedule THIS row (no re-enqueue, so the
             // per-signature dedupe key stays valid).
-            Ok(JobPlan::outcome(JobOutcome::Defer {
+            Ok(plan(JobOutcome::Defer {
                 until_ms: chrono::Utc::now().timestamp_millis() + REEMBED_BACKFILL_REVISIT_MS,
                 reason: "re-embed backfill: batch done, more pending".to_string(),
             }))
@@ -499,10 +537,7 @@ async fn handle_reembed_backfill(
         }
         | ReembedProgress::Covered
         | ReembedProgress::NoProvider
-        | ReembedProgress::StaleSignature => {
-            set_backfill_in_progress(false);
-            Ok(JobPlan::done(Vec::new()))
-        }
+        | ReembedProgress::StaleSignature => Ok(plan(JobOutcome::Done)),
     }
 }
 

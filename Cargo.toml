@@ -190,7 +190,7 @@ block2 = { version = "0.6", optional = true }
 dotenvy = "0.15"
 tempfile = "3"
 tinystoragedrivers-testkit = { git = "https://github.com/senamakel/tinystoragedrivers", tag = "v2.0.1" }
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "net"] }
 wiremock = "0.6"
 
 [[test]]

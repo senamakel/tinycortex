@@ -10,7 +10,7 @@ use tempfile::TempDir;
 
 fn test_config() -> (TempDir, MemoryConfig) {
     let tmp = TempDir::new().unwrap();
-    let cfg = MemoryConfig::new(tmp.path());
+    let cfg = crate::memory::chunks::test_support::host_config(tmp.path());
     (tmp, cfg)
 }
 
@@ -29,6 +29,30 @@ async fn run_once_returns_false_when_queue_is_empty() {
     let (_tmp, cfg) = test_config();
     let d = RecordingDelegates::admitting();
     assert!(!run_once(&cfg, &d).await.unwrap());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn run_once_processes_a_job_on_a_current_thread_runtime() {
+    let (_tmp, cfg) = test_config();
+    let delegates = RecordingDelegates::admitting();
+    let new_job = NewJob::flush_stale(&FlushStalePayload::default(), "current-thread", 0).unwrap();
+    let id = crate::memory::queue::store::enqueue_async(&cfg, &new_job)
+        .await
+        .unwrap()
+        .expect("enqueued");
+
+    assert!(run_once(&cfg, &delegates).await.unwrap());
+    let job = crate::memory::queue::store::get_job_async(&cfg, &id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(job.status, JobStatus::Done);
+    assert_eq!(
+        crate::memory::queue::store::count_by_status_async(&cfg, JobStatus::Done)
+            .await
+            .unwrap(),
+        1
+    );
 }
 
 #[tokio::test]
@@ -175,9 +199,56 @@ fn terminal_reembed_failure_clears_process_backfill_flag() {
 }
 
 #[test]
+fn committed_reembed_defer_keeps_backfill_hint_until_completion() {
+    let _flag_guard = crate::memory::queue::test_support::BACKFILL_FLAG_TEST_LOCK.lock();
+    let (_tmp, cfg) = test_config();
+    let new_job = NewJob::reembed_backfill(&ReembedBackfillPayload {
+        signature: "provider=test;model=defer;dims=3".into(),
+    })
+    .unwrap();
+    let id = enqueue(&cfg, &new_job).unwrap().unwrap();
+    let first_claim = claim_next(&cfg, DEFAULT_LOCK_DURATION_MS).unwrap().unwrap();
+
+    crate::memory::queue::worker::settle_planned_job(
+        &cfg,
+        &first_claim,
+        Ok(crate::memory::queue::handlers::JobPlan {
+            outcome: JobOutcome::Defer {
+                until_ms: chrono::Utc::now().timestamp_millis(),
+                reason: "more rows remain".into(),
+            },
+            follow_ups: Vec::new(),
+            expected: Vec::new(),
+            mutations: Vec::new(),
+        }),
+    )
+    .unwrap();
+    assert!(crate::memory::queue::ops::backfill_in_progress());
+
+    crate::memory::queue::store::update_test_record(&cfg, &id, |record| {
+        record.available_at_ms = 0;
+    })
+    .unwrap();
+    let second_claim = claim_next(&cfg, DEFAULT_LOCK_DURATION_MS).unwrap().unwrap();
+    crate::memory::queue::worker::settle_planned_job(
+        &cfg,
+        &second_claim,
+        Ok(crate::memory::queue::handlers::JobPlan {
+            outcome: JobOutcome::Done,
+            follow_ups: Vec::new(),
+            expected: Vec::new(),
+            mutations: Vec::new(),
+        }),
+    )
+    .unwrap();
+    assert!(!crate::memory::queue::ops::backfill_in_progress());
+}
+
+#[test]
 fn completed_seal_rearms_same_level_when_live_buffer_still_crosses_gate() {
     use crate::memory::chunks::with_connection;
     use crate::memory::queue::types::SealPayload;
+    use rusqlite::params;
 
     let (_tmp, mut cfg) = test_config();
     cfg.tree.input_token_budget = 10;
@@ -204,7 +275,7 @@ fn completed_seal_rearms_same_level_when_live_buffer_still_crosses_gate() {
             "INSERT INTO mem_tree_buffers
                 (tree_id, level, item_ids_json, token_sum, oldest_at_ms, updated_at_ms)
              VALUES (?1, 0, '[\"late-chunk\"]', 10, 1, 1)",
-            rusqlite::params![payload.tree_id],
+            params![payload.tree_id],
         )?;
         Ok(())
     })
@@ -266,18 +337,29 @@ async fn run_once_defers_instead_of_blocking_when_llm_gate_is_full() {
 
 #[test]
 fn bootstrap_purges_retired_and_recovers_locks() {
-    use crate::memory::chunks::with_connection;
-    use rusqlite::params;
     let (_tmp, cfg) = test_config();
-    with_connection(&cfg, |conn| {
-        conn.execute(
-            "INSERT INTO mem_tree_jobs (id, kind, payload_json, status, attempts,
-                max_attempts, available_at_ms, created_at_ms)
-             VALUES ('job:r', 'topic_route', '{}', 'ready', 0, 5, 0, 0)",
-            params![],
-        )?;
-        Ok(())
-    })
+    crate::memory::queue::store::insert_test_record(
+        &cfg,
+        &crate::memory::queue::store::JobRecord {
+            id: "job:r".into(),
+            kind: "topic_route".into(),
+            payload_json: "{}".into(),
+            dedupe_key: None,
+            status: JobStatus::Ready.as_str().into(),
+            attempts: 0,
+            max_attempts: 5,
+            available_at_ms: 0,
+            locked_until_ms: None,
+            last_error: None,
+            failure_reason: None,
+            failure_class: None,
+            created_at_ms: 0,
+            started_at_ms: None,
+            completed_at_ms: None,
+            lease_epoch: 0,
+            lease_token: None,
+        },
+    )
     .unwrap();
     let (purged, _recovered) = bootstrap(&cfg).unwrap();
     assert_eq!(purged, 1);

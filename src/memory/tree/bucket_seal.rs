@@ -28,20 +28,31 @@ use crate::memory::chunks::with_connection;
 use crate::memory::config::MemoryConfig;
 use crate::memory::score::store::index_summary_entity_ids_tx;
 use crate::memory::store::content::{
-    slugify_source_id, stage_summary_with_layout, SummaryComposeInput, SummaryDiskLayout,
-    SummaryTreeKind,
+    SummaryComposeInput, SummaryDiskLayout, SummaryTreeKind, slugify_source_id,
+    stage_summary_with_layout,
 };
 use crate::memory::tree::hydrate::hydrate_inputs;
 use crate::memory::tree::label_resolver::resolve_labels;
 use crate::memory::tree::registry::new_summary_id;
 use crate::memory::tree::store::{self, Buffer, SummaryNode, Tree};
-use crate::memory::tree::summarise::{fallback_summary, Summariser, SummaryContext};
+use crate::memory::tree::summarise::{Summariser, SummaryContext, fallback_summary};
 pub(crate) use crate::memory::tree::types::NoopSealObserver;
 pub use crate::memory::tree::types::{LabelStrategy, LeafRef, SealObserver, SealServices};
 
 /// Hard cap on cascade depth — guards against runaway loops if token accounting
 /// ever slips.
 const MAX_CASCADE_DEPTH: u32 = 32;
+
+/// Result of persisting one summary level. Queue workers can include the
+/// optional parent seal in the same lease-fenced owner commit as this seal's
+/// state mutations; the tree layer never writes queue state itself.
+#[derive(Clone, Debug)]
+pub struct SealLevelResult {
+    /// Stable id of the summary written for this level.
+    pub summary_id: String,
+    /// Parent level that crossed its gate and should be sealed next.
+    pub follow_up: Option<crate::memory::queue::SealPayload>,
+}
 
 /// Append a leaf to `tree`, sealing buffers as they fill. Returns the ids of
 /// any summaries that sealed during this call.
@@ -137,7 +148,6 @@ pub async fn cascade_all_from(
             observer: &NoopSealObserver,
         },
         strategy,
-        false,
     )
     .await
 }
@@ -149,7 +159,6 @@ pub async fn cascade_all_from_with_services(
     force: bool,
     services: &SealServices<'_>,
     strategy: &LabelStrategy,
-    enqueue_follow_ups: bool,
 ) -> Result<Vec<String>> {
     let mut sealed_ids: Vec<String> = Vec::new();
     let mut first_iteration = true;
@@ -166,16 +175,9 @@ pub async fn cascade_all_from_with_services(
             break;
         }
 
-        let summary_id = seal_one_level_with_services(
-            config,
-            tree,
-            &buf,
-            services,
-            strategy,
-            enqueue_follow_ups,
-        )
-        .await?;
-        sealed_ids.push(summary_id);
+        let summary_id =
+            seal_one_level_with_services(config, tree, &buf, services, strategy).await?;
+        sealed_ids.push(summary_id.summary_id);
     }
 
     // Flavoured trees carry a first-class compiled root artifact; refresh it
@@ -226,8 +228,7 @@ pub async fn seal_one_level_with_services(
     buf: &Buffer,
     services: &SealServices<'_>,
     strategy: &LabelStrategy,
-    enqueue_follow_ups: bool,
-) -> Result<String> {
+) -> Result<SealLevelResult> {
     let level = buf.level;
     let target_level = level + 1;
 
@@ -377,7 +378,7 @@ pub async fn seal_one_level_with_services(
     let summary_id_for_tx = summary_id.clone();
     let node_for_tx = node.clone();
     let staged_for_tx = staged.clone();
-    with_connection(config, move |conn| {
+    let follow_up = with_connection(config, move |conn| {
         let tx = conn.unchecked_transaction()?;
 
         let (current_max, status): (u32, String) = tx
@@ -430,18 +431,11 @@ pub async fn seal_one_level_with_services(
         };
         store::upsert_buffer_tx(&tx, &parent)?;
 
-        if enqueue_follow_ups && should_seal(config, &parent) {
-            let payload = crate::memory::queue::SealPayload {
-                tree_id: tree_id.clone(),
-                level: target_level,
-                force_now_ms: None,
-            };
-            crate::memory::queue::store::enqueue_tx_with_default(
-                &tx,
-                &crate::memory::queue::NewJob::seal(&payload)?,
-                config.queue.max_attempts,
-            )?;
-        }
+        let follow_up = should_seal(config, &parent).then(|| crate::memory::queue::SealPayload {
+            tree_id: tree_id.clone(),
+            level: target_level,
+            force_now_ms: None,
+        });
 
         if target_level > current_max {
             store::update_tree_after_seal_tx(&tx, &tree_id, &summary_id_for_tx, target_level, now)?;
@@ -450,16 +444,19 @@ pub async fn seal_one_level_with_services(
         }
 
         tx.commit()?;
-        Ok(())
+        Ok(follow_up)
     })?;
 
     services
         .observer
         .summary_committed(tree, &node, &staged.content_path, "bucket_seal")?;
 
-    Ok(summary_id)
+    Ok(SealLevelResult {
+        summary_id,
+        follow_up,
+    })
 }
-pub use super::document_seal::{seal_document_subtree_with_services, MERGE_LEVEL_BASE};
+pub use super::document_seal::{MERGE_LEVEL_BASE, seal_document_subtree_with_services};
 
 #[cfg(test)]
 #[path = "bucket_seal_label_tests.rs"]

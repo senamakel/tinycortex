@@ -1,15 +1,15 @@
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use chrono::{TimeZone, Utc};
 use tempfile::TempDir;
 
 use super::{ingest_chat, ingest_document, ingest_document_versioned, ingest_email_with_raw_refs};
 use crate::memory::chunks::{
-    count_chunks, get_chunk_content_pointers, get_chunk_lifecycle_status, is_source_ingested,
-    SourceKind, CHUNK_STATUS_PENDING_EXTRACTION,
+    CHUNK_STATUS_PENDING_EXTRACTION, SourceKind, count_chunks, get_chunk_content_pointers,
+    get_chunk_lifecycle_status, is_source_ingested,
 };
-use crate::memory::chunks::{get_chunk_raw_refs, RawRef};
+use crate::memory::chunks::{RawRef, get_chunk_raw_refs};
 use crate::memory::config::MemoryConfig;
 use crate::memory::ingest::canonicalize::chat::{ChatBatch, ChatMessage};
 use crate::memory::ingest::canonicalize::document::DocumentInput;
@@ -386,17 +386,19 @@ async fn ingest_head_failure_does_not_publish_or_expose_its_outbox_intent() {
         modified_at: Utc.timestamp_millis_opt(1_700_000_000_000).unwrap(),
         source_ref: Some("notion://page/uncommitted".into()),
     };
-    assert!(ingest_document(
-        &cfg,
-        "notion:uncommitted",
-        "alice",
-        vec![],
-        doc,
-        &sink,
-        &scoring
-    )
-    .await
-    .is_err());
+    assert!(
+        ingest_document(
+            &cfg,
+            "notion:uncommitted",
+            "alice",
+            vec![],
+            doc,
+            &sink,
+            &scoring
+        )
+        .await
+        .is_err()
+    );
     assert!(sink.ids.lock().unwrap().is_empty());
     assert_eq!(count_chunks(&cfg).unwrap(), 0);
     assert!(!is_source_ingested(&cfg, SourceKind::Document, "notion:uncommitted").unwrap());
@@ -416,18 +418,26 @@ async fn current_thread_queue_sink_repairs_lost_hint_ack_without_duplicate_jobs(
         modified_at: Utc.timestamp_millis_opt(1_700_000_000_000).unwrap(),
         source_ref: Some("notion://page/current-thread".into()),
     };
-    assert!(ingest_document(
+    assert!(
+        ingest_document(
+            &cfg,
+            "notion:current-thread",
+            "alice",
+            vec![],
+            doc,
+            &sink,
+            &scoring
+        )
+        .await
+        .is_err()
+    );
+    let expected_jobs = crate::memory::chunks::versioned::list_state_async(
         &cfg,
-        "notion:current-thread",
-        "alice",
-        vec![],
-        doc,
-        &sink,
-        &scoring
+        crate::memory::chunks::collections::CHUNK_LIFECYCLE,
     )
     .await
-    .is_err());
-    let expected_jobs = count_chunks(&cfg).unwrap();
+    .unwrap()
+    .len() as u64;
     assert!(expected_jobs > 0);
     let published_before_repair = ready_queue_messages(&cfg).await;
     assert!(published_before_repair > 0);
@@ -438,6 +448,20 @@ async fn current_thread_queue_sink_repairs_lost_hint_ack_without_duplicate_jobs(
         .unwrap();
     assert_eq!(published_before_repair + repaired as u64, expected_jobs);
     assert_eq!(ready_queue_messages(&cfg).await, expected_jobs);
+    let gate_key = crate::memory::chunks::store_sources::source_gate_key(
+        SourceKind::Document,
+        "notion:current-thread",
+    );
+    assert!(
+        crate::memory::chunks::versioned::read_state_async(
+            &cfg,
+            crate::memory::chunks::collections::INGESTED_SOURCES,
+            &gate_key,
+        )
+        .await
+        .unwrap()
+        .is_some()
+    );
 }
 
 async fn ready_queue_messages(config: &MemoryConfig) -> u64 {

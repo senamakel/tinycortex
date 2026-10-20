@@ -12,7 +12,7 @@ use chrono::{DateTime, Duration, Utc};
 
 use crate::memory::config::MemoryConfig;
 use crate::memory::tree::bucket_seal::{
-    cascade_all_from, cascade_all_from_with_services, LabelStrategy, SealServices,
+    LabelStrategy, SealServices, cascade_all_from, cascade_all_from_with_services,
 };
 use crate::memory::tree::store::{self, DEFAULT_FLUSH_AGE_SECS};
 use crate::memory::tree::summarise::Summariser;
@@ -67,10 +67,8 @@ pub async fn flush_stale_buffers_with_services(
         let Some(tree) = tree_by_id.get(&buf.tree_id) else {
             continue; // orphan buffer — tree row gone
         };
-        let sealed = cascade_all_from_with_services(
-            config, tree, buf.level, true, services, strategy, false,
-        )
-        .await;
+        let sealed =
+            cascade_all_from_with_services(config, tree, buf.level, true, services, strategy).await;
         match sealed {
             Ok(ids) => seals += ids.len(),
             Err(err) => failures.push(format!("{} level {}: {err:#}", buf.tree_id, buf.level)),

@@ -9,10 +9,10 @@ use crate::memory::tree::SummaryInput;
 use tempfile::TempDir;
 
 use crate::memory::chunks::upsert_chunks;
-use crate::memory::chunks::{chunk_id, Chunk, Metadata, SourceKind, SourceRef};
+use crate::memory::chunks::{Chunk, Metadata, SourceKind, SourceRef, chunk_id};
 use crate::memory::config::MemoryConfig;
 use crate::memory::tree::registry::get_or_create_tree;
-use crate::memory::tree::store::{self, TreeKind, INPUT_TOKEN_BUDGET, SUMMARY_FANOUT};
+use crate::memory::tree::store::{self, INPUT_TOKEN_BUDGET, SUMMARY_FANOUT, TreeKind};
 use crate::memory::tree::summarise::ConcatSummariser;
 use chrono::{TimeZone, Utc};
 use std::sync::Arc;
@@ -156,7 +156,7 @@ async fn archived_tree_rejects_seal_of_existing_buffer() {
 }
 
 #[tokio::test]
-async fn service_seal_stages_body_and_enqueues_parent_atomically() {
+async fn service_seal_returns_parent_follow_up_intent_without_persisting_queue_state() {
     let (_tmp, mut cfg) = test_config();
     cfg.tree.summary_fanout = 1;
     let tree = get_or_create_tree(&cfg, TreeKind::Source, "slack:#eng").unwrap();
@@ -183,16 +183,21 @@ async fn service_seal_stages_body_and_enqueues_parent_atomically() {
             observer: &NoopSealObserver,
         },
         &LabelStrategy::Empty,
-        true,
     )
     .await
     .unwrap();
 
     assert!(
-        crate::memory::store::content::read_summary_body(&cfg, &summary_id)
+        crate::memory::store::content::read_summary_body(&cfg, &summary_id.summary_id)
             .unwrap()
             .contains("full staged body")
     );
+    let follow_up = summary_id
+        .follow_up
+        .expect("fanout one should request parent seal");
+    assert_eq!(follow_up.tree_id, tree.id);
+    assert_eq!(follow_up.level, 1);
+    assert_eq!(crate::memory::queue::store::count_total(&cfg).unwrap(), 0);
     assert_eq!(crate::memory::queue::count_total(&cfg).unwrap(), 1);
 }
 
@@ -326,14 +331,8 @@ async fn seal_preserves_items_appended_while_summariser_is_running() {
         embedder: None,
         observer: &observer,
     };
-    let seal = seal_one_level_with_services(
-        &cfg,
-        &tree,
-        &snapshot,
-        &services,
-        &LabelStrategy::Empty,
-        false,
-    );
+    let seal =
+        seal_one_level_with_services(&cfg, &tree, &snapshot, &services, &LabelStrategy::Empty);
     let append = async {
         started.notified().await;
         append_to_buffer(&cfg, &tree.id, 0, &c2.id, 10, ts).unwrap();

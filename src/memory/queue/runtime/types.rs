@@ -1,7 +1,7 @@
 //! Configuration and control types for the background worker loops.
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 /// Cooperative shutdown flag shared with running loops.

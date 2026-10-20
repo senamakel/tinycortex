@@ -1,9 +1,8 @@
 use super::*;
-use crate::memory::chunks::with_connection;
 use crate::memory::config::MemoryConfig;
 use crate::memory::queue::store::{
-    claim_next, count_by_status, count_failed_unrecoverable, count_total, enqueue, get_job,
-    DEFAULT_LOCK_DURATION_MS,
+    DEFAULT_LOCK_DURATION_MS, claim_next, count_by_status, count_failed_unrecoverable, count_total,
+    enqueue, get_job,
 };
 use crate::memory::queue::types::{
     AppendBufferPayload, AppendTarget, ExtractChunkPayload, JobStatus, NewJob, NodeRef,
@@ -12,7 +11,7 @@ use tempfile::TempDir;
 
 fn test_config() -> (TempDir, MemoryConfig) {
     let tmp = TempDir::new().unwrap();
-    let cfg = MemoryConfig::new(tmp.path());
+    let cfg = crate::memory::chunks::test_support::host_config(tmp.path());
     (tmp, cfg)
 }
 
@@ -145,12 +144,8 @@ fn mark_failed_retries_then_terminates() {
     assert_eq!(row.last_error.as_deref(), Some("boom"));
 
     // Force the row available again so the test doesn't hinge on sleep.
-    with_connection(&cfg, |c| {
-        c.execute(
-            "UPDATE mem_tree_jobs SET available_at_ms = 0 WHERE id = ?1",
-            params![id],
-        )?;
-        Ok(())
+    crate::memory::queue::store::update_test_record(&cfg, &id, |record| {
+        record.available_at_ms = 0;
     })
     .unwrap();
 
@@ -382,14 +377,12 @@ fn requeue_failed_is_deterministic_on_equal_millisecond_completions() {
 
     // Force identical completion timestamps so ordering falls to the tiebreaker.
     let same_ms = 1_800_000_000_000_i64;
-    with_connection(&cfg, |conn| {
-        conn.execute(
-            "UPDATE mem_tree_jobs SET completed_at_ms = ?1 WHERE id IN (?2, ?3)",
-            params![same_ms, a, b],
-        )?;
-        Ok(())
-    })
-    .unwrap();
+    for id in [&a, &b] {
+        crate::memory::queue::store::update_test_record(&cfg, id, |record| {
+            record.completed_at_ms = Some(same_ms);
+        })
+        .unwrap();
+    }
 
     let requeued = requeue_failed(&cfg).expect("requeue must not abort on a millisecond tie");
 
@@ -515,17 +508,10 @@ fn mark_deferred_parks_jobs_that_exceed_the_defer_age_bound() {
         .unwrap()
         .expect("inserted");
     let claimed = claim_next(&cfg, DEFAULT_LOCK_DURATION_MS).unwrap().unwrap();
-    with_connection(&cfg, |conn| {
-        conn.execute(
-            "UPDATE mem_tree_jobs SET created_at_ms = ?1 WHERE id = ?2",
-            rusqlite::params![
-                Utc::now()
-                    .timestamp_millis()
-                    .saturating_sub(max_defer_age_ms + 1),
-                id,
-            ],
-        )?;
-        Ok(())
+    crate::memory::queue::store::update_test_record(&cfg, &id, |record| {
+        record.created_at_ms = Utc::now()
+            .timestamp_millis()
+            .saturating_sub(max_defer_age_ms + 1);
     })
     .unwrap();
 
@@ -555,12 +541,8 @@ fn deferred_row_not_claimable_until_until_ms() {
         "deferred row must not be claimable before until_ms"
     );
 
-    with_connection(&cfg, |c| {
-        c.execute(
-            "UPDATE mem_tree_jobs SET available_at_ms = 0 WHERE id = ?1",
-            params![id],
-        )?;
-        Ok(())
+    crate::memory::queue::store::update_test_record(&cfg, &id, |record| {
+        record.available_at_ms = 0;
     })
     .unwrap();
     let claim2 = claim_next(&cfg, DEFAULT_LOCK_DURATION_MS).unwrap().unwrap();

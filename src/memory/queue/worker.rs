@@ -29,10 +29,10 @@ use crate::memory::config::MemoryConfig;
 use crate::memory::queue::gate::{LlmGate, Permit};
 use crate::memory::queue::handlers::{self, QueueDelegates};
 use crate::memory::queue::ops::set_backfill_in_progress;
-use crate::memory::queue::store::{claim_next, purge_retired_jobs};
-use crate::memory::queue::store_settle::{
-    mark_deferred, mark_done_with_followups, mark_failed_typed, recover_stale_locks,
-};
+use crate::memory::queue::store::purge_retired_jobs;
+use crate::memory::queue::store_settle::{mark_failed_typed, recover_stale_locks};
+#[cfg(test)]
+use crate::memory::queue::store::claim_next;
 use crate::memory::queue::types::{
     Job, JobFailure, JobKind, JobOutcome, JobStatus, NewJob, SealPayload,
 };
@@ -60,6 +60,14 @@ pub fn llm_gate() -> &'static LlmGate {
 pub fn bootstrap(config: &MemoryConfig) -> Result<(usize, usize)> {
     let purged = purge_retired_jobs(config)?;
     let recovered = recover_stale_locks(config)?;
+    crate::memory::queue::store::repair_pending_hints(config)?;
+    Ok((purged, recovered))
+}
+
+pub(crate) async fn bootstrap_async(config: &MemoryConfig) -> Result<(usize, usize)> {
+    let purged = crate::memory::queue::store::purge_retired_jobs_async(config).await?;
+    let recovered = crate::memory::queue::store_settle::recover_stale_locks_async(config).await?;
+    crate::memory::queue::store::repair_pending_hints_async(config).await?;
     Ok((purged, recovered))
 }
 
@@ -101,7 +109,10 @@ async fn run_once_with_gate(
     delegates: &dyn QueueDelegates,
     gate: &LlmGate,
 ) -> Result<bool> {
-    let Some(job) = claim_next(config, config.queue.lock_duration_ms)? else {
+    let Some(job) =
+        crate::memory::queue::store::claim_next_async(config, config.queue.lock_duration_ms)
+            .await?
+    else {
         return Ok(false);
     };
 
@@ -109,12 +120,21 @@ async fn run_once_with_gate(
     // handler; non-LLM jobs (AppendBuffer, FlushStale) run without one.
     let permit: Option<Permit> = if job.kind.is_llm_bound() {
         let Some(permit) = gate.try_acquire() else {
-            mark_deferred(
+            crate::memory::queue::store_settle::mark_deferred_async(
                 config,
                 &job,
                 chrono::Utc::now().timestamp_millis() + LLM_GATE_RETRY_MS,
                 "llm concurrency gate busy",
-            )?;
+            )
+            .await?;
+            if job.kind == JobKind::ReembedBackfill
+                && matches!(
+                    crate::memory::queue::store::get_job_async(config, &job.id).await?,
+                    Some(current) if current.status == JobStatus::Ready
+                )
+            {
+                set_backfill_in_progress(true);
+            }
             return Ok(true);
         };
         Some(permit)
@@ -125,12 +145,13 @@ async fn run_once_with_gate(
     let result = handlers::plan_job(config, &job, delegates).await;
     drop(permit);
 
-    settle_planned_job(config, &job, result)?;
+    settle_planned_job_async(config, &job, result).await?;
     Ok(true)
 }
 
 /// Translate a handler plan into the matching store settlement call. Successful
-/// follow-up enqueues commit in the same transaction as `mark_done`.
+/// follow-ups and staged domain changes commit with `mark_done` under the same
+/// owner-state head CAS.
 /// Errors from the settlement call itself (e.g. a busy database) propagate to
 /// the caller — the job's `running` row is then left for lease-expiry
 /// recovery rather than being retried inline here.
@@ -142,6 +163,8 @@ fn settle_job(config: &MemoryConfig, job: &Job, result: Result<JobOutcome>) -> R
         result.map(|outcome| handlers::JobPlan {
             outcome,
             follow_ups: Vec::new(),
+            expected: Vec::new(),
+            mutations: Vec::new(),
         }),
     )
 }
@@ -155,12 +178,22 @@ fn settle_planned_job(
         Ok(handlers::JobPlan {
             outcome: JobOutcome::Done,
             follow_ups,
+            expected,
+            mutations,
         }) => {
             let arms_reembed = follow_ups
                 .iter()
                 .any(|follow_up| follow_up.kind == JobKind::ReembedBackfill);
-            let committed = mark_done_with_followups(config, job, &follow_ups)?;
-            if committed && arms_reembed {
+            let committed = crate::memory::queue::store_settle::mark_done_with_changes(
+                config,
+                job,
+                &follow_ups,
+                &expected,
+                &mutations,
+            )?;
+            if committed && job.kind == JobKind::ReembedBackfill {
+                set_backfill_in_progress(arms_reembed);
+            } else if committed && arms_reembed {
                 set_backfill_in_progress(true);
             }
 
@@ -188,11 +221,23 @@ fn settle_planned_job(
         }
         Ok(handlers::JobPlan {
             outcome: JobOutcome::Defer { until_ms, reason },
+            expected,
+            mutations,
             ..
         }) => {
             // Defer is normal operation (transient blocker) — does NOT burn the
             // failure budget; `mark_deferred` reverts the claim's attempts bump.
-            mark_deferred(config, job, until_ms, &reason)
+            let committed = crate::memory::queue::store_settle::mark_deferred_with_changes(
+                config, job, until_ms, &reason, &expected, &mutations,
+            )?;
+            if committed && job.kind == JobKind::ReembedBackfill {
+                let still_pending = matches!(
+                    crate::memory::queue::store::get_job(config, &job.id)?,
+                    Some(current) if current.status == JobStatus::Ready
+                );
+                set_backfill_in_progress(still_pending);
+            }
+            Ok(())
         }
         Err(err) => {
             // Preserve the full anyhow cause chain in `last_error` so a reader
@@ -223,6 +268,88 @@ fn settle_planned_job(
             if job.kind == JobKind::ReembedBackfill
                 && matches!(
                     crate::memory::queue::store::get_job(config, &job.id)?,
+                    Some(current) if current.status == JobStatus::Failed
+                )
+            {
+                set_backfill_in_progress(false);
+            }
+            Ok(())
+        }
+    }
+}
+
+async fn settle_planned_job_async(
+    config: &MemoryConfig,
+    job: &Job,
+    result: Result<handlers::JobPlan>,
+) -> Result<()> {
+    match result {
+        Ok(handlers::JobPlan {
+            outcome: JobOutcome::Done,
+            follow_ups,
+            expected,
+            mutations,
+        }) => {
+            let arms_reembed = follow_ups
+                .iter()
+                .any(|follow_up| follow_up.kind == JobKind::ReembedBackfill);
+            let committed = crate::memory::queue::store_settle::mark_done_with_changes_async(
+                config,
+                job,
+                &follow_ups,
+                &expected,
+                &mutations,
+            )
+            .await?;
+            if committed && job.kind == JobKind::ReembedBackfill {
+                set_backfill_in_progress(arms_reembed);
+            } else if committed && arms_reembed {
+                set_backfill_in_progress(true);
+            }
+            // Post-seal rechecks are intentionally kept out of this async
+            // path until the tree store exposes its owner-state async read.
+            // The staged seal/append plan must carry any follow-up intent in
+            // the same CAS; a synchronous SQLite recheck cannot run on a
+            // current-thread executor.
+            Ok(())
+        }
+        Ok(handlers::JobPlan {
+            outcome: JobOutcome::Defer { until_ms, reason },
+            expected,
+            mutations,
+            ..
+        }) => {
+            let committed = crate::memory::queue::store_settle::mark_deferred_with_changes_async(
+                config, job, until_ms, &reason, &expected, &mutations,
+            )
+            .await?;
+            if committed && job.kind == JobKind::ReembedBackfill {
+                let still_pending = matches!(
+                    crate::memory::queue::store::get_job_async(config, &job.id).await?,
+                    Some(current) if current.status == JobStatus::Ready
+                );
+                set_backfill_in_progress(still_pending);
+            }
+            Ok(())
+        }
+        Err(err) => {
+            let message = format!("{err:#}");
+            let converted_pipeline_failure = err
+                .downcast_ref::<crate::memory::health::PipelineFailure>()
+                .map(|f| JobFailure {
+                    code: f.code.as_str(),
+                    class: f.class.as_str(),
+                });
+            let typed = err
+                .downcast_ref::<JobFailure>()
+                .or(converted_pipeline_failure.as_ref());
+            crate::memory::queue::store_settle::mark_failed_typed_async(
+                config, job, &message, typed,
+            )
+            .await?;
+            if job.kind == JobKind::ReembedBackfill
+                && matches!(
+                    crate::memory::queue::store::get_job_async(config, &job.id).await?,
                     Some(current) if current.status == JobStatus::Failed
                 )
             {
