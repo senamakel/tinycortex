@@ -1,8 +1,8 @@
 use super::*;
 use crate::memory::config::MemoryConfig;
 use crate::memory::queue::store::{
-    DEFAULT_LOCK_DURATION_MS, claim_next, count_by_status, count_failed_unrecoverable, count_total,
-    enqueue, get_job,
+    claim_next, count_by_status, count_failed_unrecoverable, count_total, enqueue, get_job,
+    DEFAULT_LOCK_DURATION_MS,
 };
 use crate::memory::queue::types::{
     AppendBufferPayload, AppendTarget, ExtractChunkPayload, JobStatus, NewJob, NodeRef,

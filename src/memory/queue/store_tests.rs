@@ -205,7 +205,7 @@ fn idle_worker_repairs_a_ready_job_whose_hint_was_lost() {
 #[test]
 fn owner_head_commit_fences_domain_changes_and_follow_ups_together() {
     use crate::memory::chunks::versioned::{self, StateChange};
-    use crate::memory::queue::store::{JobRecord, commit_claimed};
+    use crate::memory::queue::store::{commit_claimed, JobRecord};
     use serde_json::json;
 
     let (_tmp, cfg) = test_config();
@@ -422,11 +422,9 @@ fn retired_kind_rows_are_skipped_then_purged() {
     assert_eq!(claimed.id, live_id);
     assert_eq!(claimed.kind, JobKind::ExtractChunk);
     // No further claimable rows (retired ones are excluded).
-    assert!(
-        claim_next(&cfg, DEFAULT_LOCK_DURATION_MS)
-            .unwrap()
-            .is_none()
-    );
+    assert!(claim_next(&cfg, DEFAULT_LOCK_DURATION_MS)
+        .unwrap()
+        .is_none());
 
     // Purge removes exactly the two retired rows; the live row stays.
     let purged = purge_retired_jobs(&cfg).unwrap();
@@ -474,11 +472,9 @@ fn claim_next_prefers_reembed_backfill_over_older_extract_chunk() {
     assert_eq!(second.id, extract_id);
     assert_eq!(second.kind, JobKind::ExtractChunk);
 
-    assert!(
-        claim_next(&cfg, DEFAULT_LOCK_DURATION_MS)
-            .unwrap()
-            .is_none()
-    );
+    assert!(claim_next(&cfg, DEFAULT_LOCK_DURATION_MS)
+        .unwrap()
+        .is_none());
 }
 
 /// Pins the whole claim ladder: `seal` > `reembed_backfill` > `flush_stale` >

@@ -1,6 +1,6 @@
 use super::*;
 use crate::memory::config::MemoryConfig;
-use crate::memory::queue::store::{DEFAULT_LOCK_DURATION_MS, claim_next, count_by_status};
+use crate::memory::queue::store::{claim_next, count_by_status, DEFAULT_LOCK_DURATION_MS};
 use crate::memory::queue::store_settle::mark_failed;
 use crate::memory::queue::types::{ExtractChunkPayload, JobKind, JobStatus, NewJob};
 use tempfile::TempDir;
