@@ -4,7 +4,7 @@ use crate::memory::graph::{pairs_from_entities, upsert_edges};
 #[test]
 fn bounded_bfs_finds_two_hop_pair() {
     let temp = tempfile::tempdir().unwrap();
-    let config = MemoryConfig::new(temp.path());
+    let config = crate::memory::chunks::test_support::host_config(temp.path());
     upsert_edges(
         &config,
         &pairs_from_entities(&["alice".into(), "bob".into()]),

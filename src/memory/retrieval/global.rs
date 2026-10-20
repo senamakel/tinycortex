@@ -16,12 +16,14 @@
 use anyhow::Result;
 use chrono::{DateTime, TimeZone, Utc};
 
-use crate::memory::chunks::{get_chunk_embeddings_batch, get_chunks_batch_async, SourceKind};
+use crate::memory::chunks::{get_chunk_embeddings_batch_async, get_chunks_batch_async, SourceKind};
 use crate::memory::config::MemoryConfig;
 use crate::memory::score::embed::Embedder;
-use crate::memory::score::store::{get_dropped_chunk_ids_batch, lookup_entity_in_window};
+use crate::memory::score::store::{
+    get_dropped_chunk_ids_batch_async, lookup_entity_in_window_async,
+};
 use crate::memory::tree::store::{
-    get_summaries_batch, get_summary_embeddings_batch, get_trees_batch,
+    get_summaries_batch_async, get_summary_embeddings_batch_async, get_trees_batch_async,
 };
 
 use super::source::{collect_source_hits, order_hits, ScoredHit};
@@ -38,7 +40,7 @@ use super::types::{hit_from_chunk, hit_from_summary, QueryResponse};
 ///
 /// Returns an error if `until_ms < since_ms`.
 ///
-/// The window predicate is applied in SQLite per selected tree before summary
+/// The window predicate is applied per selected tree before summary
 /// embeddings are hydrated.
 pub async fn query_global(
     config: &MemoryConfig,
@@ -60,7 +62,7 @@ pub async fn query_global(
             "query_global: until_ms ({until_ms}) precedes since_ms ({since_ms})"
         ));
     }
-    let scored = collect_source_hits(config, None, source_kind, Some((since_ms, until_ms)))?;
+    let scored = collect_source_hits(config, None, source_kind, Some((since_ms, until_ms))).await?;
     let total = scored.len();
 
     let mut hits = order_hits(scored, query, embedder).await;
@@ -75,7 +77,7 @@ pub async fn query_global(
 /// hit (summaries hydrated with their tree scope, leaves with their source id),
 /// optionally restricted to `[since_ms, until_ms]` and reranked by `query`.
 ///
-/// The entity-index timestamp window is pushed into SQLite before the
+/// The entity-index timestamp window is applied before the
 /// configured topic lookup cap, so historical windows are not crowded
 /// out by newer mentions. A window containing more than the cap remains
 /// intentionally bounded.
@@ -131,13 +133,14 @@ async fn resolve_topic_hits(
     since_ms: Option<i64>,
     until_ms: Option<i64>,
 ) -> Result<Vec<ScoredHit>> {
-    let entity_hits = lookup_entity_in_window(
+    let entity_hits = lookup_entity_in_window_async(
         config,
         entity_id,
         since_ms,
         until_ms,
         Some(config.retrieval.limits.topic_lookup_limit),
-    )?;
+    )
+    .await?;
     if entity_hits.is_empty() {
         return Ok(Vec::new());
     }
@@ -153,11 +156,11 @@ async fn resolve_topic_hits(
         .map(|h| h.node_id.clone())
         .collect();
 
-    let summaries = get_summaries_batch(config, &summary_ids)?;
-    let summary_embs = get_summary_embeddings_batch(config, &summary_ids)?;
-    let dropped_chunk_ids = get_dropped_chunk_ids_batch(config, &leaf_ids)?;
+    let summaries = get_summaries_batch_async(config, &summary_ids).await?;
+    let summary_embs = get_summary_embeddings_batch_async(config, &summary_ids).await?;
+    let dropped_chunk_ids = get_dropped_chunk_ids_batch_async(config, &leaf_ids).await?;
     let chunks = get_chunks_batch_async(config, &leaf_ids).await?;
-    let chunk_embs = get_chunk_embeddings_batch(config, &leaf_ids)?;
+    let chunk_embs = get_chunk_embeddings_batch_async(config, &leaf_ids).await?;
 
     // Distinct tree ids for summary scopes.
     let tree_ids: Vec<String> = {
@@ -168,7 +171,7 @@ async fn resolve_topic_hits(
             .map(|s| s.tree_id.clone())
             .collect()
     };
-    let trees = get_trees_batch(config, &tree_ids)?;
+    let trees = get_trees_batch_async(config, &tree_ids).await?;
 
     let mut out: Vec<ScoredHit> = Vec::with_capacity(entity_hits.len());
     for eh in &entity_hits {

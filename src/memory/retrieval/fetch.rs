@@ -7,15 +7,15 @@
 //! ids are silently skipped — the return is best-effort, so partial failures
 //! are visible via `hits.len() < ids.len()`.
 //!
-//! Each hit is annotated with the chunk's score from `mem_tree_score` when
+//! Each hit is annotated with the chunk's score from the owner score collection when
 //! available; score is `0.0` when the chunk has no score row. Two batched
-//! reads (chunks + scores) replace `2N` per-id queries.
+//! owner-store reads (chunks + scores) replace `2N` per-id queries.
 
 use anyhow::Result;
 
 use crate::memory::chunks::{get_chunks_batch, get_chunks_batch_async};
 use crate::memory::config::MemoryConfig;
-use crate::memory::score::store::get_scores_batch;
+use crate::memory::score::store::{get_scores_batch, get_scores_batch_async};
 
 use super::types::{hydrated_chunk_hit, RetrievalHit};
 
@@ -37,7 +37,7 @@ pub fn fetch_leaves(config: &MemoryConfig, chunk_ids: &[String]) -> Result<Vec<R
         chunk_ids
     };
 
-    // Two batched SQLite reads up front instead of 2N per-id queries.
+    // Two batched owner-store reads up front instead of 2N per-id queries.
     let chunk_by_id = get_chunks_batch(config, ids)?;
     let score_by_id = get_scores_batch(config, ids)?;
 
@@ -70,7 +70,7 @@ pub async fn fetch_leaves_async(
         chunk_ids
     };
     let chunk_by_id = get_chunks_batch_async(config, ids).await?;
-    let score_by_id = get_scores_batch(config, ids)?;
+    let score_by_id = get_scores_batch_async(config, ids).await?;
     let mut out = Vec::with_capacity(ids.len());
     for id in ids {
         if let Some(chunk) = chunk_by_id.get(id) {

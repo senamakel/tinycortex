@@ -12,27 +12,27 @@
 //! append and summary seal happen in the async extract worker driven off the
 //! [`TreeJobSink`]; this hot path stops at enqueue.
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{anyhow, bail, Result};
 use chrono::Utc;
 
 use crate::memory::chunks::collections::{
-    CHUNK_LIFECYCLE, INGEST_OUTBOX, INGESTED_SOURCES, RAW_REFS, SCORES,
+    CHUNK_LIFECYCLE, INGESTED_SOURCES, INGEST_OUTBOX, RAW_REFS, SCORES,
 };
 use crate::memory::chunks::versioned::{
-    StateChange, commit_if_state_matches_async, commit_staged_chunks_if_state_matches_async,
-    list_state_async, read_state_async, read_states_async,
+    commit_if_state_matches_async, commit_staged_chunks_if_state_matches_async, list_state_async,
+    read_state_async, read_states_async, StateChange,
 };
 use crate::memory::chunks::{
-    self, CHUNK_STATUS_PENDING_EXTRACTION, ChunkerInput, ChunkerOptions, SourceKind, chunk_markdown,
+    self, chunk_markdown, ChunkerInput, ChunkerOptions, SourceKind, CHUNK_STATUS_PENDING_EXTRACTION,
 };
 use crate::memory::config::MemoryConfig;
-use crate::memory::score::{ScoringConfig, score_chunks_fast};
+use crate::memory::score::{score_chunks_fast, ScoringConfig};
 use crate::memory::store::content;
 
-use super::canonicalize::CanonicalisedSource;
 use super::canonicalize::chat::{self, ChatBatch};
 use super::canonicalize::document::{self, DocumentInput};
 use super::canonicalize::email::{self, EmailThread};
+use super::canonicalize::CanonicalisedSource;
 use super::types::{ExtractJobIntent, IngestOptions, IngestSummary, QueuePublication, TreeJobSink};
 
 /// Publish queue hints for every committed ingest intent that has not yet

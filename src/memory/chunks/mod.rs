@@ -114,12 +114,15 @@ pub use embeddings::{
     tree_active_signature, REEMBED_SKIP_KEY_MAX_LEN,
 };
 pub use embeddings_query::{
-    get_chunk_embedding, get_chunk_embedding_for_signature, get_chunk_embeddings_batch,
-    get_chunk_embeddings_for_signature_batch, has_uncovered_reembed_work,
+    get_chunk_embedding, get_chunk_embedding_async, get_chunk_embedding_for_signature,
+    get_chunk_embedding_for_signature_async, get_chunk_embeddings_batch,
+    get_chunk_embeddings_batch_async, get_chunk_embeddings_for_signature_batch,
+    get_chunk_embeddings_for_signature_batch_async, has_uncovered_reembed_work,
 };
 pub use raw_refs::{
     get_chunk_content_path, get_chunk_content_pointers, get_chunk_raw_refs,
-    get_summary_content_pointers, list_chunk_raw_ref_paths_with_prefix,
+    get_chunk_raw_refs_async, get_summary_content_pointers, get_summary_content_pointers_async,
+    list_chunk_raw_ref_paths_with_prefix, list_chunk_raw_ref_paths_with_prefix_async,
     list_summaries_with_content_path, set_chunk_raw_refs, set_chunk_raw_refs_tx, RawRef,
 };
 pub use recovery::{
@@ -135,8 +138,8 @@ pub use store::{
     filter_raw_paths_not_ingested, get_chunk, get_chunk_async, get_chunk_lifecycle_status,
     get_chunks_batch, get_chunks_batch_async, is_source_ingested, list_source_ids_with_prefix,
     mark_raw_paths_ingested, set_chunk_lifecycle_status, update_chunk_content_sha256,
-    update_summary_content_sha256, upsert_chunks, upsert_chunks_tx, upsert_staged_chunks_tx,
-    CHUNK_STATUS_ADMITTED, CHUNK_STATUS_BUFFERED, CHUNK_STATUS_DROPPED,
+    update_summary_content_sha256, upsert_chunks, upsert_chunks_async, upsert_chunks_tx,
+    upsert_staged_chunks_tx, CHUNK_STATUS_ADMITTED, CHUNK_STATUS_BUFFERED, CHUNK_STATUS_DROPPED,
     CHUNK_STATUS_PENDING_EXTRACTION, CHUNK_STATUS_SEALED, RAW_FILE_GATE_KIND,
 };
 pub(crate) use store_delete::remove_unreferenced_content_files;

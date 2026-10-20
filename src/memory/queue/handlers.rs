@@ -28,7 +28,7 @@ use serde::de::DeserializeOwned;
 
 use crate::memory::chunks::collections::{
     BUFFERS, CHUNK_EMBEDDINGS, CHUNK_LIFECYCLE, CHUNK_REEMBED_SKIPS, ENTITY_EDGES, ENTITY_HOTNESS,
-    ENTITY_INDEX, SCORES, SUMMARIES, TREES,
+    ENTITY_INDEX, SCORES, SUMMARIES, SUMMARY_CONTENT_POINTERS, TREES,
 };
 use crate::memory::chunks::versioned::StateChange;
 use crate::memory::config::MemoryConfig;
@@ -124,6 +124,8 @@ pub enum JobStateCollection {
     Trees,
     /// Sealed tree summaries.
     Summaries,
+    /// Content-addressed summary body pointers.
+    SummaryContentPointers,
     /// Mutable tree buffers.
     TreeBuffers,
     /// Per-model chunk vectors.
@@ -145,6 +147,7 @@ impl JobStateCollection {
             Self::ChunkScores => SCORES,
             Self::Trees => TREES,
             Self::Summaries => SUMMARIES,
+            Self::SummaryContentPointers => SUMMARY_CONTENT_POINTERS,
             Self::TreeBuffers => BUFFERS,
             Self::ChunkEmbeddings => CHUNK_EMBEDDINGS,
             Self::ChunkReembedSkips => CHUNK_REEMBED_SKIPS,

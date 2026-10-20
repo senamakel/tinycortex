@@ -202,9 +202,8 @@ async fn query_topic_window_filters_old_nodes() {
 
 #[tokio::test]
 async fn query_topic_applies_historical_window_before_lookup_cap() {
-    use crate::memory::chunks::with_connection;
-
-    let (_tmp, cfg) = test_config();
+    let (_tmp, mut cfg) = test_config();
+    cfg.retrieval.limits.topic_lookup_limit = 2;
     let old = Utc.timestamp_millis_opt(1_000_000_000_000).unwrap();
     let chunk = sample_chunk_at("slack:#history", 0, "historic phoenix", old);
     insert_chunks(&cfg, std::slice::from_ref(&chunk));
@@ -220,23 +219,18 @@ async fn query_topic_applies_historical_window_before_lookup_cap() {
     );
     // More than the configured topic cap recent stale index rows used to hide the old
     // real row because LIMIT ran before the historical-window filter.
-    with_connection(&cfg, |conn| {
-        let tx = conn.unchecked_transaction()?;
-        for index in 0..=cfg.retrieval.limits.topic_lookup_limit {
-            tx.execute(
-                "INSERT INTO mem_tree_entity_index
-                 (entity_id,node_id,node_kind,entity_kind,surface,score,timestamp_ms,tree_id,is_user)
-                 VALUES ('topic:phoenix',?1,'leaf','topic','phoenix',1.0,?2,NULL,0)",
-                rusqlite::params![
-                    format!("stale-{index}"),
-                    fixed_ts().timestamp_millis() + index as i64
-                ],
-            )?;
-        }
-        tx.commit()?;
-        Ok(())
-    })
-    .unwrap();
+    for index in 0..=cfg.retrieval.limits.topic_lookup_limit {
+        index_entity_occurrence(
+            &cfg,
+            "topic:phoenix",
+            EntityKind::Topic,
+            "phoenix",
+            &format!("stale-{index}"),
+            "leaf",
+            fixed_ts().timestamp_millis() + index as i64,
+            None,
+        );
+    }
 
     let response = query_topic(
         &cfg,
@@ -256,19 +250,20 @@ async fn query_topic_applies_historical_window_before_lookup_cap() {
 
 #[tokio::test]
 async fn query_topic_excludes_chunks_with_dropped_score_rows() {
-    use crate::memory::chunks::with_connection;
-
     let (_tmp, cfg) = test_config();
     let chunk = sample_chunk("slack:#eng", 0, "phoenix");
     insert_chunks(&cfg, std::slice::from_ref(&chunk));
     insert_score(&cfg, &chunk.id, 0.1);
-    with_connection(&cfg, |conn| {
-        conn.execute(
-            "UPDATE mem_tree_score SET dropped=1 WHERE chunk_id=?1",
-            rusqlite::params![chunk.id],
-        )?;
-        Ok(())
+    let score_config = cfg.clone();
+    let score_id = chunk.id.clone();
+    std::thread::spawn(move || {
+        let mut score = crate::memory::score::store::get_score(&score_config, &score_id)
+            .unwrap()
+            .unwrap();
+        score.dropped = true;
+        crate::memory::score::store::upsert_score(&score_config, &score).unwrap();
     })
+    .join()
     .unwrap();
     index_entity_occurrence(
         &cfg,

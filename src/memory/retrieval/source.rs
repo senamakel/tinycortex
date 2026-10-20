@@ -7,15 +7,14 @@
 //!    kind (chat / email / document).
 //! 3. Neither → every source tree.
 //!
-//! For each tree we pull level ≥ 1 summaries. With `time_window_days`, an SQL
+//! For each tree we pull level ≥ 1 summaries. With `time_window_days`, a
 //! predicate keeps only summaries whose `[time_range_start, time_range_end]`
 //! overlaps `[now − window, now]` before embeddings are hydrated. When `query`
 //! is `Some`, hits are reranked by cosine
 //! similarity between the query embedding and each summary's stored embedding;
 //! otherwise they are ordered newest-first by `time_range_end`.
 //!
-//! This is a thin read-only view over `mem_tree_trees` and `mem_tree_summaries`
-//! — no new indexes or tables.
+//! This is a read-only view over versioned owner state.
 //!
 //! Unwindowed queries still materialize all selected summaries; callers should
 //! supply a window for bounded historical retrieval.
@@ -27,8 +26,8 @@ use crate::memory::chunks::SourceKind;
 use crate::memory::config::MemoryConfig;
 use crate::memory::score::embed::Embedder;
 use crate::memory::tree::store::{
-    get_summary_embeddings_batch, get_tree_by_scope, list_summaries_at_level,
-    list_summaries_overlapping_window, list_trees_by_kind,
+    get_summary_embeddings_batch_async, get_tree_by_scope_async, list_summaries_at_level_async,
+    list_summaries_overlapping_window_async, list_trees_by_kind_async,
 };
 use crate::memory::tree::{Tree, TreeKind};
 
@@ -74,7 +73,7 @@ pub async fn query_source(
             Ok((start.timestamp_millis(), now.timestamp_millis()))
         })
         .transpose()?;
-    let scored = collect_source_hits(config, source_id, source_kind, window)?;
+    let scored = collect_source_hits(config, source_id, source_kind, window).await?;
     let total = scored.len();
 
     let sorted = order_hits(scored, query, embedder).await;
@@ -107,16 +106,16 @@ pub(crate) async fn order_hits(
 /// the selected source trees, hydrating each summary's embedding from the
 /// per-model sidecar when the legacy in-row column is empty.
 ///
-/// When `window_ms` is present, filtering happens in SQLite before embedding
-/// hydration. Without a window this remains O(number of non-deleted summaries
+/// When `window_ms` is present, filtering happens in the owner-state reader
+/// before embedding hydration. Without a window this remains O(number of non-deleted summaries
 /// across the selected trees), unbounded by any `limit` argument.
-pub(crate) fn collect_source_hits(
+pub(crate) async fn collect_source_hits(
     config: &MemoryConfig,
     source_id: Option<&str>,
     source_kind: Option<SourceKind>,
     window_ms: Option<(i64, i64)>,
 ) -> Result<Vec<ScoredHit>> {
-    let trees = select_trees(config, source_id, source_kind)?;
+    let trees = select_trees(config, source_id, source_kind).await?;
 
     let mut hits: Vec<RetrievalHit> = Vec::new();
     let mut node_ids: Vec<String> = Vec::new();
@@ -128,7 +127,10 @@ pub(crate) fn collect_source_hits(
             continue;
         }
         if let Some((since_ms, until_ms)) = window_ms {
-            for node in list_summaries_overlapping_window(config, &tree.id, since_ms, until_ms)? {
+            for node in
+                list_summaries_overlapping_window_async(config, &tree.id, since_ms, until_ms)
+                    .await?
+            {
                 if node.deleted {
                     continue;
                 }
@@ -138,7 +140,7 @@ pub(crate) fn collect_source_hits(
             }
         } else {
             for level in 1..=tree.max_level {
-                for node in list_summaries_at_level(config, &tree.id, level)? {
+                for node in list_summaries_at_level_async(config, &tree.id, level).await? {
                     if node.deleted {
                         continue;
                     }
@@ -159,7 +161,7 @@ pub(crate) fn collect_source_hits(
         .map(|(id, _)| id.clone())
         .collect();
     if !unembedded.is_empty() {
-        let by_id = get_summary_embeddings_batch(config, &unembedded)?;
+        let by_id = get_summary_embeddings_batch_async(config, &unembedded).await?;
         for (id, slot) in node_ids.iter().zip(embeddings.iter_mut()) {
             if slot.is_none() {
                 if let Some(v) = by_id.get(id) {
@@ -174,18 +176,18 @@ pub(crate) fn collect_source_hits(
 
 /// Resolve the set of source trees to scan. `source_id` has priority, then
 /// `source_kind` (via scope prefix matching), then "all source trees".
-fn select_trees(
+async fn select_trees(
     config: &MemoryConfig,
     source_id: Option<&str>,
     source_kind: Option<SourceKind>,
 ) -> Result<Vec<Tree>> {
     if let Some(id) = source_id {
-        return match get_tree_by_scope(config, TreeKind::Source, id)? {
+        return match get_tree_by_scope_async(config, TreeKind::Source, id).await? {
             Some(t) => Ok(vec![t]),
             None => Ok(Vec::new()),
         };
     }
-    let all = list_trees_by_kind(config, TreeKind::Source)?;
+    let all = list_trees_by_kind_async(config, TreeKind::Source).await?;
     if let Some(kind) = source_kind {
         let prefix = kind.as_str();
         return Ok(all

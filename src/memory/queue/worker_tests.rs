@@ -260,9 +260,7 @@ fn committed_reembed_defer_keeps_backfill_hint_until_completion() {
 
 #[test]
 fn completed_seal_rearms_same_level_when_live_buffer_still_crosses_gate() {
-    use crate::memory::chunks::with_connection;
     use crate::memory::queue::types::SealPayload;
-    use rusqlite::params;
 
     let (_tmp, mut cfg) = test_config();
     cfg.tree.input_token_budget = 10;
@@ -284,15 +282,14 @@ fn completed_seal_rearms_same_level_when_live_buffer_still_crosses_gate() {
 
     // Models content appended after the handler took and consumed its own
     // snapshot, while this job's active dedupe key still suppressed producers.
-    with_connection(&cfg, |conn| {
-        conn.execute(
-            "INSERT INTO mem_tree_buffers
-                (tree_id, level, item_ids_json, token_sum, oldest_at_ms, updated_at_ms)
-             VALUES (?1, 0, '[\"late-chunk\"]', 10, 1, 1)",
-            params![payload.tree_id],
-        )?;
-        Ok(())
-    })
+    crate::memory::tree::append_to_buffer(
+        &cfg,
+        &payload.tree_id,
+        0,
+        "late-chunk",
+        10,
+        chrono::Utc::now(),
+    )
     .unwrap();
 
     settle_job(&cfg, &claimed, Ok(JobOutcome::Done)).unwrap();

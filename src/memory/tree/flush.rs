@@ -12,7 +12,7 @@ use chrono::{DateTime, Duration, Utc};
 
 use crate::memory::config::MemoryConfig;
 use crate::memory::tree::bucket_seal::{
-    LabelStrategy, SealServices, cascade_all_from, cascade_all_from_with_services,
+    cascade_all_from, cascade_all_from_with_services, LabelStrategy, SealServices,
 };
 use crate::memory::tree::store::{self, DEFAULT_FLUSH_AGE_SECS};
 use crate::memory::tree::summarise::Summariser;
@@ -46,7 +46,7 @@ pub async fn flush_stale_buffers_with_services(
 ) -> Result<usize> {
     let now = Utc::now();
     let cutoff = now - max_age;
-    let stale = store::list_stale_buffers(config, cutoff)?;
+    let stale = store::list_stale_buffers_async(config, cutoff).await?;
 
     // One batched fetch over the distinct tree_ids; missing rows are skipped.
     let distinct_tree_ids: Vec<String> = {
@@ -59,7 +59,7 @@ pub async fn flush_stale_buffers_with_services(
         }
         out
     };
-    let tree_by_id = store::get_trees_batch(config, &distinct_tree_ids)?;
+    let tree_by_id = store::get_trees_batch_async(config, &distinct_tree_ids).await?;
 
     let mut seals = 0;
     let mut failures = Vec::new();
@@ -117,7 +117,8 @@ pub async fn force_flush_tree(
     strategy: &LabelStrategy,
 ) -> Result<Vec<String>> {
     let _ = now;
-    let tree = store::get_tree(config, tree_id)?
+    let tree = store::get_tree_async(config, tree_id)
+        .await?
         .ok_or_else(|| anyhow::anyhow!("no tree with id {tree_id}"))?;
     cascade_all_from(config, &tree, 0, true, summariser, strategy).await
 }

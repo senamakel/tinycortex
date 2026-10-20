@@ -29,11 +29,9 @@ async fn blocking_bridge_rejects_current_thread_runtime_without_deadlocking() {
 
     let error = blocking.run(async { 42 }).unwrap_err();
 
-    assert!(
-        error
-            .to_string()
-            .contains("cannot run on a current-thread Tokio runtime")
-    );
+    assert!(error
+        .to_string()
+        .contains("cannot run on a current-thread Tokio runtime"));
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -81,11 +79,9 @@ fn blocking_bridge_reports_a_future_panic() {
         .run(async { panic!("bridge test panic") })
         .unwrap_err();
 
-    assert!(
-        error
-            .to_string()
-            .contains("storage call stopped unexpectedly")
-    );
+    assert!(error
+        .to_string()
+        .contains("storage call stopped unexpectedly"));
 }
 
 #[test]
@@ -97,9 +93,7 @@ fn blocking_bridge_rejects_reentrant_calls_instead_of_deadlocking() {
         .run(async move { nested.run(async {}).unwrap_err() })
         .unwrap();
 
-    assert!(
-        error
-            .to_string()
-            .contains("called back into its own blocking bridge")
-    );
+    assert!(error
+        .to_string()
+        .contains("called back into its own blocking bridge"));
 }

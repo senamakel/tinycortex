@@ -25,9 +25,7 @@ const MAX_STALE_HINTS: usize = 64;
 /// Default visibility lock — a crashed worker is redelivered after this window.
 pub const DEFAULT_LOCK_DURATION_MS: i64 = 5 * 60 * 1_000;
 /// Backoff math for retry. Returns `now + min(base * 2^attempts, cap)`.
-#[cfg(test)]
 pub(crate) const RETRY_BASE_MS: i64 = 60 * 1_000;
-#[cfg(test)]
 pub(crate) const RETRY_CAP_MS: i64 = 60 * 60 * 1_000;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -1083,55 +1081,57 @@ pub(crate) async fn repair_pending_hints_async(config: &MemoryConfig) -> Result<
 
 /// Count rows with a given durable lifecycle status.
 pub fn count_by_status(config: &MemoryConfig, status: JobStatus) -> Result<u64> {
-    Ok(all_jobs(config)?
+    Ok(versioned::list_state(config, JOBS)?
         .into_iter()
-        .filter(|job| job.status == status)
+        .filter(|(key, _)| key.starts_with(JOB_PREFIX))
+        .map(|(_, value)| decode_job(&value))
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .filter(|record| record.status == status.as_str())
         .count() as u64)
 }
 
 #[cfg(test)]
 pub(crate) async fn count_by_status_async(config: &MemoryConfig, status: JobStatus) -> Result<u64> {
-    Ok(all_jobs_async(config)
+    Ok(versioned::list_state_async(config, JOBS)
         .await?
         .into_iter()
-        .filter(|job| job.status == status)
+        .filter(|(key, _)| key.starts_with(JOB_PREFIX))
+        .map(|(_, value)| decode_job(&value))
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .filter(|record| record.status == status.as_str())
         .count() as u64)
 }
 
 #[cfg(test)]
 pub(crate) async fn count_total_async(config: &MemoryConfig) -> Result<u64> {
-    Ok(all_jobs_async(config).await?.len() as u64)
+    Ok(versioned::list_state_async(config, JOBS)
+        .await?
+        .into_iter()
+        .filter(|(key, _)| key.starts_with(JOB_PREFIX))
+        .count() as u64)
 }
 
 pub fn count_failed_unrecoverable(config: &MemoryConfig) -> Result<u64> {
-    Ok(all_jobs(config)?
+    Ok(versioned::list_state(config, JOBS)?
         .into_iter()
-        .filter(|job| {
-            job.status == JobStatus::Failed && job.failure_class.as_deref() == Some("unrecoverable")
+        .filter(|(key, _)| key.starts_with(JOB_PREFIX))
+        .map(|(_, value)| decode_job(&value))
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .filter(|record| {
+            record.status == JobStatus::Failed.as_str()
+                && record.failure_class.as_deref() == Some("unrecoverable")
         })
         .count() as u64)
 }
 
 pub fn count_total(config: &MemoryConfig) -> Result<u64> {
-    Ok(all_jobs(config)?.len() as u64)
-}
-
-fn all_jobs(config: &MemoryConfig) -> Result<Vec<Job>> {
-    versioned::list_state(config, JOBS)?
+    Ok(versioned::list_state(config, JOBS)?
         .into_iter()
         .filter(|(key, _)| key.starts_with(JOB_PREFIX))
-        .map(|(_, value)| decode_job(&value)?.public(None))
-        .collect()
-}
-
-#[cfg(test)]
-async fn all_jobs_async(config: &MemoryConfig) -> Result<Vec<Job>> {
-    versioned::list_state_async(config, JOBS)
-        .await?
-        .into_iter()
-        .filter(|(key, _)| key.starts_with(JOB_PREFIX))
-        .map(|(_, value)| decode_job(&value)?.public(None))
-        .collect()
+        .count() as u64)
 }
 
 pub fn get_job(config: &MemoryConfig, id: &str) -> Result<Option<Job>> {

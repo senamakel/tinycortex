@@ -19,19 +19,13 @@ pub struct GraphEdge {
     pub weight: u32,
 }
 
-/// Read contract over the entity occurrence index (`mem_tree_entity_index` in
-/// OpenHuman) that the co-occurrence graph derives its edges from.
+/// Read contract for deriving graph co-occurrence from entity occurrences.
 ///
-/// `memory_graph` deliberately owns no storage. The occurrence index — which
-/// records every `(entity_id, node_id)` pair the tree scorer emits — lives in
-/// a separate module (`memory_store::entities`). Rather than hard-depending on
-/// that module's concrete connection handling, the graph queries take any
-/// implementation of this trait by injection. That keeps the derivation pure
-/// and trivially testable with an in-memory fixture, while a real SQLite-backed
-/// adapter can satisfy the same two reads in production.
+/// Production adapters read TinyCortex's owner-scoped versioned occurrence
+/// collection. The trait remains injectable so graph ordering and grouping
+/// behavior can be tested independently of a host storage backend.
 ///
-/// The two operations mirror the only index reads co-occurrence needs and
-/// correspond to OpenHuman's SQL SELF-JOIN over `mem_tree_entity_index`:
+/// The two operations provide the index reads needed by a co-occurrence query:
 ///
 /// - [`nodes_for_entity`] is the `WHERE a.entity_id = ?` side.
 /// - [`entities_on_node`] is the `JOIN … ON a.node_id = b.node_id` side.

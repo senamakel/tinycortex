@@ -24,15 +24,15 @@ use crate::memory::tree::{SummaryNode, Tree, TreeKind};
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NodeKind {
-    /// Leaf = one `mem_tree_chunks` row (level 0).
+    /// Leaf = one persisted chunk record (level 0).
     Leaf,
-    /// Summary = one `mem_tree_summaries` row (level ≥ 1).
+    /// Summary = one persisted summary record (level ≥ 1).
     Summary,
 }
 
 impl NodeKind {
     /// Stable lowercase string form (`"leaf"` / `"summary"`) — matches the
-    /// serde representation and is suitable for SQL discriminator columns.
+    /// serde representation and is suitable for persisted discriminators.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Leaf => "leaf",
@@ -231,7 +231,7 @@ pub struct EntityMatch {
     pub kind: EntityKind,
     /// Example surface form that matched — useful for UI display.
     pub surface: String,
-    /// Total rows in `mem_tree_entity_index` grouped under this canonical id.
+    /// Number of persisted occurrence rows grouped under this canonical id.
     pub mention_count: u64,
     /// Epoch-millis of the newest mention across all rows.
     pub last_seen_ms: i64,

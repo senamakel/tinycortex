@@ -107,13 +107,7 @@ fn fetch_leaves_hydrates_full_staged_body_instead_of_sql_preview() {
         std::slice::from_ref(&chunk),
     )
     .unwrap();
-    crate::memory::chunks::with_connection(&cfg, |conn| {
-        let tx = conn.unchecked_transaction()?;
-        crate::memory::chunks::upsert_staged_chunks_tx(&tx, &staged)?;
-        tx.commit()?;
-        Ok(())
-    })
-    .unwrap();
+    crate::memory::chunks::versioned::upsert_staged_chunks(&cfg, &staged).unwrap();
 
     let out = fetch_leaves(&cfg, &[chunk.id]).unwrap();
     assert_eq!(out[0].content, full_body);

@@ -50,12 +50,10 @@ async fn extract_admits_and_plans_append_buffer() {
     assert_eq!(plan.follow_ups.len(), 1);
     assert_eq!(plan.follow_ups[0].kind, JobKind::AppendBuffer);
     // Covered space → no reembed chain armed.
-    assert!(
-        !plan
-            .follow_ups
-            .iter()
-            .any(|job| job.kind == JobKind::ReembedBackfill)
-    );
+    assert!(!plan
+        .follow_ups
+        .iter()
+        .any(|job| job.kind == JobKind::ReembedBackfill));
 }
 
 #[test]
@@ -173,11 +171,10 @@ async fn extract_arms_reembed_when_uncovered() {
     );
     let plan = plan_job(&cfg, &job, &d).await.unwrap();
     assert_eq!(plan.follow_ups.len(), 2);
-    assert!(
-        plan.follow_ups
-            .iter()
-            .any(|job| job.kind == JobKind::ReembedBackfill)
-    );
+    assert!(plan
+        .follow_ups
+        .iter()
+        .any(|job| job.kind == JobKind::ReembedBackfill));
 }
 
 #[tokio::test]

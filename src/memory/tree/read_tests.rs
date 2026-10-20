@@ -12,7 +12,7 @@ use crate::memory::tree::store::{self, SummaryNode, Tree, TreeKind, TreeStatus};
 
 fn test_config() -> (TempDir, MemoryConfig) {
     let tmp = TempDir::new().unwrap();
-    let cfg = MemoryConfig::new(tmp.path());
+    let cfg = crate::memory::chunks::test_support::host_config(tmp.path());
     (tmp, cfg)
 }
 
@@ -82,23 +82,20 @@ fn seed_tree(cfg: &MemoryConfig) {
         &[chunk("chunkA", "alpha body"), chunk("chunkB", "beta body")],
     )
     .unwrap();
-    crate::memory::chunks::with_connection(cfg, |conn| {
-        let tx = conn.unchecked_transaction()?;
-        store::insert_summary_tx(
-            &tx,
-            &summary("l2-root", 2, vec!["l1a", "l1b"], "root summary"),
-            "t",
-        )?;
-        store::insert_summary_tx(
-            &tx,
-            &summary("l1a", 1, vec!["chunkA"], "alpha summary"),
-            "t",
-        )?;
-        store::insert_summary_tx(&tx, &summary("l1b", 1, vec!["chunkB"], "beta summary"), "t")?;
-        tx.commit()?;
-        Ok(())
-    })
-    .unwrap();
+    for node in [
+        summary("l2-root", 2, vec!["l1a", "l1b"], "root summary"),
+        summary("l1a", 1, vec!["chunkA"], "alpha summary"),
+        summary("l1b", 1, vec!["chunkB"], "beta summary"),
+    ] {
+        let staged = store::stage_summary_changes(&node, None, "test").unwrap();
+        assert!(crate::memory::chunks::versioned::commit_if_state_matches(
+            cfg,
+            &staged.expected,
+            &[],
+            &staged.changes,
+        )
+        .unwrap());
+    }
 }
 
 #[test]

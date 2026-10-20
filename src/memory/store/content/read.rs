@@ -1,6 +1,6 @@
 //! Read and verify chunk and summary `.md` files from the content store.
 //!
-//! Includes high-level id-based readers that resolve SQLite pointers, hydrate
+//! Includes high-level id-based readers that resolve host-owned pointers, hydrate
 //! raw-backed chunks, and repair stale checksum tokens after external edits.
 
 use std::path::{Component, Path, PathBuf};
@@ -222,8 +222,12 @@ fn read_chunk_body_from_raw(config: &MemoryConfig, refs: &[RawRef]) -> anyhow::R
 /// Read a full summary body by id and repair a stale checksum token
 /// best-effort when an external editor changed the staged file.
 pub fn read_summary_body(config: &MemoryConfig, summary_id: &str) -> anyhow::Result<String> {
-    let (rel_path, expected_sha256) = get_summary_content_pointers(config, summary_id)?
-        .ok_or_else(|| anyhow::anyhow!("no content pointer for summary {summary_id}"))?;
+    let Some((rel_path, expected_sha256)) = get_summary_content_pointers(config, summary_id)?
+    else {
+        return crate::memory::tree::store::get_summary(config, summary_id)?
+            .map(|summary| summary.content)
+            .ok_or_else(|| anyhow::anyhow!("summary {summary_id} does not exist"));
+    };
     let abs_path = resolve_within_content_root(&content_root(config), &rel_path)?;
     let result = read_summary_file(&abs_path)?;
     if result.sha256 != expected_sha256 {
@@ -235,6 +239,27 @@ pub fn read_summary_body(config: &MemoryConfig, summary_id: &str) -> anyhow::Res
                 "[memory:content] summary checksum repair failed summary_id={summary_id}: {error}"
             );
         }
+    }
+    Ok(result.body)
+}
+
+/// Async counterpart to [`read_summary_body`] for current-thread host tasks.
+pub async fn read_summary_body_async(
+    config: &MemoryConfig,
+    summary_id: &str,
+) -> anyhow::Result<String> {
+    let Some((rel_path, expected_sha256)) =
+        crate::memory::chunks::get_summary_content_pointers_async(config, summary_id).await?
+    else {
+        return crate::memory::tree::store::get_summary_async(config, summary_id)
+            .await?
+            .map(|summary| summary.content)
+            .ok_or_else(|| anyhow::anyhow!("summary {summary_id} does not exist"));
+    };
+    let abs_path = resolve_within_content_root(&content_root(config), &rel_path)?;
+    let result = read_summary_file(&abs_path)?;
+    if result.sha256 != expected_sha256 {
+        log::warn!("[memory:content] stale summary checksum token summary_id={summary_id}");
     }
     Ok(result.body)
 }

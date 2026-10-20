@@ -9,13 +9,11 @@ use std::collections::HashMap;
 
 use anyhow::{Context, Result};
 use chrono::Utc;
-use rusqlite::{params, OptionalExtension, Transaction};
+use rusqlite::{params, Transaction};
 
-use super::common::{decode_signature_blob, ms_to_utc, pack_embedding_blob};
+use super::common::{ms_to_utc, pack_embedding_blob};
 use super::types::{SummaryNode, TreeKind};
-use crate::memory::chunks::{
-    signature_in_clause, signature_variants, tree_active_signature, with_connection,
-};
+use crate::memory::chunks::{signature_variants, tree_active_signature};
 use crate::memory::config::MemoryConfig;
 use crate::memory::score::embed::decode_optional_blob;
 use crate::memory::store::content::StagedSummary;
@@ -94,19 +92,121 @@ pub fn insert_staged_summary_tx(
 
 /// Fetch one summary by id. Soft-deleted rows are returned with `deleted = true`.
 pub fn get_summary(config: &MemoryConfig, id: &str) -> Result<Option<SummaryNode>> {
-    with_connection(config, |conn| {
-        let mut stmt = conn.prepare(SELECT_SUMMARY_COLS)?;
-        let row = stmt
-            .query_row(params![id], row_to_summary)
-            .optional()
-            .context("Failed to query summary by id")?;
-        Ok(row)
-    })
+    crate::memory::chunks::versioned::read_state(
+        config,
+        crate::memory::chunks::collections::SUMMARIES,
+        &summary_key(id),
+    )?
+    .map(serde_json::from_value)
+    .transpose()
+    .map_err(Into::into)
 }
 
-const MAX_FETCH_BATCH: usize = 500;
+/// Async counterpart to [`get_summary`].
+pub async fn get_summary_async(config: &MemoryConfig, id: &str) -> Result<Option<SummaryNode>> {
+    crate::memory::chunks::versioned::read_state_async(
+        config,
+        crate::memory::chunks::collections::SUMMARIES,
+        &summary_key(id),
+    )
+    .await?
+    .map(serde_json::from_value)
+    .transpose()
+    .map_err(Into::into)
+}
 
-/// Fetch many summaries by id in a single round-trip per window. Missing ids
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct StagedSummaryChanges {
+    pub(crate) expected: Vec<crate::memory::chunks::versioned::StateChange>,
+    pub(crate) changes: Vec<crate::memory::chunks::versioned::StateChange>,
+}
+
+/// Build owner-state changes for an immutable summary and its staged-content
+/// and per-model embedding records. Callers combine these with tree, buffer,
+/// child-link, and entity-index mutations in one owner-head commit.
+pub(crate) fn stage_summary_changes(
+    node: &SummaryNode,
+    staged: Option<&StagedSummary>,
+    model_signature: &str,
+) -> Result<StagedSummaryChanges> {
+    use crate::memory::chunks::versioned::StateChange;
+
+    let key = summary_key(&node.id);
+    let mut stored_node = node.clone();
+    // Preserve the old row shape: embeddings are per-signature sidecar data,
+    // never part of the summary record itself.
+    stored_node.embedding = None;
+    let mut expected = vec![StateChange {
+        collection: crate::memory::chunks::collections::SUMMARIES.to_owned(),
+        key: key.clone(),
+        value: None,
+    }];
+    let mut changes = vec![StateChange {
+        collection: crate::memory::chunks::collections::SUMMARIES.to_owned(),
+        key,
+        value: Some(serde_json::to_value(stored_node)?),
+    }];
+    if let Some(staged) = staged {
+        let key = content_pointer_key(&node.id);
+        expected.push(StateChange {
+            collection: crate::memory::chunks::collections::SUMMARY_CONTENT_POINTERS.to_owned(),
+            key: key.clone(),
+            value: None,
+        });
+        changes.push(StateChange {
+            collection: crate::memory::chunks::collections::SUMMARY_CONTENT_POINTERS.to_owned(),
+            key,
+            value: Some(serde_json::json!({
+                "summary_id": node.id,
+                "content_path": staged.content_path,
+                "content_sha256": staged.content_sha256,
+            })),
+        });
+    }
+    if let Some(embedding) = &node.embedding {
+        let key = summary_embedding_key(&node.id, model_signature);
+        expected.push(StateChange {
+            collection: crate::memory::chunks::collections::SUMMARY_EMBEDDINGS.to_owned(),
+            key: key.clone(),
+            value: None,
+        });
+        changes.push(StateChange {
+            collection: crate::memory::chunks::collections::SUMMARY_EMBEDDINGS.to_owned(),
+            key,
+            value: Some(serde_json::json!({
+                "summary_id": node.id,
+                "model_signature": model_signature,
+                "vector": embedding,
+                "dim": embedding.len(),
+                "created_at_ms": Utc::now().timestamp_millis(),
+            })),
+        });
+    }
+    Ok(StagedSummaryChanges { expected, changes })
+}
+
+fn summary_key(id: &str) -> String {
+    format!("summary:{id}")
+}
+
+fn summary_embedding_key(id: &str, signature: &str) -> String {
+    format!("summary-embedding:{}:{id}:{signature}", id.len())
+}
+
+fn content_pointer_key(id: &str) -> String {
+    format!("summary:{id}")
+}
+
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+struct SummaryEmbeddingRecord {
+    summary_id: String,
+    model_signature: String,
+    vector: Vec<f32>,
+    dim: usize,
+    created_at_ms: i64,
+}
+
+/// Fetch many summaries by id from one committed owner snapshot. Missing ids
 /// are silently absent.
 pub fn get_summaries_batch(
     config: &MemoryConfig,
@@ -115,27 +215,29 @@ pub fn get_summaries_batch(
     if summary_ids.is_empty() {
         return Ok(HashMap::new());
     }
-    with_connection(config, |conn| {
-        let mut out: HashMap<String, SummaryNode> = HashMap::with_capacity(summary_ids.len());
-        for window in summary_ids.chunks(MAX_FETCH_BATCH) {
-            let placeholders = (1..=window.len())
-                .map(|i| format!("?{i}"))
-                .collect::<Vec<_>>()
-                .join(",");
-            let sql = format!("{SELECT_SUMMARY_BASE} WHERE id IN ({placeholders})");
-            let mut stmt = conn.prepare(&sql)?;
-            let params: Vec<&dyn rusqlite::ToSql> =
-                window.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
-            let rows = stmt
-                .query_map(params.as_slice(), row_to_summary)?
-                .collect::<rusqlite::Result<Vec<_>>>()
-                .context("Failed to collect summaries batch")?;
-            for s in rows {
-                out.insert(s.id.clone(), s);
-            }
-        }
-        Ok(out)
-    })
+    let wanted: std::collections::HashSet<_> = summary_ids.iter().map(String::as_str).collect();
+    Ok(all_summaries(config)?
+        .into_iter()
+        .filter(|summary| wanted.contains(summary.id.as_str()))
+        .map(|summary| (summary.id.clone(), summary))
+        .collect())
+}
+
+/// Async counterpart to [`get_summaries_batch`].
+pub async fn get_summaries_batch_async(
+    config: &MemoryConfig,
+    summary_ids: &[String],
+) -> Result<HashMap<String, SummaryNode>> {
+    if summary_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let wanted: std::collections::HashSet<_> = summary_ids.iter().map(String::as_str).collect();
+    Ok(all_summaries_async(config)
+        .await?
+        .into_iter()
+        .filter(|summary| wanted.contains(summary.id.as_str()))
+        .map(|summary| (summary.id.clone(), summary))
+        .collect())
 }
 
 /// List sealed summaries for a tree at a level, ordered by `sealed_at` ASC.
@@ -145,17 +247,27 @@ pub fn list_summaries_at_level(
     tree_id: &str,
     level: u32,
 ) -> Result<Vec<SummaryNode>> {
-    with_connection(config, |conn| {
-        let mut stmt = conn.prepare(&format!(
-            "{SELECT_SUMMARY_BASE} WHERE tree_id = ?1 AND level = ?2 AND deleted = 0 \
-             ORDER BY sealed_at_ms ASC"
-        ))?;
-        let rows = stmt
-            .query_map(params![tree_id, level], row_to_summary)?
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .context("Failed to collect summaries")?;
-        Ok(rows)
-    })
+    let mut rows: Vec<_> = all_summaries(config)?
+        .into_iter()
+        .filter(|summary| summary.tree_id == tree_id && summary.level == level && !summary.deleted)
+        .collect();
+    rows.sort_by_key(|summary| summary.sealed_at);
+    Ok(rows)
+}
+
+/// Async counterpart to [`list_summaries_at_level`].
+pub async fn list_summaries_at_level_async(
+    config: &MemoryConfig,
+    tree_id: &str,
+    level: u32,
+) -> Result<Vec<SummaryNode>> {
+    let mut rows: Vec<_> = all_summaries_async(config)
+        .await?
+        .into_iter()
+        .filter(|summary| summary.tree_id == tree_id && summary.level == level && !summary.deleted)
+        .collect();
+    rows.sort_by_key(|summary| summary.sealed_at);
+    Ok(rows)
 }
 
 /// List every non-deleted summary whose time-range envelope is fully contained
@@ -166,18 +278,38 @@ pub fn list_summaries_in_window(
     since_ms: i64,
     until_ms: i64,
 ) -> Result<Vec<SummaryNode>> {
-    with_connection(config, |conn| {
-        let mut stmt = conn.prepare(&format!(
-            "{SELECT_SUMMARY_BASE} WHERE tree_id = ?1 AND deleted = 0 \
-               AND time_range_start_ms >= ?2 AND time_range_end_ms <= ?3 \
-             ORDER BY level ASC, time_range_start_ms ASC"
-        ))?;
-        let rows = stmt
-            .query_map(params![tree_id, since_ms, until_ms], row_to_summary)?
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .context("Failed to collect in-window summaries")?;
-        Ok(rows)
-    })
+    let mut rows: Vec<_> = all_summaries(config)?
+        .into_iter()
+        .filter(|summary| {
+            summary.tree_id == tree_id
+                && !summary.deleted
+                && summary.time_range_start.timestamp_millis() >= since_ms
+                && summary.time_range_end.timestamp_millis() <= until_ms
+        })
+        .collect();
+    rows.sort_by_key(|summary| (summary.level, summary.time_range_start));
+    Ok(rows)
+}
+
+/// Async counterpart to [`list_summaries_in_window`].
+pub async fn list_summaries_in_window_async(
+    config: &MemoryConfig,
+    tree_id: &str,
+    since_ms: i64,
+    until_ms: i64,
+) -> Result<Vec<SummaryNode>> {
+    let mut rows: Vec<_> = all_summaries_async(config)
+        .await?
+        .into_iter()
+        .filter(|summary| {
+            summary.tree_id == tree_id
+                && !summary.deleted
+                && summary.time_range_start.timestamp_millis() >= since_ms
+                && summary.time_range_end.timestamp_millis() <= until_ms
+        })
+        .collect();
+    rows.sort_by_key(|summary| (summary.level, summary.time_range_start));
+    Ok(rows)
 }
 
 /// List non-deleted summaries whose time envelope overlaps the inclusive
@@ -191,18 +323,40 @@ pub fn list_summaries_overlapping_window(
     since_ms: i64,
     until_ms: i64,
 ) -> Result<Vec<SummaryNode>> {
-    with_connection(config, |conn| {
-        let mut stmt = conn.prepare(&format!(
-            "{SELECT_SUMMARY_BASE} WHERE tree_id = ?1 AND deleted = 0 AND level >= 1 \
-               AND time_range_end_ms >= ?2 AND time_range_start_ms <= ?3 \
-             ORDER BY level ASC, time_range_start_ms ASC"
-        ))?;
-        let rows = stmt
-            .query_map(params![tree_id, since_ms, until_ms], row_to_summary)?
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .context("Failed to collect overlapping summaries")?;
-        Ok(rows)
-    })
+    let mut rows: Vec<_> = all_summaries(config)?
+        .into_iter()
+        .filter(|summary| {
+            summary.tree_id == tree_id
+                && !summary.deleted
+                && summary.level >= 1
+                && summary.time_range_end.timestamp_millis() >= since_ms
+                && summary.time_range_start.timestamp_millis() <= until_ms
+        })
+        .collect();
+    rows.sort_by_key(|summary| (summary.level, summary.time_range_start));
+    Ok(rows)
+}
+
+/// Async counterpart to [`list_summaries_overlapping_window`].
+pub async fn list_summaries_overlapping_window_async(
+    config: &MemoryConfig,
+    tree_id: &str,
+    since_ms: i64,
+    until_ms: i64,
+) -> Result<Vec<SummaryNode>> {
+    let mut rows: Vec<_> = all_summaries_async(config)
+        .await?
+        .into_iter()
+        .filter(|summary| {
+            summary.tree_id == tree_id
+                && !summary.deleted
+                && summary.level >= 1
+                && summary.time_range_end.timestamp_millis() >= since_ms
+                && summary.time_range_start.timestamp_millis() <= until_ms
+        })
+        .collect();
+    rows.sort_by_key(|summary| (summary.level, summary.time_range_start));
+    Ok(rows)
 }
 
 /// List non-deleted summaries whose `parent_id` is `parent` (its direct
@@ -211,31 +365,66 @@ pub fn list_children_of_summary(
     config: &MemoryConfig,
     parent_id: &str,
 ) -> Result<Vec<SummaryNode>> {
-    with_connection(config, |conn| {
-        let mut stmt = conn.prepare(&format!(
-            "{SELECT_SUMMARY_BASE} WHERE parent_id = ?1 AND deleted = 0 \
-             ORDER BY sealed_at_ms ASC"
-        ))?;
-        let rows = stmt
-            .query_map(params![parent_id], row_to_summary)?
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .context("Failed to collect summary children")?;
-        Ok(rows)
-    })
+    let mut rows: Vec<_> = all_summaries(config)?
+        .into_iter()
+        .filter(|summary| summary.parent_id.as_deref() == Some(parent_id) && !summary.deleted)
+        .collect();
+    rows.sort_by_key(|summary| summary.sealed_at);
+    Ok(rows)
+}
+
+/// Async counterpart to [`list_children_of_summary`].
+pub async fn list_children_of_summary_async(
+    config: &MemoryConfig,
+    parent_id: &str,
+) -> Result<Vec<SummaryNode>> {
+    let mut rows: Vec<_> = all_summaries_async(config)
+        .await?
+        .into_iter()
+        .filter(|summary| summary.parent_id.as_deref() == Some(parent_id) && !summary.deleted)
+        .collect();
+    rows.sort_by_key(|summary| summary.sealed_at);
+    Ok(rows)
 }
 
 /// Count non-deleted summaries in a tree (diagnostic helper).
 pub fn count_summaries(config: &MemoryConfig, tree_id: &str) -> Result<u64> {
-    with_connection(config, |conn| {
-        let n: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM mem_tree_summaries WHERE tree_id = ?1 AND deleted = 0",
-                params![tree_id],
-                |r| r.get(0),
-            )
-            .context("count summaries query")?;
-        Ok(n.max(0) as u64)
-    })
+    Ok(all_summaries(config)?
+        .iter()
+        .filter(|summary| summary.tree_id == tree_id && !summary.deleted)
+        .count() as u64)
+}
+
+/// Async counterpart to [`count_summaries`].
+pub async fn count_summaries_async(config: &MemoryConfig, tree_id: &str) -> Result<u64> {
+    Ok(all_summaries_async(config)
+        .await?
+        .iter()
+        .filter(|summary| summary.tree_id == tree_id && !summary.deleted)
+        .count() as u64)
+}
+
+fn all_summaries(config: &MemoryConfig) -> Result<Vec<SummaryNode>> {
+    crate::memory::chunks::versioned::list_state(
+        config,
+        crate::memory::chunks::collections::SUMMARIES,
+    )?
+    .into_iter()
+    .filter(|(key, _)| key.starts_with("summary:"))
+    .map(|(_, value)| serde_json::from_value(value).map_err(Into::into))
+    .collect()
+}
+
+async fn all_summaries_async(config: &MemoryConfig) -> Result<Vec<SummaryNode>> {
+    crate::memory::chunks::versioned::list_state_async(
+        config,
+        crate::memory::chunks::collections::SUMMARIES,
+    )
+    .await?
+    .into_iter()
+    .filter(|(key, _)| key.starts_with("summary:"))
+    .map(|(_, value)| serde_json::from_value(value).map_err(Into::into))
+    .collect()
 }
 
 // ── Embedding sidecar ───────────────────────────────────────────────────────
@@ -267,9 +456,40 @@ pub fn set_summary_embedding_for_signature(
     model_signature: &str,
     embedding: &[f32],
 ) -> Result<()> {
-    with_connection(config, |conn| {
-        upsert_summary_embedding_conn(conn, summary_id, model_signature, embedding)
-    })
+    let key = summary_embedding_key(summary_id, model_signature);
+    for _ in 0..8 {
+        let current = crate::memory::chunks::versioned::read_state(
+            config,
+            crate::memory::chunks::collections::SUMMARY_EMBEDDINGS,
+            &key,
+        )?;
+        let expected = [crate::memory::chunks::versioned::StateChange {
+            collection: crate::memory::chunks::collections::SUMMARY_EMBEDDINGS.to_owned(),
+            key: key.clone(),
+            value: current,
+        }];
+        let record = SummaryEmbeddingRecord {
+            summary_id: summary_id.to_owned(),
+            model_signature: model_signature.to_owned(),
+            vector: embedding.to_vec(),
+            dim: embedding.len(),
+            created_at_ms: Utc::now().timestamp_millis(),
+        };
+        let changes = [crate::memory::chunks::versioned::StateChange {
+            collection: crate::memory::chunks::collections::SUMMARY_EMBEDDINGS.to_owned(),
+            key: key.clone(),
+            value: Some(serde_json::to_value(record)?),
+        }];
+        if crate::memory::chunks::versioned::commit_if_state_matches(
+            config,
+            &expected,
+            &[],
+            &changes,
+        )? {
+            return Ok(());
+        }
+    }
+    anyhow::bail!("summary embedding changed repeatedly during update")
 }
 
 /// Store a summary embedding under the active model signature.
@@ -291,30 +511,48 @@ pub fn get_summary_embedding_for_signature(
     model_signature: &str,
 ) -> Result<Option<Vec<f32>>> {
     let variants = signature_variants(model_signature);
-    with_connection(config, |conn| {
-        let mut bound: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(variants.len() + 1);
-        bound.push(&summary_id as &dyn rusqlite::ToSql);
-        for variant in &variants {
-            bound.push(variant as &dyn rusqlite::ToSql);
-        }
-        let row: Option<(Option<Vec<u8>>, i64)> = conn
-            .query_row(
-                &format!(
-                    "SELECT vector, dim FROM mem_tree_summary_embeddings
-                      WHERE summary_id = ?1 AND model_signature {}",
-                    signature_in_clause(variants.len(), 2)
-                ),
-                bound.as_slice(),
-                |r| Ok((Some(r.get(0)?), r.get(1)?)),
-            )
-            .optional()?;
-        match row {
-            None => Ok(None),
-            Some((blob, dim)) => {
-                decode_signature_blob(blob, dim, &format!("summary_id={summary_id}"))
-            }
-        }
-    })
+    let keys: Vec<_> = variants
+        .iter()
+        .map(|signature| crate::memory::chunks::versioned::StateKey {
+            collection: crate::memory::chunks::collections::SUMMARY_EMBEDDINGS.to_owned(),
+            key: summary_embedding_key(summary_id, signature),
+        })
+        .collect();
+    let values = crate::memory::chunks::versioned::read_state_keys(config, &keys)?;
+    for value in values.into_iter().flatten() {
+        let record: SummaryEmbeddingRecord = serde_json::from_value(value)?;
+        anyhow::ensure!(
+            record.dim == record.vector.len(),
+            "summary embedding dimension mismatch"
+        );
+        return Ok(Some(record.vector));
+    }
+    Ok(None)
+}
+
+/// Async counterpart to [`get_summary_embedding_for_signature`].
+pub async fn get_summary_embedding_for_signature_async(
+    config: &MemoryConfig,
+    summary_id: &str,
+    model_signature: &str,
+) -> Result<Option<Vec<f32>>> {
+    let keys: Vec<_> = signature_variants(model_signature)
+        .into_iter()
+        .map(|signature| crate::memory::chunks::versioned::StateKey {
+            collection: crate::memory::chunks::collections::SUMMARY_EMBEDDINGS.to_owned(),
+            key: summary_embedding_key(summary_id, &signature),
+        })
+        .collect();
+    let values = crate::memory::chunks::versioned::read_state_keys_async(config, &keys).await?;
+    for value in values.into_iter().flatten() {
+        let record: SummaryEmbeddingRecord = serde_json::from_value(value)?;
+        anyhow::ensure!(
+            record.dim == record.vector.len(),
+            "summary embedding dimension mismatch"
+        );
+        return Ok(Some(record.vector));
+    }
+    Ok(None)
 }
 
 /// Fetch a summary embedding under the active model signature.
@@ -323,7 +561,14 @@ pub fn get_summary_embedding(config: &MemoryConfig, summary_id: &str) -> Result<
     get_summary_embedding_for_signature(config, summary_id, &signature)
 }
 
-const MAX_EMBEDDING_BATCH: usize = 500;
+/// Async counterpart to [`get_summary_embedding`].
+pub async fn get_summary_embedding_async(
+    config: &MemoryConfig,
+    summary_id: &str,
+) -> Result<Option<Vec<f32>>> {
+    let signature = tree_active_signature(config);
+    get_summary_embedding_for_signature_async(config, summary_id, &signature).await
+}
 
 /// Batched read of summary embeddings under one signature. The map contains
 /// only ids with a non-null vector under `model_signature`.
@@ -335,45 +580,66 @@ pub fn get_summary_embeddings_for_signature_batch(
     if summary_ids.is_empty() {
         return Ok(HashMap::new());
     }
-    let variants = signature_variants(model_signature);
-    with_connection(config, |conn| {
-        let mut out: HashMap<String, Vec<f32>> = HashMap::with_capacity(summary_ids.len());
-        for window in summary_ids.chunks(MAX_EMBEDDING_BATCH) {
-            let placeholders = std::iter::repeat_n("?", window.len())
-                .collect::<Vec<_>>()
-                .join(",");
-            let sql = format!(
-                "SELECT summary_id, vector, dim FROM mem_tree_summary_embeddings
-                  WHERE summary_id IN ({placeholders}) AND model_signature {sig_clause}",
-                sig_clause = signature_in_clause(variants.len(), window.len() + 1),
-            );
-            let mut stmt = conn.prepare(&sql)?;
-            let mut bound: Vec<&dyn rusqlite::ToSql> =
-                Vec::with_capacity(window.len() + variants.len());
-            for id in window {
-                bound.push(id as &dyn rusqlite::ToSql);
-            }
-            for variant in &variants {
-                bound.push(variant as &dyn rusqlite::ToSql);
-            }
-            let rows = stmt.query_map(bound.as_slice(), |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, Option<Vec<u8>>>(1)?,
-                    row.get::<_, i64>(2)?,
-                ))
-            })?;
-            for row in rows {
-                let (summary_id, blob, dim) = row?;
-                if let Some(v) =
-                    decode_signature_blob(blob, dim, &format!("summary_id={summary_id}"))?
-                {
-                    out.insert(summary_id, v);
-                }
-            }
+    let ids: std::collections::HashSet<_> = summary_ids.iter().map(String::as_str).collect();
+    let signatures: std::collections::HashSet<_> =
+        signature_variants(model_signature).into_iter().collect();
+    let rows = crate::memory::chunks::versioned::list_state(
+        config,
+        crate::memory::chunks::collections::SUMMARY_EMBEDDINGS,
+    )?;
+    let mut out = HashMap::with_capacity(summary_ids.len());
+    for (key, value) in rows {
+        if !key.starts_with("summary-embedding:") {
+            continue;
         }
-        Ok(out)
-    })
+        let record: SummaryEmbeddingRecord = serde_json::from_value(value)?;
+        if ids.contains(record.summary_id.as_str())
+            && signatures.contains(record.model_signature.as_str())
+        {
+            anyhow::ensure!(
+                record.dim == record.vector.len(),
+                "summary embedding dimension mismatch"
+            );
+            out.insert(record.summary_id, record.vector);
+        }
+    }
+    Ok(out)
+}
+
+/// Async counterpart to [`get_summary_embeddings_for_signature_batch`].
+pub async fn get_summary_embeddings_for_signature_batch_async(
+    config: &MemoryConfig,
+    summary_ids: &[String],
+    model_signature: &str,
+) -> Result<HashMap<String, Vec<f32>>> {
+    if summary_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let ids: std::collections::HashSet<_> = summary_ids.iter().map(String::as_str).collect();
+    let signatures: std::collections::HashSet<_> =
+        signature_variants(model_signature).into_iter().collect();
+    let rows = crate::memory::chunks::versioned::list_state_async(
+        config,
+        crate::memory::chunks::collections::SUMMARY_EMBEDDINGS,
+    )
+    .await?;
+    let mut out = HashMap::with_capacity(summary_ids.len());
+    for (key, value) in rows {
+        if !key.starts_with("summary-embedding:") {
+            continue;
+        }
+        let record: SummaryEmbeddingRecord = serde_json::from_value(value)?;
+        if ids.contains(record.summary_id.as_str())
+            && signatures.contains(record.model_signature.as_str())
+        {
+            anyhow::ensure!(
+                record.dim == record.vector.len(),
+                "summary embedding dimension mismatch"
+            );
+            out.insert(record.summary_id, record.vector);
+        }
+    }
+    Ok(out)
 }
 
 /// Batched read under the active signature.
@@ -383,6 +649,15 @@ pub fn get_summary_embeddings_batch(
 ) -> Result<HashMap<String, Vec<f32>>> {
     let signature = tree_active_signature(config);
     get_summary_embeddings_for_signature_batch(config, summary_ids, &signature)
+}
+
+/// Async counterpart to [`get_summary_embeddings_batch`].
+pub async fn get_summary_embeddings_batch_async(
+    config: &MemoryConfig,
+    summary_ids: &[String],
+) -> Result<HashMap<String, Vec<f32>>> {
+    let signature = tree_active_signature(config);
+    get_summary_embeddings_for_signature_batch_async(config, summary_ids, &signature).await
 }
 
 // ── Row decoding ────────────────────────────────────────────────────────────
@@ -462,3 +737,7 @@ fn row_to_summary(row: &rusqlite::Row<'_>) -> rusqlite::Result<SummaryNode> {
         version_ms,
     })
 }
+
+#[cfg(test)]
+#[path = "summaries_tests.rs"]
+mod tests;

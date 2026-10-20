@@ -16,6 +16,15 @@ pub fn get_or_create_tree(config: &MemoryConfig, kind: TreeKind, scope: &str) ->
     get_or_create_tree_with_ask(config, kind, scope, None)
 }
 
+/// Async get-or-create for callers already running on Tokio.
+pub async fn get_or_create_tree_async(
+    config: &MemoryConfig,
+    kind: TreeKind,
+    scope: &str,
+) -> Result<Tree> {
+    get_or_create_tree_with_ask_async(config, kind, scope, None).await
+}
+
 /// Get-or-create variant that stamps a natural-language `ask` on the row when a
 /// fresh tree is inserted. Used by [`crate::memory::tree::TreeFactory::flavoured`].
 ///
@@ -57,6 +66,39 @@ pub fn get_or_create_tree_with_ask(
             })
         }
         Err(err) => Err(err),
+    }
+}
+
+/// Async get-or-create variant that stamps `ask` only on a newly inserted row.
+pub async fn get_or_create_tree_with_ask_async(
+    config: &MemoryConfig,
+    kind: TreeKind,
+    scope: &str,
+    ask: Option<&str>,
+) -> Result<Tree> {
+    if let Some(existing) = store::get_tree_by_scope_async(config, kind, scope).await? {
+        return Ok(existing);
+    }
+    let tree = Tree {
+        id: new_tree_id(kind),
+        kind,
+        scope: scope.to_owned(),
+        root_id: None,
+        max_level: 0,
+        status: TreeStatus::Active,
+        created_at: Utc::now(),
+        last_sealed_at: None,
+        ask: ask.map(str::to_owned),
+    };
+    match store::insert_tree_async(config, &tree).await {
+        Ok(()) => Ok(tree),
+        Err(err) => {
+            if let Some(existing) = store::get_tree_by_scope_async(config, kind, scope).await? {
+                Ok(existing)
+            } else {
+                Err(err)
+            }
+        }
     }
 }
 

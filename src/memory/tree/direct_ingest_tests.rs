@@ -1,13 +1,19 @@
 use super::*;
-use crate::memory::tree::{store::get_buffer, ConcatSummariser};
+use crate::memory::tree::{
+    registry::get_or_create_tree_async, store::get_buffer_async, ConcatSummariser,
+};
 
 #[tokio::test]
 async fn direct_summary_lands_at_l1_without_creating_chunks() {
     let temp = tempfile::tempdir().unwrap();
-    let config = MemoryConfig::new(temp.path());
-    let tree = TreeFactory::source("github:org/repo")
-        .get_or_create(&config)
-        .unwrap();
+    let config = crate::memory::chunks::test_support::host_config(temp.path());
+    let tree = get_or_create_tree_async(
+        &config,
+        crate::memory::tree::store::TreeKind::Source,
+        "github:org/repo",
+    )
+    .await
+    .unwrap();
     let now = Utc::now();
     let outcome = ingest_summary(
         &config,
@@ -27,11 +33,25 @@ async fn direct_summary_lands_at_l1_without_creating_chunks() {
     )
     .await
     .unwrap();
-    assert_eq!(crate::memory::chunks::count_chunks(&config).unwrap(), 0);
-    let summary = store::get_summary(&config, &outcome.summary_id)
+    let count_config = config.clone();
+    let chunk_count =
+        std::thread::spawn(move || crate::memory::chunks::count_chunks(&count_config))
+            .join()
+            .unwrap()
+            .unwrap();
+    assert_eq!(chunk_count, 0);
+    let summary = store::get_summary_async(&config, &outcome.summary_id)
+        .await
         .unwrap()
         .unwrap();
     assert_eq!(summary.level, 1);
     assert_eq!(summary.child_ids, vec!["100_issue-1"]);
-    assert_eq!(get_buffer(&config, &tree.id, 1).unwrap().item_ids.len(), 1);
+    assert_eq!(
+        get_buffer_async(&config, &tree.id, 1)
+            .await
+            .unwrap()
+            .item_ids
+            .len(),
+        1
+    );
 }

@@ -6,10 +6,10 @@ use std::collections::{HashMap, HashSet};
 use anyhow::Result;
 
 use crate::memory::config::MemoryConfig;
-use crate::memory::graph::{pair_distances, PairDistance};
+use crate::memory::graph::{pair_distances_async, PairDistance};
 use crate::memory::score::embed::Embedder;
-use crate::memory::score::store::lookup_entity;
-use crate::memory::tree::store::{get_summaries_batch, get_tree};
+use crate::memory::score::store::lookup_entity_async;
+use crate::memory::tree::store::{get_summaries_batch_async, get_tree_async};
 
 use super::fetch::fetch_leaves_async;
 use super::source::query_source;
@@ -76,7 +76,7 @@ pub async fn fast_retrieve(
         )
         .await;
     }
-    let pairs = pair_distances(config, &entity_ids, max_hops)?;
+    let pairs = pair_distances_async(config, &entity_ids, max_hops).await?;
     if pairs.is_empty() {
         return global_occurrence(
             config,
@@ -90,11 +90,12 @@ pub async fn fast_retrieve(
         .await;
     }
     let mut hops = max_hops;
-    let mut candidates = local_candidates(config, &pairs)?;
+    let mut candidates = local_candidates(config, &pairs).await?;
     let mut last_non_empty = candidates.clone();
     while candidates.len() > limit && hops > 1 {
         hops -= 1;
-        let next = local_candidates(config, &pair_distances(config, &entity_ids, hops)?)?;
+        let pairs = pair_distances_async(config, &entity_ids, hops).await?;
+        let next = local_candidates(config, &pairs).await?;
         if next.is_empty() {
             break;
         }
@@ -126,15 +127,15 @@ struct Candidate {
     latest_ts: i64,
 }
 
-fn local_candidates(
+async fn local_candidates(
     config: &MemoryConfig,
     pairs: &[PairDistance],
 ) -> Result<HashMap<String, Candidate>> {
     let mut output = HashMap::new();
     for pair in pairs {
         let occurrence_limit = config.retrieval.limits.occurrence_lookup_limit;
-        let left = lookup_entity(config, &pair.a, Some(occurrence_limit))?;
-        let right = lookup_entity(config, &pair.b, Some(occurrence_limit))?;
+        let left = lookup_entity_async(config, &pair.a, Some(occurrence_limit)).await?;
+        let right = lookup_entity_async(config, &pair.b, Some(occurrence_limit)).await?;
         let right_nodes: HashMap<_, _> = right
             .iter()
             .map(|hit| (hit.node_id.as_str(), hit.timestamp_ms))
@@ -190,13 +191,14 @@ async fn resolve_local(
             by_id.insert(hit.node_id.clone(), hit);
         }
     }
-    let summaries = get_summaries_batch(config, &summary_ids)?;
+    let summaries = get_summaries_batch_async(config, &summary_ids).await?;
     let mut scope_cache: HashMap<String, String> = HashMap::new();
     for (id, node) in summaries {
         let scope = match scope_cache.get(&node.tree_id) {
             Some(scope) => scope.clone(),
             None => {
-                let scope = get_tree(config, &node.tree_id)?
+                let scope = get_tree_async(config, &node.tree_id)
+                    .await?
                     .map(|tree| tree.scope)
                     .unwrap_or_default();
                 scope_cache.insert(node.tree_id.clone(), scope.clone());

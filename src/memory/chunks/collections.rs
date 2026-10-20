@@ -74,9 +74,14 @@ pub fn collections() -> Vec<CollectionSpec> {
             .index(IndexSpec::new("by_parent", ["parent_id"]))
             .index(IndexSpec::new("by_sealed", ["sealed_at_ms"]))
             .index(IndexSpec::new("by_deleted", ["deleted"])),
+        CollectionSpec::new(SUMMARY_EMBEDDINGS)
+            .index(IndexSpec::new("by_summary_model", ["summary_id", "model_signature"]).unique())
+            .index(IndexSpec::new("by_model", ["model_signature"])),
         CollectionSpec::new(BUFFERS)
             .index(IndexSpec::new("by_tree_level", ["tree_id", "level"]).unique())
             .index(IndexSpec::new("by_oldest", ["oldest_at_ms"])),
+        CollectionSpec::new(SUMMARY_CONTENT_POINTERS)
+            .index(IndexSpec::new("by_summary", ["summary_id"]).unique()),
         CollectionSpec::new(ENTITY_HOTNESS)
             .index(IndexSpec::new("by_entity", ["entity_id"]).unique())
             .index(IndexSpec::new("by_score", ["last_hotness"])),
@@ -116,8 +121,12 @@ pub const ENTITY_EDGES: &str = "memory_entity_edges";
 pub const TREES: &str = "memory_trees";
 /// Stable collection name for summary nodes.
 pub const SUMMARIES: &str = "memory_summaries";
+/// Stable collection name for per-model summary embedding metadata.
+pub const SUMMARY_EMBEDDINGS: &str = "memory_summary_embeddings";
 /// Stable collection name for unsealed tree buffers.
 pub const BUFFERS: &str = "memory_tree_buffers";
+/// Stable collection name for staged summary content pointers.
+pub const SUMMARY_CONTENT_POINTERS: &str = "memory_summary_content_pointers";
 /// Stable collection name for graph entity hotness records.
 pub const ENTITY_HOTNESS: &str = "memory_entity_hotness";
 /// Stable collection name for committed ingest work waiting for queue hints.

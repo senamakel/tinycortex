@@ -6,14 +6,8 @@ fn get_summaries_batch_returns_present_ids_and_skips_missing() {
     insert_tree(&cfg, &sample_tree("tree-1", "slack:#eng")).unwrap();
     let a = sample_summary("sum-a", "tree-1", 1);
     let b = sample_summary("sum-b", "tree-1", 1);
-    with_connection(&cfg, |conn| {
-        let tx = conn.unchecked_transaction()?;
-        insert_summary_tx(&tx, &a, "test")?;
-        insert_summary_tx(&tx, &b, "test")?;
-        tx.commit()?;
-        Ok(())
-    })
-    .unwrap();
+    assert!(persist_summary(&cfg, &a, None));
+    assert!(persist_summary(&cfg, &b, None));
     assert!(get_summaries_batch(&cfg, &[]).unwrap().is_empty());
     let ids = vec![
         "sum-a".to_string(),
@@ -32,13 +26,7 @@ fn summary_batch_embedding_lookup_returns_only_signature_scoped_rows() {
     insert_tree(&cfg, &sample_tree("tree-1", "slack:#eng")).unwrap();
     for sid in ["sum-1", "sum-2", "sum-3"] {
         let node = sample_summary(sid, "tree-1", 1);
-        with_connection(&cfg, |conn| {
-            let tx = conn.unchecked_transaction()?;
-            insert_summary_tx(&tx, &node, "test")?;
-            tx.commit()?;
-            Ok(())
-        })
-        .unwrap();
+        assert!(persist_summary(&cfg, &node, None));
     }
     let sig_a = "openai/text-embedding-3-small@1536";
     let sig_b = "local/bge-small@384";

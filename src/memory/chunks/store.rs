@@ -48,6 +48,11 @@ pub fn upsert_chunks(config: &MemoryConfig, chunks: &[Chunk]) -> Result<usize> {
     super::versioned::upsert_chunks(config, chunks)
 }
 
+/// Async counterpart to [`upsert_chunks`] for Tokio callers.
+pub async fn upsert_chunks_async(config: &MemoryConfig, chunks: &[Chunk]) -> Result<usize> {
+    super::versioned::upsert_chunks_async(config, chunks).await
+}
+
 pub fn upsert_chunks_tx(tx: &Transaction<'_>, chunks: &[Chunk]) -> Result<usize> {
     let _ = (tx, chunks);
     anyhow::bail!("chunks must be committed with host storage, not a SQLite transaction")

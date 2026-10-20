@@ -24,18 +24,12 @@
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 
-use crate::memory::chunks::with_connection;
 use crate::memory::config::MemoryConfig;
-use crate::memory::score::store::index_summary_entity_ids_tx;
-use crate::memory::store::content::{
-    SummaryComposeInput, SummaryDiskLayout, SummaryTreeKind, slugify_source_id,
-    stage_summary_with_layout,
-};
 use crate::memory::tree::hydrate::hydrate_inputs;
 use crate::memory::tree::label_resolver::resolve_labels;
 use crate::memory::tree::registry::new_summary_id;
 use crate::memory::tree::store::{self, Buffer, SummaryNode, Tree};
-use crate::memory::tree::summarise::{Summariser, SummaryContext, fallback_summary};
+use crate::memory::tree::summarise::{fallback_summary, Summariser, SummaryContext};
 pub(crate) use crate::memory::tree::types::NoopSealObserver;
 pub use crate::memory::tree::types::{LabelStrategy, LeafRef, SealObserver, SealServices};
 
@@ -54,6 +48,115 @@ pub struct SealLevelResult {
     pub follow_up: Option<crate::memory::queue::SealPayload>,
 }
 
+/// Compute one seal for queue settlement without publishing domain state.
+///
+/// The returned mutations include the tree, source/parent buffers, summary,
+/// entity occurrences, and edge records. A queue worker must commit them with
+/// the job lease and terminal receipt in one owner-head CAS. This function
+/// performs summarisation and embedding before that CAS, so those computations
+/// may be repeated after a crash; no tree state is visible until settlement.
+pub async fn plan_seal_one_level_for_queue(
+    config: &MemoryConfig,
+    tree: &Tree,
+    buffer: &Buffer,
+    services: &SealServices<'_>,
+    strategy: &LabelStrategy,
+) -> Result<crate::memory::queue::DelegateOutput<Option<crate::memory::queue::SealPayload>>> {
+    let staged =
+        stage_seal_one_level_with_services(config, tree, buffer, services, strategy).await?;
+    let mutations = merge_staged_seal_changes(staged.expected, staged.changes)?;
+    Ok(crate::memory::queue::DelegateOutput {
+        result: staged.result.follow_up,
+        mutations,
+    })
+}
+
+fn merge_staged_seal_changes(
+    expected: Vec<crate::memory::chunks::versioned::StateChange>,
+    changes: Vec<crate::memory::chunks::versioned::StateChange>,
+) -> Result<Vec<crate::memory::queue::JobMutation>> {
+    use std::collections::BTreeMap;
+
+    let mut preconditions = BTreeMap::new();
+    for condition in expected {
+        let key = (condition.collection.clone(), condition.key.clone());
+        if let Some(previous) = preconditions.insert(key, condition.value.clone()) {
+            anyhow::ensure!(
+                previous == condition.value,
+                "conflicting staged expectations for {}:{}",
+                condition.collection,
+                condition.key
+            );
+        }
+    }
+
+    let mut replacements = BTreeMap::new();
+    for change in changes {
+        let key = (change.collection.clone(), change.key.clone());
+        anyhow::ensure!(
+            preconditions.contains_key(&key),
+            "staged seal change has no expectation for {}:{}",
+            change.collection,
+            change.key
+        );
+        if let Some(previous) = replacements.insert(key, change.value.clone()) {
+            anyhow::ensure!(
+                previous == change.value,
+                "conflicting staged replacements for {}:{}",
+                change.collection,
+                change.key
+            );
+        }
+    }
+
+    // A staged expectation without a change still needs to participate in the
+    // worker's owner-head CAS. Its unchanged value is an explicit no-op write.
+    preconditions
+        .into_iter()
+        .map(|((collection, key), expected)| {
+            let value = replacements
+                .remove(&(collection.clone(), key.clone()))
+                .unwrap_or_else(|| expected.clone());
+            Ok(crate::memory::queue::JobMutation {
+                collection: queue_collection(&collection)?,
+                key,
+                expected,
+                value,
+            })
+        })
+        .collect()
+}
+
+fn queue_collection(collection: &str) -> Result<crate::memory::queue::JobStateCollection> {
+    use crate::memory::chunks::collections as c;
+    use crate::memory::queue::JobStateCollection as J;
+    Ok(match collection {
+        c::TREES => J::Trees,
+        c::BUFFERS => J::TreeBuffers,
+        c::SUMMARIES => J::Summaries,
+        c::SUMMARY_CONTENT_POINTERS => J::SummaryContentPointers,
+        c::SCORES => J::ChunkScores,
+        c::CHUNK_LIFECYCLE => J::ChunkLifecycle,
+        c::CHUNK_EMBEDDINGS => J::ChunkEmbeddings,
+        c::CHUNK_REEMBED_SKIPS => J::ChunkReembedSkips,
+        c::ENTITY_INDEX => J::EntityIndex,
+        c::ENTITY_EDGES => J::EntityEdges,
+        c::ENTITY_HOTNESS => J::EntityHotness,
+        other => anyhow::bail!("tree seal staged unsupported owner collection '{other}'"),
+    })
+}
+
+/// Prepared seal work for queue settlement. The worker combines these owner
+/// mutations with its lease receipt and follow-up jobs in one CAS; no domain
+/// records are visible before that commit succeeds.
+#[derive(Clone, Debug)]
+pub(crate) struct StagedSealLevel {
+    pub(crate) result: SealLevelResult,
+    pub(crate) expected: Vec<crate::memory::chunks::versioned::StateChange>,
+    pub(crate) changes: Vec<crate::memory::chunks::versioned::StateChange>,
+    pub(crate) node: SummaryNode,
+}
+
 /// Append a leaf to `tree`, sealing buffers as they fill. Returns the ids of
 /// any summaries that sealed during this call.
 pub async fn append_leaf(
@@ -63,14 +166,15 @@ pub async fn append_leaf(
     summariser: &dyn Summariser,
     strategy: &LabelStrategy,
 ) -> Result<Vec<String>> {
-    append_to_buffer(
+    append_to_buffer_async(
         config,
         &tree.id,
         0,
         &leaf.chunk_id,
         leaf.token_count as i64,
         leaf.timestamp,
-    )?;
+    )
+    .await?;
     cascade_all_from(config, tree, 0, false, summariser, strategy).await
 }
 
@@ -99,30 +203,18 @@ pub fn append_to_buffer(
     token_delta: i64,
     item_ts: DateTime<Utc>,
 ) -> Result<()> {
-    with_connection(config, |conn| {
-        let tx = conn.unchecked_transaction()?;
-        let status: String = tx
-            .query_row(
-                "SELECT status FROM mem_tree_trees WHERE id = ?1",
-                rusqlite::params![tree_id],
-                |row| row.get(0),
-            )
-            .context("Failed to read tree status before append")?;
-        anyhow::ensure!(status == "active", "tree '{tree_id}' is archived");
-        let mut buf = store::get_buffer_conn(&tx, tree_id, level)?;
-        if buf.item_ids.iter().any(|existing| existing == item_id) {
-            return Ok(()); // retry after a failed cascade — no double count
-        }
-        buf.item_ids.push(item_id.to_string());
-        buf.token_sum = buf.token_sum.saturating_add(token_delta);
-        buf.oldest_at = match buf.oldest_at {
-            Some(existing) => Some(existing.min(item_ts)),
-            None => Some(item_ts),
-        };
-        store::upsert_buffer_tx(&tx, &buf)?;
-        tx.commit()?;
-        Ok(())
-    })
+    store::append_buffer_item(config, tree_id, level, item_id, token_delta, item_ts)
+}
+
+pub(crate) async fn append_to_buffer_async(
+    config: &MemoryConfig,
+    tree_id: &str,
+    level: u32,
+    item_id: &str,
+    token_delta: i64,
+    item_ts: DateTime<Utc>,
+) -> Result<()> {
+    store::append_buffer_item_async(config, tree_id, level, item_id, token_delta, item_ts).await
 }
 
 /// Seal buffers starting at `start_level` and cascade upward. When `force` is
@@ -164,7 +256,7 @@ pub async fn cascade_all_from_with_services(
     let mut first_iteration = true;
 
     for level in (start_level..).take(MAX_CASCADE_DEPTH as usize) {
-        let buf = store::get_buffer(config, &tree.id, level)?;
+        let buf = store::get_buffer_async(config, &tree.id, level).await?;
         let forced = first_iteration && force;
         first_iteration = false;
 
@@ -186,7 +278,9 @@ pub async fn cascade_all_from_with_services(
     // pick up the new `root_id`. Best-effort: a stale artifact must never fail
     // an otherwise-successful seal.
     if !sealed_ids.is_empty() && tree.kind == crate::memory::tree::TreeKind::Flavoured {
-        if let Err(err) = crate::memory::tree::flavoured::compile_flavoured_root(config, &tree.id) {
+        if let Err(err) =
+            crate::memory::tree::flavoured::compile_flavoured_root_async(config, &tree.id).await
+        {
             log::warn!(
                 "[memory_tree:flavoured] compile root failed tree_id={}: {err:#}",
                 tree.id
@@ -229,6 +323,35 @@ pub async fn seal_one_level_with_services(
     services: &SealServices<'_>,
     strategy: &LabelStrategy,
 ) -> Result<SealLevelResult> {
+    let plan = stage_seal_one_level_with_services(config, tree, buf, services, strategy).await?;
+    anyhow::ensure!(
+        crate::memory::chunks::versioned::commit_if_state_matches_async(
+            config,
+            &plan.expected,
+            &[],
+            &plan.changes,
+        )
+        .await?,
+        "tree or summary state changed while sealing tree_id={} level={}",
+        tree.id,
+        buf.level
+    );
+    services
+        .observer
+        .summary_committed(tree, &plan.node, None, "bucket_seal")?;
+    Ok(plan.result)
+}
+
+/// Compute and stage one seal without publishing domain state. Queue workers
+/// use this so the summary, tree, buffer, entity-index and job receipt become
+/// visible under the same lease-fenced owner-head CAS.
+pub(crate) async fn stage_seal_one_level_with_services(
+    config: &MemoryConfig,
+    tree: &Tree,
+    buf: &Buffer,
+    services: &SealServices<'_>,
+    strategy: &LabelStrategy,
+) -> Result<StagedSealLevel> {
     let level = buf.level;
     let target_level = level + 1;
 
@@ -321,146 +444,171 @@ pub async fn seal_one_level_with_services(
     services
         .observer
         .progress(tree, "persisting", target_level, None);
-    let summary_kind = match tree.kind {
-        crate::memory::tree::TreeKind::Source => SummaryTreeKind::Source,
-        crate::memory::tree::TreeKind::Topic => SummaryTreeKind::Topic,
-        crate::memory::tree::TreeKind::Global => SummaryTreeKind::Global,
-        crate::memory::tree::TreeKind::Flavoured => SummaryTreeKind::Flavoured,
-    };
-    let child_basenames = if target_level == 1 {
-        Some(
-            node.child_ids
-                .iter()
-                .map(|id| {
-                    crate::memory::chunks::get_chunk_raw_refs(config, id)
-                        .ok()
-                        .flatten()
-                        .and_then(|refs| refs.into_iter().next())
-                        .map(|raw| {
-                            raw.path
-                                .strip_suffix(".md")
-                                .unwrap_or(&raw.path)
-                                .to_string()
-                        })
-                })
-                .collect::<Vec<_>>(),
-        )
-    } else {
-        None
-    };
-    let layout = if target_level >= 1_000 {
-        SummaryDiskLayout::Merge
-    } else {
-        SummaryDiskLayout::Standard
-    };
-    let staged = stage_summary_with_layout(
-        &crate::memory::chunks::content_root(config),
-        &SummaryComposeInput {
-            summary_id: &node.id,
-            tree_kind: summary_kind,
-            tree_id: &node.tree_id,
-            tree_scope: &tree.scope,
-            level: node.level,
-            child_ids: &node.child_ids,
-            child_basenames: child_basenames.as_deref(),
-            child_count: node.child_ids.len(),
-            time_range_start: node.time_range_start,
-            time_range_end: node.time_range_end,
-            sealed_at: node.sealed_at,
-            body: &node.content,
-        },
-        &slugify_source_id(&tree.scope),
-        layout,
-    )?;
-
     let signature = crate::memory::chunks::tree_active_signature(config);
     let tree_id = tree.id.clone();
-    let summary_id_for_tx = summary_id.clone();
-    let node_for_tx = node.clone();
-    let staged_for_tx = staged.clone();
-    let follow_up = with_connection(config, move |conn| {
-        let tx = conn.unchecked_transaction()?;
+    let tree_key = format!("tree:{tree_id}");
+    let source_buffer_key = format!("buffer:{tree_id}:{level}");
+    let parent_buffer_key = format!("buffer:{tree_id}:{target_level}");
+    let keys = [
+        crate::memory::chunks::versioned::StateKey {
+            collection: crate::memory::chunks::collections::TREES.to_owned(),
+            key: tree_key.clone(),
+        },
+        crate::memory::chunks::versioned::StateKey {
+            collection: crate::memory::chunks::collections::BUFFERS.to_owned(),
+            key: source_buffer_key.clone(),
+        },
+        crate::memory::chunks::versioned::StateKey {
+            collection: crate::memory::chunks::collections::BUFFERS.to_owned(),
+            key: parent_buffer_key.clone(),
+        },
+    ];
+    let values = crate::memory::chunks::versioned::read_state_keys_async(config, &keys).await?;
+    let Some(current_tree_value) = values[0].as_ref() else {
+        anyhow::bail!("tree '{tree_id}' does not exist");
+    };
+    let mut current_tree: Tree = serde_json::from_value(current_tree_value.clone())?;
+    anyhow::ensure!(
+        current_tree.status == crate::memory::tree::TreeStatus::Active,
+        "tree '{tree_id}' is archived"
+    );
+    let Some(current_source_value) = values[1].as_ref() else {
+        anyhow::bail!("buffer changed while sealing tree_id={tree_id} level={level}");
+    };
+    let mut remaining: Buffer = serde_json::from_value(current_source_value.clone())?;
+    if !remaining.item_ids.starts_with(&buf.item_ids) {
+        anyhow::bail!("buffer changed while sealing tree_id={tree_id} level={level}");
+    }
+    remaining.item_ids.drain(..buf.item_ids.len());
+    remaining.token_sum = remaining.token_sum.saturating_sub(buf.token_sum).max(0);
+    if remaining.item_ids.is_empty() {
+        remaining.oldest_at = None;
+        remaining.token_sum = 0;
+    }
+    let mut parent = values[2]
+        .clone()
+        .map(serde_json::from_value)
+        .transpose()?
+        .unwrap_or_else(|| Buffer::empty(&tree_id, target_level));
+    if !parent.item_ids.contains(&summary_id) {
+        parent.item_ids.push(summary_id.clone());
+        parent.token_sum = parent.token_sum.saturating_add(node.token_count as i64);
+        parent.oldest_at = Some(
+            parent
+                .oldest_at
+                .map_or(time_range_start, |oldest| oldest.min(time_range_start)),
+        );
+    }
+    let follow_up = should_seal(config, &parent).then(|| crate::memory::queue::SealPayload {
+        tree_id: tree_id.clone(),
+        level: target_level,
+        force_now_ms: None,
+    });
 
-        let (current_max, status): (u32, String) = tx
-            .query_row(
-                "SELECT max_level, status FROM mem_tree_trees WHERE id = ?1",
-                rusqlite::params![&tree_id],
-                |r| Ok((r.get::<_, i64>(0)?.max(0) as u32, r.get(1)?)),
-            )
-            .context("Failed to read current state for tree")?;
-        anyhow::ensure!(status == "active", "tree '{tree_id}' is archived");
+    if target_level > current_tree.max_level {
+        current_tree.root_id = Some(summary_id.clone());
+        current_tree.max_level = target_level;
+    }
+    current_tree.last_sealed_at = Some(now);
 
-        store::insert_staged_summary_tx(&tx, &node_for_tx, Some(&staged_for_tx), &signature)?;
-        index_summary_entity_ids_tx(
-            &tx,
-            &node_for_tx.entities,
-            &node_for_tx.id,
-            node_for_tx.score,
-            now.timestamp_millis(),
-            Some(&tree_id),
-        )?;
-        // Backlink children → new parent for single-row traversal.
-        for child_id in &node_for_tx.child_ids {
-            if level == 0 {
-                tx.execute(
-                    "UPDATE mem_tree_chunks SET parent_summary_id = ?1
-                       WHERE id = ?2 AND parent_summary_id IS NULL",
-                    rusqlite::params![&summary_id_for_tx, child_id],
-                )
-                .context("Failed to backlink chunk to parent summary")?;
-            } else {
-                tx.execute(
-                    "UPDATE mem_tree_summaries SET parent_id = ?1
-                       WHERE id = ?2 AND parent_id IS NULL",
-                    rusqlite::params![&summary_id_for_tx, child_id],
-                )
-                .context("Failed to backlink summary to parent summary")?;
+    let summary_changes = store::stage_summary_changes(&node, None, &signature)?;
+    let entity_changes = crate::memory::score::store::stage_summary_entity_ids_async(
+        config,
+        &node.entities,
+        &node.id,
+        node.score,
+        now.timestamp_millis(),
+        Some(&tree_id),
+    )
+    .await?;
+    let mut expected = vec![
+        crate::memory::chunks::versioned::StateChange {
+            collection: crate::memory::chunks::collections::TREES.to_owned(),
+            key: tree_key.clone(),
+            value: Some(current_tree_value.clone()),
+        },
+        crate::memory::chunks::versioned::StateChange {
+            collection: crate::memory::chunks::collections::BUFFERS.to_owned(),
+            key: source_buffer_key.clone(),
+            value: Some(current_source_value.clone()),
+        },
+        crate::memory::chunks::versioned::StateChange {
+            collection: crate::memory::chunks::collections::BUFFERS.to_owned(),
+            key: parent_buffer_key.clone(),
+            value: values[2].clone(),
+        },
+    ];
+    expected.extend(summary_changes.expected);
+    expected.extend(entity_changes.expected);
+    let mut changes = vec![
+        crate::memory::chunks::versioned::StateChange {
+            collection: crate::memory::chunks::collections::TREES.to_owned(),
+            key: tree_key,
+            value: Some(serde_json::to_value(current_tree)?),
+        },
+        crate::memory::chunks::versioned::StateChange {
+            collection: crate::memory::chunks::collections::BUFFERS.to_owned(),
+            key: source_buffer_key,
+            value: Some(serde_json::to_value(remaining)?),
+        },
+        crate::memory::chunks::versioned::StateChange {
+            collection: crate::memory::chunks::collections::BUFFERS.to_owned(),
+            key: parent_buffer_key,
+            value: Some(serde_json::to_value(parent)?),
+        },
+    ];
+
+    if level > 0 {
+        let child_keys: Vec<_> = node
+            .child_ids
+            .iter()
+            .map(|id| crate::memory::chunks::versioned::StateKey {
+                collection: crate::memory::chunks::collections::SUMMARIES.to_owned(),
+                key: format!("summary:{id}"),
+            })
+            .collect();
+        let child_values =
+            crate::memory::chunks::versioned::read_state_keys_async(config, &child_keys).await?;
+        for (id, value) in node.child_ids.iter().zip(child_values) {
+            if let Some(value) = value {
+                let mut child: SummaryNode = serde_json::from_value(value.clone())?;
+                if child.parent_id.is_none() {
+                    child.parent_id = Some(summary_id.clone());
+                    expected.push(crate::memory::chunks::versioned::StateChange {
+                        collection: crate::memory::chunks::collections::SUMMARIES.to_owned(),
+                        key: format!("summary:{id}"),
+                        value: Some(value),
+                    });
+                    changes.push(crate::memory::chunks::versioned::StateChange {
+                        collection: crate::memory::chunks::collections::SUMMARIES.to_owned(),
+                        key: format!("summary:{id}"),
+                        value: Some(serde_json::to_value(child)?),
+                    });
+                }
             }
         }
-        store::consume_snapshot_tx(&tx, buf)?;
-
-        // Append the new summary to the parent buffer.
-        let mut parent = store::get_buffer_conn(&tx, &tree_id, target_level)?;
-        parent.item_ids.push(summary_id_for_tx.clone());
-        parent.token_sum = parent
-            .token_sum
-            .saturating_add(node_for_tx.token_count as i64);
-        parent.oldest_at = match parent.oldest_at {
-            Some(existing) => Some(existing.min(time_range_start)),
-            None => Some(time_range_start),
-        };
-        store::upsert_buffer_tx(&tx, &parent)?;
-
-        let follow_up = should_seal(config, &parent).then(|| crate::memory::queue::SealPayload {
-            tree_id: tree_id.clone(),
-            level: target_level,
-            force_now_ms: None,
-        });
-
-        if target_level > current_max {
-            store::update_tree_after_seal_tx(&tx, &tree_id, &summary_id_for_tx, target_level, now)?;
-        } else {
-            store::refresh_last_sealed_tx(&tx, &tree_id, now)?;
-        }
-
-        tx.commit()?;
-        Ok(follow_up)
-    })?;
-
-    services
-        .observer
-        .summary_committed(tree, &node, &staged.content_path, "bucket_seal")?;
-
-    Ok(SealLevelResult {
-        summary_id,
-        follow_up,
+    }
+    changes.extend(summary_changes.changes);
+    changes.extend(entity_changes.changes);
+    Ok(StagedSealLevel {
+        result: SealLevelResult {
+            summary_id,
+            follow_up,
+        },
+        expected,
+        changes,
+        node,
     })
 }
-pub use super::document_seal::{MERGE_LEVEL_BASE, seal_document_subtree_with_services};
+pub use super::document_seal::{seal_document_subtree_with_services, MERGE_LEVEL_BASE};
 
 #[cfg(test)]
 #[path = "bucket_seal_label_tests.rs"]
 mod label_tests;
+
+#[cfg(test)]
+#[path = "bucket_seal_queue_tests.rs"]
+mod queue_tests;
 #[cfg(test)]
 #[path = "bucket_seal_tests.rs"]
 mod tests;

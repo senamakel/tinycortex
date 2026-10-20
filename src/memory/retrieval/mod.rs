@@ -15,7 +15,7 @@
 //!   reconstructed from source-tree summaries.
 //! - [`query_topic`] — entity/topic-scoped retrieval reconstructed from the
 //!   entity index plus hydrated source-tree nodes.
-//! - [`search_entities`] — fuzzy `LIKE` lookup over the entity index.
+//! - [`search_entities`] — case-insensitive substring lookup over the entity index.
 //! - [`drill_down()`] — descend a summary's `child_ids` (BFS, optional rerank).
 //! - [`cover_window`] — minimum-node cover of a `[since, until]` window.
 //! - [`fetch_leaves`] — batch-hydrate raw chunk leaves by id, capped.
@@ -43,7 +43,7 @@
 //!
 //! These primitives delegate storage to the already-ported modules:
 //! - [`crate::memory::tree`] for tree/summary reads,
-//! - [`crate::memory::chunks`] for leaf hydration + the shared SQLite handle,
+//! - [`crate::memory::chunks`] for leaf hydration through prepared storage ports,
 //! - [`crate::memory::score`] for embeddings ([`Embedder`]) and the entity
 //!   index,
 //! - [`crate::memory::graph`] for co-occurrence relevance (via

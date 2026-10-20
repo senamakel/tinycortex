@@ -130,8 +130,8 @@ async fn occurrence_fallback_prioritizes_hits_containing_query_entities() {
     assert!(response.truncated);
 }
 
-#[test]
-fn local_candidates_intersect_occurrences_and_keep_latest_timestamp() {
+#[tokio::test]
+async fn local_candidates_intersect_occurrences_and_keep_latest_timestamp() {
     let (_temp, config) = test_config();
     for (entity, kind, timestamp) in [
         ("person:alice", EntityKind::Person, 10),
@@ -154,7 +154,7 @@ fn local_candidates_intersect_occurrences_and_keep_latest_timestamp() {
         dist: 1,
     }];
 
-    let candidates = local_candidates(&config, &pairs).unwrap();
+    let candidates = local_candidates(&config, &pairs).await.unwrap();
 
     assert_eq!(candidates["shared-node"].matched.len(), 2);
     assert_eq!(candidates["shared-node"].latest_ts, 20);
@@ -238,11 +238,16 @@ async fn local_branch_intersects_entities_and_applies_scope_before_limit() {
             );
         }
     }
-    upsert_edges(
-        &config,
-        &pairs_from_entities(&["person:alice".into(), "topic:launch".into()]),
-        fixed_ts().timestamp_millis(),
-    )
+    let edge_config = config.clone();
+    std::thread::spawn(move || {
+        upsert_edges(
+            &edge_config,
+            &pairs_from_entities(&["person:alice".into(), "topic:launch".into()]),
+            fixed_ts().timestamp_millis(),
+        )
+        .unwrap();
+    })
+    .join()
     .unwrap();
     let scope = HashSet::from(["slack:#allowed".to_string()]);
 

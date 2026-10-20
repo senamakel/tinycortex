@@ -18,7 +18,7 @@ use sha2::{Digest, Sha256};
 use tinystoragedrivers_types::{Filter, Precondition, Query, Sort, Version, WriteOptions};
 
 use super::collections::{
-    CHUNK_CONTENT_POINTERS, CHUNK_VERSIONS, CHUNKS, COMMIT_HEADS, OPERATIONS, STATE_VERSIONS,
+    CHUNKS, CHUNK_CONTENT_POINTERS, CHUNK_VERSIONS, COMMIT_HEADS, OPERATIONS, STATE_VERSIONS,
 };
 use super::types::{Chunk, StagedChunk};
 use crate::memory::config::MemoryConfig;
@@ -169,6 +169,12 @@ async fn capture_head_async(config: &MemoryConfig) -> Result<HeadSnapshot> {
     }))
 }
 
+/// Capture one immutable owner-head token for a multi-collection read/commit
+/// sequence that must reject phantoms created after enumeration.
+pub(crate) async fn capture_state_snapshot_async(config: &MemoryConfig) -> Result<HeadSnapshot> {
+    capture_head_async(config).await
+}
+
 /// Write a chunk batch as immutable versions and commit them in one head CAS.
 ///
 /// # Errors
@@ -176,6 +182,19 @@ async fn capture_head_async(config: &MemoryConfig) -> Result<HeadSnapshot> {
 /// or the host document store fails.
 pub(crate) fn upsert_chunks(config: &MemoryConfig, chunks: &[Chunk]) -> Result<usize> {
     commit_operation(config, chunks, &[])
+}
+
+/// Async counterpart to [`upsert_chunks`] for Tokio callers.
+pub(crate) async fn upsert_chunks_async(config: &MemoryConfig, chunks: &[Chunk]) -> Result<usize> {
+    if chunks.is_empty() {
+        return Ok(0);
+    }
+    for _ in 0..CAS_RETRIES {
+        if commit_if_state_matches_async(config, &[], chunks, &[]).await? {
+            return Ok(chunks.len());
+        }
+    }
+    anyhow::bail!("chunk version commit did not succeed within the retry budget")
 }
 
 /// Commit staged chunk previews and their content pointers at one head.
@@ -934,9 +953,8 @@ pub(crate) async fn read_state_keys_async(
         .run_async(async move {
             let mut values = Vec::with_capacity(keys.len());
             for key in keys {
-                values.push(
-                    read_state_at(&*documents, &snapshot, &key.collection, &key.key).await?,
-                );
+                values
+                    .push(read_state_at(&*documents, &snapshot, &key.collection, &key.key).await?);
             }
             Ok::<_, tinystoragedrivers_types::StorageError>(values)
         })
@@ -971,7 +989,10 @@ pub(crate) fn read_states(
 }
 
 /// Synchronous counterpart of [`read_state_keys_async`].
-pub(crate) fn read_state_keys(config: &MemoryConfig, keys: &[StateKey]) -> Result<Vec<Option<Value>>> {
+pub(crate) fn read_state_keys(
+    config: &MemoryConfig,
+    keys: &[StateKey],
+) -> Result<Vec<Option<Value>>> {
     let snapshot = capture_head(config)?;
     let documents = config.storage()?.documents().clone();
     let keys = keys.to_vec();
@@ -980,9 +1001,8 @@ pub(crate) fn read_state_keys(config: &MemoryConfig, keys: &[StateKey]) -> Resul
         .run(async move {
             let mut values = Vec::with_capacity(keys.len());
             for key in keys {
-                values.push(
-                    read_state_at(&*documents, &snapshot, &key.collection, &key.key).await?,
-                );
+                values
+                    .push(read_state_at(&*documents, &snapshot, &key.collection, &key.key).await?);
             }
             Ok::<_, tinystoragedrivers_types::StorageError>(values)
         })?
@@ -1085,6 +1105,49 @@ pub(crate) async fn commit_if_state_matches_async(
     }))
 }
 
+/// Commit against the exact head used to enumerate a logical snapshot. Unlike
+/// the retrying conditional API, this returns `false` when any operation has
+/// advanced the owner head since `snapshot` was captured, even if the changed
+/// operation touched a previously absent key.
+pub(crate) async fn commit_if_state_matches_at_snapshot_async(
+    config: &MemoryConfig,
+    snapshot: &HeadSnapshot,
+    expected: &[StateChange],
+    chunks: &[Chunk],
+    changes: &[StateChange],
+) -> Result<bool> {
+    let documents = config.storage()?.documents().clone();
+    let conditions = expected.to_vec();
+    let read_snapshot = snapshot.clone();
+    let matches = config
+        .storage_blocking()?
+        .run_async(async move {
+            for condition in conditions {
+                if read_state_at(
+                    &*documents,
+                    &read_snapshot,
+                    &condition.collection,
+                    &condition.key,
+                )
+                .await?
+                    != condition.value
+                {
+                    return Ok::<_, tinystoragedrivers_types::StorageError>(false);
+                }
+            }
+            Ok(true)
+        })
+        .await??;
+    if !matches || capture_head_async(config).await? != *snapshot {
+        return Ok(false);
+    }
+    match upsert_chunks_at_async(config, snapshot, chunks, chunks, changes).await {
+        Ok(_) => Ok(true),
+        Err(error) if is_storage_conflict(&error) => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
 pub(crate) fn insert_state_changes_if_absent(
     config: &MemoryConfig,
     changes: &[StateChange],
@@ -1183,8 +1246,20 @@ pub(crate) async fn list_state_async(
     collection: &str,
 ) -> Result<Vec<(String, Value)>> {
     let snapshot = capture_head_async(config).await?;
+    list_state_at_snapshot_async(config, &snapshot, collection).await
+}
+
+/// Enumerate state values at a previously captured head. This permits callers
+/// to enumerate several collections under one snapshot and use the same token
+/// as a strict commit precondition, preventing missing-key phantoms.
+pub(crate) async fn list_state_at_snapshot_async(
+    config: &MemoryConfig,
+    snapshot: &HeadSnapshot,
+    collection: &str,
+) -> Result<Vec<(String, Value)>> {
     let documents = config.storage()?.documents().clone();
     let collection = collection.to_owned();
+    let snapshot = snapshot.clone();
     config
         .storage_blocking()?
         .run_async(async move {

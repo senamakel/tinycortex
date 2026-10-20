@@ -6,8 +6,8 @@
 //! re-embed progress sequence.
 
 use std::collections::VecDeque;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 
 use anyhow::Result;
 use async_trait::async_trait;

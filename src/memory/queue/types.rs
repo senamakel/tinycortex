@@ -13,7 +13,7 @@
 //! contract the queue cares about: a machine-readable `code`, a `class`
 //! (`transient` / `unrecoverable`), and [`JobFailure::is_unrecoverable`].
 
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 
 pub use super::payloads::{
     AppendBufferPayload, AppendTarget, ExtractChunkPayload, FlushStalePayload, NodeRef,

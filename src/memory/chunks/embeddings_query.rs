@@ -13,7 +13,7 @@
 use super::collections::CHUNK_EMBEDDINGS;
 use super::embeddings::{chunk_embedding_key, tree_active_signature, ChunkEmbeddingRecord};
 use super::signature::{signature_in_clause, signature_variants};
-use super::versioned::{read_state, read_states};
+use super::versioned::{read_state, read_states, read_states_async};
 use anyhow::Result;
 use rusqlite::Connection;
 use std::collections::HashMap;
@@ -57,12 +57,45 @@ pub fn get_chunk_embedding_for_signature(
     Ok(None)
 }
 
+/// Async counterpart to [`get_chunk_embedding_for_signature`].
+pub async fn get_chunk_embedding_for_signature_async(
+    config: &MemoryConfig,
+    chunk_id: &str,
+    model_signature: &str,
+) -> Result<Option<Vec<f32>>> {
+    let variants = signature_variants(model_signature);
+    let keys = variants
+        .iter()
+        .map(|variant| chunk_embedding_key(chunk_id, variant))
+        .collect::<Vec<_>>();
+    let values = read_states_async(config, CHUNK_EMBEDDINGS, &keys).await?;
+    for (variant, key) in variants.iter().zip(keys) {
+        let Some(value) = values.get(&key) else {
+            continue;
+        };
+        let record: ChunkEmbeddingRecord = serde_json::from_value(value.clone())?;
+        if record.chunk_id == chunk_id && record.model_signature.as_str() == variant.as_str() {
+            return embedding_from_blob(&record.vector, record.dim, "chunk embedding");
+        }
+    }
+    Ok(None)
+}
+
 /// Fetch a chunk's embedding for the active model signature (see
 /// [`tree_active_signature`]). See [`get_chunk_embedding_for_signature`] for
 /// the return/error contract.
 pub fn get_chunk_embedding(config: &MemoryConfig, chunk_id: &str) -> Result<Option<Vec<f32>>> {
     let signature = tree_active_signature(config);
     get_chunk_embedding_for_signature(config, chunk_id, &signature)
+}
+
+/// Async counterpart to [`get_chunk_embedding`].
+pub async fn get_chunk_embedding_async(
+    config: &MemoryConfig,
+    chunk_id: &str,
+) -> Result<Option<Vec<f32>>> {
+    let signature = tree_active_signature(config);
+    get_chunk_embedding_for_signature_async(config, chunk_id, &signature).await
 }
 
 /// Decode a little-endian `f32` vector `BLOB` back into `Vec<f32>`, validating
@@ -210,6 +243,46 @@ pub fn get_chunk_embeddings_for_signature_batch(
     Ok(out)
 }
 
+/// Async counterpart to [`get_chunk_embeddings_for_signature_batch`].
+pub async fn get_chunk_embeddings_for_signature_batch_async(
+    config: &MemoryConfig,
+    chunk_ids: &[String],
+    model_signature: &str,
+) -> Result<HashMap<String, Vec<f32>>> {
+    if chunk_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let variants = signature_variants(model_signature);
+    let keys = chunk_ids
+        .iter()
+        .flat_map(|id| {
+            variants
+                .iter()
+                .map(|variant| chunk_embedding_key(id, variant))
+        })
+        .collect::<Vec<_>>();
+    let records = read_states_async(config, CHUNK_EMBEDDINGS, &keys).await?;
+    let mut out = HashMap::with_capacity(chunk_ids.len());
+    for id in chunk_ids {
+        for variant in &variants {
+            let key = chunk_embedding_key(id, variant);
+            let Some(value) = records.get(&key) else {
+                continue;
+            };
+            let record: ChunkEmbeddingRecord = serde_json::from_value(value.clone())?;
+            if record.chunk_id == *id && record.model_signature == *variant {
+                if let Some(vector) =
+                    embedding_from_blob(&record.vector, record.dim, "chunk embedding")?
+                {
+                    out.insert(id.clone(), vector);
+                    break;
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// Batched read of chunk embeddings under the **active** model signature. See
 /// [`get_chunk_embeddings_for_signature_batch`] for the batching and error
 /// contract.
@@ -219,4 +292,13 @@ pub fn get_chunk_embeddings_batch(
 ) -> Result<HashMap<String, Vec<f32>>> {
     let signature = tree_active_signature(config);
     get_chunk_embeddings_for_signature_batch(config, chunk_ids, &signature)
+}
+
+/// Async counterpart to [`get_chunk_embeddings_batch`].
+pub async fn get_chunk_embeddings_batch_async(
+    config: &MemoryConfig,
+    chunk_ids: &[String],
+) -> Result<HashMap<String, Vec<f32>>> {
+    let signature = tree_active_signature(config);
+    get_chunk_embeddings_for_signature_batch_async(config, chunk_ids, &signature).await
 }

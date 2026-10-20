@@ -8,11 +8,10 @@ use super::*;
 use crate::memory::tree::SummaryInput;
 use tempfile::TempDir;
 
-use crate::memory::chunks::upsert_chunks;
-use crate::memory::chunks::{Chunk, Metadata, SourceKind, SourceRef, chunk_id};
+use crate::memory::chunks::{chunk_id, Chunk, Metadata, SourceKind, SourceRef};
 use crate::memory::config::MemoryConfig;
-use crate::memory::tree::registry::get_or_create_tree;
-use crate::memory::tree::store::{self, INPUT_TOKEN_BUDGET, SUMMARY_FANOUT, TreeKind};
+use crate::memory::tree::registry::get_or_create_tree_async;
+use crate::memory::tree::store::{self, TreeKind, INPUT_TOKEN_BUDGET, SUMMARY_FANOUT};
 use crate::memory::tree::summarise::ConcatSummariser;
 use chrono::{TimeZone, Utc};
 use std::sync::Arc;
@@ -38,7 +37,7 @@ impl Summariser for PausingSummariser {
 
 fn test_config() -> (TempDir, MemoryConfig) {
     let tmp = TempDir::new().unwrap();
-    let cfg = MemoryConfig::new(tmp.path());
+    let cfg = crate::memory::chunks::test_support::host_config(tmp.path());
     (tmp, cfg)
 }
 
@@ -55,7 +54,7 @@ fn mk_leaf(id: &str, tokens: u32, ts_ms: i64) -> LeafRef {
 }
 
 /// Persist a chat chunk readable by the seal hydrator and return its id.
-fn seed_chunk(
+async fn seed_chunk(
     cfg: &MemoryConfig,
     seq: u32,
     content: &str,
@@ -83,14 +82,18 @@ fn seed_chunk(
         created_at: ts,
         partial_message: false,
     };
-    upsert_chunks(cfg, std::slice::from_ref(&c)).unwrap();
+    crate::memory::chunks::upsert_chunks_async(cfg, std::slice::from_ref(&c))
+        .await
+        .unwrap();
     c
 }
 
 #[tokio::test]
 async fn append_below_budget_does_not_seal() {
     let (_tmp, cfg) = test_config();
-    let tree = get_or_create_tree(&cfg, TreeKind::Source, "slack:#eng").unwrap();
+    let tree = get_or_create_tree_async(&cfg, TreeKind::Source, "slack:#eng")
+        .await
+        .unwrap();
     let s = ConcatSummariser::new();
     let leaf = mk_leaf("leaf-1", 100, 1_700_000_000_000);
     let sealed = append_leaf(&cfg, &tree, &leaf, &s, &LabelStrategy::Empty)
@@ -98,17 +101,22 @@ async fn append_below_budget_does_not_seal() {
         .unwrap();
     assert!(sealed.is_empty());
 
-    let buf = store::get_buffer(&cfg, &tree.id, 0).unwrap();
+    let buf = store::get_buffer_async(&cfg, &tree.id, 0).await.unwrap();
     assert_eq!(buf.item_ids, vec!["leaf-1".to_string()]);
     assert_eq!(buf.token_sum, 100);
-    assert_eq!(store::count_summaries(&cfg, &tree.id).unwrap(), 0);
+    assert_eq!(
+        store::count_summaries_async(&cfg, &tree.id).await.unwrap(),
+        0
+    );
 }
 
 #[tokio::test]
 async fn archived_tree_rejects_new_leaf() {
     let (_tmp, cfg) = test_config();
-    let tree = get_or_create_tree(&cfg, TreeKind::Source, "slack:#archived").unwrap();
-    store::archive_tree(&cfg, &tree.id).unwrap();
+    let tree = get_or_create_tree_async(&cfg, TreeKind::Source, "slack:#archived")
+        .await
+        .unwrap();
+    store::archive_tree_async(&cfg, &tree.id).await.unwrap();
     let summariser = ConcatSummariser::new();
 
     let err = append_leaf(
@@ -122,15 +130,20 @@ async fn archived_tree_rejects_new_leaf() {
     .unwrap_err();
 
     assert!(format!("{err:#}").contains("archived"));
-    assert!(store::get_buffer(&cfg, &tree.id, 0).unwrap().is_empty());
+    assert!(store::get_buffer_async(&cfg, &tree.id, 0)
+        .await
+        .unwrap()
+        .is_empty());
 }
 
 #[tokio::test]
 async fn archived_tree_rejects_seal_of_existing_buffer() {
     let (_tmp, cfg) = test_config();
-    let tree = get_or_create_tree(&cfg, TreeKind::Source, "slack:#archived").unwrap();
-    let chunk = seed_chunk(&cfg, 0, "buffered before archive", 100, vec![]);
-    append_to_buffer(
+    let tree = get_or_create_tree_async(&cfg, TreeKind::Source, "slack:#archived")
+        .await
+        .unwrap();
+    let chunk = seed_chunk(&cfg, 0, "buffered before archive", 100, vec![]).await;
+    append_to_buffer_async(
         &cfg,
         &tree.id,
         0,
@@ -138,8 +151,9 @@ async fn archived_tree_rejects_seal_of_existing_buffer() {
         chunk.token_count as i64,
         chunk.created_at,
     )
+    .await
     .unwrap();
-    store::archive_tree(&cfg, &tree.id).unwrap();
+    store::archive_tree_async(&cfg, &tree.id).await.unwrap();
 
     let err = cascade_all_from(
         &cfg,
@@ -152,16 +166,21 @@ async fn archived_tree_rejects_seal_of_existing_buffer() {
     .await
     .unwrap_err();
     assert!(format!("{err:#}").contains("archived"));
-    assert_eq!(store::count_summaries(&cfg, &tree.id).unwrap(), 0);
+    assert_eq!(
+        store::count_summaries_async(&cfg, &tree.id).await.unwrap(),
+        0
+    );
 }
 
 #[tokio::test]
 async fn service_seal_returns_parent_follow_up_intent_without_persisting_queue_state() {
     let (_tmp, mut cfg) = test_config();
     cfg.tree.summary_fanout = 1;
-    let tree = get_or_create_tree(&cfg, TreeKind::Source, "slack:#eng").unwrap();
-    let chunk = seed_chunk(&cfg, 0, "full staged body", 10, Vec::new());
-    append_to_buffer(
+    let tree = get_or_create_tree_async(&cfg, TreeKind::Source, "slack:#eng")
+        .await
+        .unwrap();
+    let chunk = seed_chunk(&cfg, 0, "full staged body", 10, Vec::new()).await;
+    append_to_buffer_async(
         &cfg,
         &tree.id,
         0,
@@ -169,8 +188,9 @@ async fn service_seal_returns_parent_follow_up_intent_without_persisting_queue_s
         chunk.token_count as i64,
         chunk.metadata.timestamp,
     )
+    .await
     .unwrap();
-    let buffer = store::get_buffer(&cfg, &tree.id, 0).unwrap();
+    let buffer = store::get_buffer_async(&cfg, &tree.id, 0).await.unwrap();
     let summariser = ConcatSummariser::new();
 
     let summary_id = seal_one_level_with_services(
@@ -188,7 +208,8 @@ async fn service_seal_returns_parent_follow_up_intent_without_persisting_queue_s
     .unwrap();
 
     assert!(
-        crate::memory::store::content::read_summary_body(&cfg, &summary_id.summary_id)
+        crate::memory::store::content::read_summary_body_async(&cfg, &summary_id.summary_id)
+            .await
             .unwrap()
             .contains("full staged body")
     );
@@ -197,15 +218,29 @@ async fn service_seal_returns_parent_follow_up_intent_without_persisting_queue_s
         .expect("fanout one should request parent seal");
     assert_eq!(follow_up.tree_id, tree.id);
     assert_eq!(follow_up.level, 1);
-    assert_eq!(crate::memory::queue::store::count_total(&cfg).unwrap(), 0);
-    assert_eq!(crate::memory::queue::count_total(&cfg).unwrap(), 1);
+    assert_eq!(
+        crate::memory::queue::store::count_total_async(&cfg)
+            .await
+            .unwrap(),
+        0
+    );
+    // The service returns follow-up intent for the worker to commit together
+    // with the owner-state settlement; planning itself must not persist a job.
+    assert_eq!(
+        crate::memory::queue::store::count_total_async(&cfg)
+            .await
+            .unwrap(),
+        0
+    );
 }
 
 #[tokio::test]
 async fn document_subtree_stages_versioned_passthrough_root() {
     let (_tmp, cfg) = test_config();
-    let tree = get_or_create_tree(&cfg, TreeKind::Source, "notion:connection").unwrap();
-    let chunk = seed_chunk(&cfg, 0, "document body", 10, Vec::new());
+    let tree = get_or_create_tree_async(&cfg, TreeKind::Source, "notion:connection")
+        .await
+        .unwrap();
+    let chunk = seed_chunk(&cfg, 0, "document body", 10, Vec::new()).await;
     let summariser = ConcatSummariser::new();
     let root_id = seal_document_subtree_with_services(
         &cfg,
@@ -223,21 +258,30 @@ async fn document_subtree_stages_versioned_passthrough_root() {
     .await
     .unwrap();
 
-    let root = store::get_summary(&cfg, &root_id).unwrap().unwrap();
+    let root = store::get_summary_async(&cfg, &root_id)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(root.content, "document body");
     assert_eq!(root.doc_id.as_deref(), Some("notion:connection:page"));
     assert_eq!(root.version_ms, Some(42));
     assert_eq!(
-        crate::memory::store::content::read_summary_body(&cfg, &root_id).unwrap(),
+        crate::memory::store::content::read_summary_body_async(&cfg, &root_id)
+            .await
+            .unwrap(),
         "document body"
     );
     assert_eq!(
-        store::get_buffer(&cfg, &tree.id, MERGE_LEVEL_BASE)
+        store::get_buffer_async(&cfg, &tree.id, MERGE_LEVEL_BASE)
+            .await
             .unwrap()
             .item_ids,
         vec![root_id]
     );
-    let published = store::get_tree(&cfg, &tree.id).unwrap().unwrap();
+    let published = store::get_tree_async(&cfg, &tree.id)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(published.root_id.as_deref(), Some(root.id.as_str()));
     assert_eq!(published.max_level, root.level);
 }
@@ -245,12 +289,14 @@ async fn document_subtree_stages_versioned_passthrough_root() {
 #[tokio::test]
 async fn crossing_budget_triggers_seal() {
     let (_tmp, cfg) = test_config();
-    let tree = get_or_create_tree(&cfg, TreeKind::Source, "slack:#eng").unwrap();
+    let tree = get_or_create_tree_async(&cfg, TreeKind::Source, "slack:#eng")
+        .await
+        .unwrap();
     let s = ConcatSummariser::new();
 
     let per_leaf = INPUT_TOKEN_BUDGET * 6 / 10;
-    let c1 = seed_chunk(&cfg, 0, "substantive chunk content 0", per_leaf, vec![]);
-    let c2 = seed_chunk(&cfg, 1, "substantive chunk content 1", per_leaf, vec![]);
+    let c1 = seed_chunk(&cfg, 0, "substantive chunk content 0", per_leaf, vec![]).await;
+    let c2 = seed_chunk(&cfg, 1, "substantive chunk content 1", per_leaf, vec![]).await;
     let ts = Utc.timestamp_millis_opt(1_700_000_000_000).unwrap();
 
     let leaf1 = LeafRef {
@@ -281,43 +327,47 @@ async fn crossing_budget_triggers_seal() {
         .unwrap();
     assert_eq!(second.len(), 1);
 
-    let summary = store::get_summary(&cfg, &second[0]).unwrap().unwrap();
+    let summary = store::get_summary_async(&cfg, &second[0])
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(summary.level, 1);
     assert_eq!(summary.child_ids, vec![c1.id.clone(), c2.id.clone()]);
     assert!(summary.token_count > 0);
 
-    assert!(store::get_buffer(&cfg, &tree.id, 0).unwrap().is_empty());
-    let l1 = store::get_buffer(&cfg, &tree.id, 1).unwrap();
+    assert!(store::get_buffer_async(&cfg, &tree.id, 0)
+        .await
+        .unwrap()
+        .is_empty());
+    let l1 = store::get_buffer_async(&cfg, &tree.id, 1).await.unwrap();
     assert_eq!(l1.item_ids, vec![second[0].clone()]);
 
-    let t = store::get_tree(&cfg, &tree.id).unwrap().unwrap();
+    let t = store::get_tree_async(&cfg, &tree.id)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(t.max_level, 1);
     assert_eq!(t.root_id.as_deref(), Some(second[0].as_str()));
     assert!(t.last_sealed_at.is_some());
 
-    // Leaf → parent backlink populated.
-    let parent: Option<String> = crate::memory::chunks::with_connection(&cfg, |conn| {
-        Ok(conn
-            .query_row(
-                "SELECT parent_summary_id FROM mem_tree_chunks WHERE id = ?1",
-                rusqlite::params![c1.id],
-                |r| r.get(0),
-            )
-            .unwrap())
-    })
-    .unwrap();
-    assert_eq!(parent.as_deref(), Some(second[0].as_str()));
+    // The owner model stores the parent-child relationship on the summary;
+    // chunk rows no longer carry a separate SQLite parent backlink.
+    assert!(summary.child_ids.contains(&c1.id));
 }
 
 #[tokio::test]
 async fn seal_preserves_items_appended_while_summariser_is_running() {
     let (_tmp, cfg) = test_config();
-    let tree = get_or_create_tree(&cfg, TreeKind::Source, "slack:#eng").unwrap();
-    let c1 = seed_chunk(&cfg, 0, "first", 10, vec![]);
-    let c2 = seed_chunk(&cfg, 1, "second", 10, vec![]);
+    let tree = get_or_create_tree_async(&cfg, TreeKind::Source, "slack:#eng")
+        .await
+        .unwrap();
+    let c1 = seed_chunk(&cfg, 0, "first", 10, vec![]).await;
+    let c2 = seed_chunk(&cfg, 1, "second", 10, vec![]).await;
     let ts = Utc.timestamp_millis_opt(1_700_000_000_000).unwrap();
-    append_to_buffer(&cfg, &tree.id, 0, &c1.id, 10, ts).unwrap();
-    let snapshot = store::get_buffer(&cfg, &tree.id, 0).unwrap();
+    append_to_buffer_async(&cfg, &tree.id, 0, &c1.id, 10, ts)
+        .await
+        .unwrap();
+    let snapshot = store::get_buffer_async(&cfg, &tree.id, 0).await.unwrap();
 
     let started = Arc::new(Notify::new());
     let release = Arc::new(Notify::new());
@@ -335,13 +385,15 @@ async fn seal_preserves_items_appended_while_summariser_is_running() {
         seal_one_level_with_services(&cfg, &tree, &snapshot, &services, &LabelStrategy::Empty);
     let append = async {
         started.notified().await;
-        append_to_buffer(&cfg, &tree.id, 0, &c2.id, 10, ts).unwrap();
+        append_to_buffer_async(&cfg, &tree.id, 0, &c2.id, 10, ts)
+            .await
+            .unwrap();
         release.notify_one();
     };
 
     let (sealed, ()) = tokio::join!(seal, append);
     sealed.unwrap();
-    let remaining = store::get_buffer(&cfg, &tree.id, 0).unwrap();
+    let remaining = store::get_buffer_async(&cfg, &tree.id, 0).await.unwrap();
     assert_eq!(remaining.item_ids, vec![c2.id]);
     assert_eq!(remaining.token_sum, 10);
 }
@@ -349,13 +401,15 @@ async fn seal_preserves_items_appended_while_summariser_is_running() {
 #[tokio::test]
 async fn fanout_at_l1_triggers_l2_seal() {
     let (_tmp, cfg) = test_config();
-    let tree = get_or_create_tree(&cfg, TreeKind::Source, "slack:#eng").unwrap();
+    let tree = get_or_create_tree_async(&cfg, TreeKind::Source, "slack:#eng")
+        .await
+        .unwrap();
     let s = ConcatSummariser::new();
 
     let mut all_sealed: Vec<String> = Vec::new();
     for seq in 0..SUMMARY_FANOUT {
         let content = format!("substantive chunk content {seq}");
-        let c = seed_chunk(&cfg, seq, &content, INPUT_TOKEN_BUDGET + 1, vec![]);
+        let c = seed_chunk(&cfg, seq, &content, INPUT_TOKEN_BUDGET + 1, vec![]).await;
         let leaf = LeafRef {
             chunk_id: c.id.clone(),
             token_count: c.token_count,
@@ -374,12 +428,21 @@ async fn fanout_at_l1_triggers_l2_seal() {
 
     // fanout L1 seals + one cascading L2 seal.
     assert_eq!(all_sealed.len() as u32, SUMMARY_FANOUT + 1);
-    let t = store::get_tree(&cfg, &tree.id).unwrap().unwrap();
+    let t = store::get_tree_async(&cfg, &tree.id)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(t.max_level, 2);
-    assert!(store::get_buffer(&cfg, &tree.id, 1).unwrap().is_empty());
-    let l2 = store::get_buffer(&cfg, &tree.id, 2).unwrap();
+    assert!(store::get_buffer_async(&cfg, &tree.id, 1)
+        .await
+        .unwrap()
+        .is_empty());
+    let l2 = store::get_buffer_async(&cfg, &tree.id, 2).await.unwrap();
     assert_eq!(l2.item_ids.len(), 1);
-    let l2_summary = store::get_summary(&cfg, &l2.item_ids[0]).unwrap().unwrap();
+    let l2_summary = store::get_summary_async(&cfg, &l2.item_ids[0])
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(l2_summary.level, 2);
     assert_eq!(l2_summary.child_ids.len() as u32, SUMMARY_FANOUT);
 }
@@ -387,13 +450,15 @@ async fn fanout_at_l1_triggers_l2_seal() {
 #[tokio::test]
 async fn upper_level_does_not_seal_below_fanout() {
     let (_tmp, cfg) = test_config();
-    let tree = get_or_create_tree(&cfg, TreeKind::Source, "slack:#eng").unwrap();
+    let tree = get_or_create_tree_async(&cfg, TreeKind::Source, "slack:#eng")
+        .await
+        .unwrap();
     let s = ConcatSummariser::new();
 
     let stop_before = SUMMARY_FANOUT.saturating_sub(1);
     for seq in 0..stop_before {
         let content = format!("c{seq}");
-        let c = seed_chunk(&cfg, seq, &content, INPUT_TOKEN_BUDGET + 1, vec![]);
+        let c = seed_chunk(&cfg, seq, &content, INPUT_TOKEN_BUDGET + 1, vec![]).await;
         let leaf = LeafRef {
             chunk_id: c.id.clone(),
             token_count: c.token_count,
@@ -408,14 +473,21 @@ async fn upper_level_does_not_seal_below_fanout() {
             .unwrap();
     }
 
-    let t = store::get_tree(&cfg, &tree.id).unwrap().unwrap();
+    let t = store::get_tree_async(&cfg, &tree.id)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(t.max_level, 1, "should plateau at L1 below fanout");
     assert_eq!(
-        store::get_buffer(&cfg, &tree.id, 1).unwrap().item_ids.len() as u32,
+        store::get_buffer_async(&cfg, &tree.id, 1)
+            .await
+            .unwrap()
+            .item_ids
+            .len() as u32,
         stop_before
     );
     assert_eq!(
-        store::count_summaries(&cfg, &tree.id).unwrap(),
+        store::count_summaries_async(&cfg, &tree.id).await.unwrap(),
         stop_before as u64
     );
 }

@@ -43,13 +43,16 @@ pub mod types;
 // ── Public API surface ──────────────────────────────────────────────────────
 
 pub use bucket_seal::{
-    MERGE_LEVEL_BASE, SealLevelResult, append_leaf, append_leaf_deferred, append_to_buffer,
-    cascade_all_from, cascade_all_from_with_services, seal_document_subtree_with_services,
-    seal_one_level_with_services, should_seal,
+    append_leaf, append_leaf_deferred, append_to_buffer, cascade_all_from,
+    cascade_all_from_with_services, plan_seal_one_level_for_queue, seal_document_subtree_with_services,
+    seal_one_level_with_services, should_seal, SealLevelResult, MERGE_LEVEL_BASE,
 };
-pub use direct_ingest::{SummaryIngestInput, SummaryIngestOutcome, ingest_summary};
-pub use factory::{GLOBAL_SCOPE, TreeFactory, TreeProfile};
-pub use flavoured::{compile_flavoured_root, flavoured_root_abs_path, flavoured_root_rel_path};
+pub use direct_ingest::{ingest_summary, SummaryIngestInput, SummaryIngestOutcome};
+pub use factory::{TreeFactory, TreeProfile, GLOBAL_SCOPE};
+pub use flavoured::{
+    compile_flavoured_root, compile_flavoured_root_async, flavoured_root_abs_path,
+    flavoured_root_rel_path,
+};
 pub use flush::{
     flush_stale_buffers, flush_stale_buffers_default, flush_stale_buffers_with_services,
     force_flush_tree,
@@ -61,15 +64,15 @@ pub use io::{
 };
 pub use read::read_tree;
 pub use registry::{
-    get_or_create_tree, get_or_create_tree_with_ask, is_unique_violation, new_summary_id,
-    new_tree_id,
+    get_or_create_tree, get_or_create_tree_async, get_or_create_tree_with_ask,
+    get_or_create_tree_with_ask_async, is_unique_violation, new_summary_id, new_tree_id,
 };
 pub use store::{
-    Buffer, INPUT_TOKEN_BUDGET, OUTPUT_TOKEN_BUDGET, SUMMARY_FANOUT, SummaryNode, Tree, TreeKind,
-    TreeStatus,
+    Buffer, SummaryNode, Tree, TreeKind, TreeStatus, INPUT_TOKEN_BUDGET, OUTPUT_TOKEN_BUDGET,
+    SUMMARY_FANOUT,
 };
 pub use summarise::{
-    ConcatSummariser, PreparedSummaryPrompt, Summariser, SummaryCall, SummaryContext, SummaryInput,
-    SummaryOutput, fallback_summary, finish_provider_summary, prepare_summary_prompt,
+    fallback_summary, finish_provider_summary, prepare_summary_prompt, ConcatSummariser,
+    PreparedSummaryPrompt, Summariser, SummaryCall, SummaryContext, SummaryInput, SummaryOutput,
 };
 pub use types::{LabelStrategy, LeafRef, SealObserver, SealServices};

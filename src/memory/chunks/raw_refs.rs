@@ -12,10 +12,7 @@
 //! ([`super::store_delete`]) owns reachability-based cleanup of unreferenced
 //! raw files and their ingest-gate rows.
 
-use rusqlite::{params, OptionalExtension};
-
 use super::collections::{CHUNK_CONTENT_POINTERS, RAW_REFS};
-use super::connection::with_connection;
 use super::versioned::{list_state, read_state, write_state, StateChange};
 use crate::memory::config::MemoryConfig;
 use anyhow::{Context, Result};
@@ -41,6 +38,13 @@ pub struct RawRef {
 #[derive(serde::Deserialize)]
 struct ChunkContentPointer {
     chunk_id: String,
+    content_path: String,
+    content_sha256: String,
+}
+
+#[derive(serde::Deserialize)]
+struct SummaryContentPointer {
+    summary_id: String,
     content_path: String,
     content_sha256: String,
 }
@@ -93,6 +97,18 @@ pub fn get_chunk_raw_refs(config: &MemoryConfig, chunk_id: &str) -> Result<Optio
         .context("deserialize raw refs")
 }
 
+/// Async counterpart to [`get_chunk_raw_refs`] for async owner operations.
+pub async fn get_chunk_raw_refs_async(
+    config: &MemoryConfig,
+    chunk_id: &str,
+) -> Result<Option<Vec<RawRef>>> {
+    super::versioned::read_state_async(config, RAW_REFS, chunk_id)
+        .await?
+        .map(serde_json::from_value)
+        .transpose()
+        .context("deserialize raw refs")
+}
+
 /// Collect every raw-archive path referenced by any chunk raw-ref record,
 /// restricted to paths under `rel_prefix`. Rust-side
 /// prefix filter so `_` / `%` in slugs are treated literally (a SQL `LIKE`
@@ -113,6 +129,24 @@ pub fn list_chunk_raw_ref_paths_with_prefix(
 ) -> Result<std::collections::HashSet<String>> {
     let mut out = std::collections::HashSet::new();
     for (_, value) in list_state(config, RAW_REFS)? {
+        if let Ok(refs) = serde_json::from_value::<Vec<RawRef>>(value) {
+            for raw_ref in refs {
+                if raw_ref.path.starts_with(rel_prefix) {
+                    out.insert(raw_ref.path);
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Async counterpart to [`list_chunk_raw_ref_paths_with_prefix`].
+pub async fn list_chunk_raw_ref_paths_with_prefix_async(
+    config: &MemoryConfig,
+    rel_prefix: &str,
+) -> Result<std::collections::HashSet<String>> {
+    let mut out = std::collections::HashSet::new();
+    for (_, value) in super::versioned::list_state_async(config, RAW_REFS).await? {
         if let Ok(refs) = serde_json::from_value::<Vec<RawRef>>(value) {
             for raw_ref in refs {
                 if raw_ref.path.starts_with(rel_prefix) {
@@ -169,20 +203,48 @@ pub fn get_summary_content_pointers(
     config: &MemoryConfig,
     summary_id: &str,
 ) -> Result<Option<(String, String)>> {
-    with_connection(config, |conn| {
-        let row = conn
-            .query_row(
-                "SELECT content_path, content_sha256 FROM mem_tree_summaries WHERE id = ?1",
-                params![summary_id],
-                |r| {
-                    let path: Option<String> = r.get(0)?;
-                    let sha: Option<String> = r.get(1)?;
-                    Ok((path, sha))
-                },
-            )
-            .optional()?;
-        Ok(row.and_then(|(p, s)| p.zip(s)))
-    })
+    let Some(value) = read_state(
+        config,
+        crate::memory::chunks::collections::SUMMARY_CONTENT_POINTERS,
+        &format!("summary:{summary_id}"),
+    )?
+    else {
+        return Ok(None);
+    };
+    let pointer: SummaryContentPointer = serde_json::from_value(value)?;
+    anyhow::ensure!(
+        pointer.summary_id == summary_id,
+        "summary content pointer key mismatch"
+    );
+    if pointer.content_path.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some((pointer.content_path, pointer.content_sha256)))
+}
+
+/// Async counterpart to [`get_summary_content_pointers`].
+pub async fn get_summary_content_pointers_async(
+    config: &MemoryConfig,
+    summary_id: &str,
+) -> Result<Option<(String, String)>> {
+    let Some(value) = super::versioned::read_state_async(
+        config,
+        crate::memory::chunks::collections::SUMMARY_CONTENT_POINTERS,
+        &format!("summary:{summary_id}"),
+    )
+    .await?
+    else {
+        return Ok(None);
+    };
+    let pointer: SummaryContentPointer = serde_json::from_value(value)?;
+    anyhow::ensure!(
+        pointer.summary_id == summary_id,
+        "summary content pointer key mismatch"
+    );
+    if pointer.content_path.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some((pointer.content_path, pointer.content_sha256)))
 }
 
 /// List all non-deleted summary rows that have both a non-NULL
@@ -194,22 +256,32 @@ pub fn get_summary_content_pointers(
 pub fn list_summaries_with_content_path(
     config: &MemoryConfig,
 ) -> Result<Vec<(String, String, String)>> {
-    with_connection(config, |conn| {
-        let mut stmt = conn.prepare(
-            "SELECT id, content_path, content_sha256
-               FROM mem_tree_summaries
-              WHERE content_path IS NOT NULL AND content_sha256 IS NOT NULL
-                AND deleted = 0",
-        )?;
-        let rows = stmt
-            .query_map([], |r| {
-                let id: String = r.get(0)?;
-                let path: String = r.get(1)?;
-                let sha: String = r.get(2)?;
-                Ok((id, path, sha))
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .context("Failed to list summaries with content_path")?;
-        Ok(rows)
-    })
+    let summaries: std::collections::HashMap<_, _> =
+        list_state(config, crate::memory::chunks::collections::SUMMARIES)?
+            .into_iter()
+            .filter_map(|(key, value)| {
+                key.strip_prefix("summary:")
+                    .map(|id| (id.to_owned(), value))
+            })
+            .collect();
+    let mut out = Vec::new();
+    for (_, value) in list_state(
+        config,
+        crate::memory::chunks::collections::SUMMARY_CONTENT_POINTERS,
+    )? {
+        let pointer: SummaryContentPointer = serde_json::from_value(value)?;
+        if pointer.content_path.is_empty() {
+            continue;
+        }
+        if summaries.get(&pointer.summary_id).is_some_and(|value| {
+            value.get("deleted").and_then(serde_json::Value::as_bool) == Some(false)
+        }) {
+            out.push((
+                pointer.summary_id,
+                pointer.content_path,
+                pointer.content_sha256,
+            ));
+        }
+    }
+    Ok(out)
 }

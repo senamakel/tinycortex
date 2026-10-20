@@ -112,6 +112,53 @@ pub fn compile_flavoured_root(config: &MemoryConfig, tree_id: &str) -> Result<St
     Ok(markdown)
 }
 
+/// Async counterpart to [`compile_flavoured_root`] for post-commit callers on
+/// Tokio. Owner reads remain asynchronous; filesystem projection happens only
+/// after the tree commit has succeeded.
+pub async fn compile_flavoured_root_async(config: &MemoryConfig, tree_id: &str) -> Result<String> {
+    let tree = store::get_tree_async(config, tree_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("no tree with id {tree_id}"))?;
+    if tree.kind != TreeKind::Flavoured {
+        anyhow::bail!(
+            "compile_flavoured_root: tree {tree_id} is {}, not flavoured",
+            tree.kind.as_str()
+        );
+    }
+    let (body, leaves_folded, root_id) = match tree.root_id.as_deref() {
+        Some(root_id) => {
+            let node = store::get_summary_async(config, root_id)
+                .await?
+                .ok_or_else(|| {
+                    anyhow::anyhow!("flavoured tree {tree_id} root {root_id} missing")
+                })?;
+            (node.content, node.child_ids.len(), Some(root_id.to_owned()))
+        }
+        None => (String::new(), 0, None),
+    };
+    let budget = config.tree.flavour_root_token_budget;
+    let (clamped, token_estimate) = clamp_to_budget(body.trim(), budget);
+    let markdown = render_flavoured_root(&FlavouredRootMeta {
+        tree_id: &tree.id,
+        scope: &tree.scope,
+        ask: tree.ask.as_deref(),
+        root_id: root_id.as_deref(),
+        sealed_at: tree.last_sealed_at.map(|time| time.to_rfc3339()),
+        leaves_folded,
+        token_estimate,
+        token_budget: budget,
+        body: &clamped,
+    });
+    let abs = flavoured_root_abs_path(config, &tree.scope);
+    if let Some(parent) = abs.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("create flavoured root dir {}", parent.display()))?;
+    }
+    crate::memory::fsutil::atomic_write(&abs, markdown.as_bytes())
+        .with_context(|| format!("write flavoured root {}", abs.display()))?;
+    Ok(markdown)
+}
+
 /// Front-matter inputs for one compiled flavoured-root artifact.
 struct FlavouredRootMeta<'a> {
     tree_id: &'a str,

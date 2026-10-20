@@ -28,10 +28,8 @@
 //! [`score_chunk`] itself is pure-ish (no store access) and safe to call
 //! concurrently for different chunks — the only shared state is whatever the
 //! configured [`extract::EntityExtractor`] / LLM provider holds internally.
-//! Persistence ([`persist_score`] / [`persist_score_tx`]) is where atomicity
-//! matters: use the `_tx` variant when persisting a score alongside its chunk
-//! write so both land in the same SQLite transaction (see
-//! [`store`]'s module docs for the full write contract).
+//! Persistence is staged as owner-scoped state changes, allowing ingest to
+//! commit score, entity, and chunk state under one versioned head.
 
 /// Embedding backends ([`embed::Embedder`]) and the deterministic
 /// [`embed::InertEmbedder`] default.
@@ -47,13 +45,12 @@ pub mod resolver;
 pub mod signals;
 /// Persistence for score rows and the entity occurrence index.
 pub mod store;
-mod store_query;
+pub(crate) mod store_query;
 
 use std::sync::Arc;
 
 use anyhow::Result;
 use chrono::Utc;
-use rusqlite::Transaction;
 use serde::{Deserialize, Serialize};
 
 use self::extract::{EntityExtractor, ExtractedEntities};
@@ -358,58 +355,16 @@ pub async fn score_chunks_fast(chunks: &[Chunk], cfg: &ScoringConfig) -> Result<
 
 // ── Persistence helpers used by the ingest orchestrator ─────────────────
 
-/// Persist the score row + entity-index rows for one kept chunk.
-///
-/// The caller is responsible for having already written the chunk itself into
-/// `mem_tree_chunks`. Dropped chunks still get a score row persisted for
-/// diagnostics — callers should pass `None` for `tree_id` in that case.
-///
-/// Co-occurrence graph edges (OpenHuman's E2GraphRAG accumulation) are not
-/// written here: TinyCortex's `memory::graph` module is not yet ported, so this
-/// helper persists the score row and the entity index only.
-///
-/// Existing entity rows are always cleared before the new result is applied;
-/// a kept-to-dropped re-score therefore cannot leave phantom topic/graph hits.
+/// Persist one score and its entity occurrences in a single owner-head commit.
+/// Dropped chunks retain a score row while their previous entity occurrences
+/// are removed.
 pub fn persist_score(
     config: &MemoryConfig,
     result: &ScoreResult,
     timestamp_ms: i64,
     tree_id: Option<&str>,
 ) -> Result<()> {
-    crate::memory::chunks::with_connection(config, |connection| {
-        let transaction = connection.unchecked_transaction()?;
-        persist_score_tx(&transaction, result, timestamp_ms, tree_id)?;
-        transaction.commit()?;
-        Ok(())
-    })
-}
-
-/// Transactional variant of [`persist_score`] — writes the score row and
-/// entity-index rows on the caller's open [`Transaction`] so the persistence
-/// is atomic with the surrounding ingest write. It has the same unconditional
-/// clear-before-optional-reindex semantics as [`persist_score`].
-pub fn persist_score_tx(
-    tx: &Transaction<'_>,
-    result: &ScoreResult,
-    timestamp_ms: i64,
-    tree_id: Option<&str>,
-) -> Result<()> {
-    let row = score_row(result);
-    store::upsert_score_tx(tx, &row)?;
-
-    store::clear_entity_index_for_node_tx(tx, &result.chunk_id)?;
-    if result.kept && !result.canonical_entities.is_empty() {
-        store::index_entities_tx(
-            tx,
-            &result.canonical_entities,
-            &result.chunk_id,
-            "leaf",
-            timestamp_ms,
-            tree_id,
-        )?;
-    }
-
-    Ok(())
+    store::persist_score(config, result, timestamp_ms, tree_id)
 }
 
 fn score_row(result: &ScoreResult) -> store::ScoreRow {

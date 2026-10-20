@@ -29,7 +29,7 @@ use crate::memory::tree::{SummaryNode, TreeKind};
 use super::types::{hydrated_chunk_hit, hydrated_summary_hit, QueryResponse, RetrievalHit};
 
 /// Page size used while scanning the complete in-window chunk set. Pagination
-/// bounds each SQLite materialisation without silently dropping later sources.
+/// bounds each materialization without silently dropping later sources.
 /// Derive the tree scope a chunk seals under: `path_scope` overrides
 /// `source_id` for shared-directory document sources, mirroring the append
 /// path's scope derivation.

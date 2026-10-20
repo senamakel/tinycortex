@@ -1,6 +1,6 @@
 //! Tests for the co-occurrence graph queries. Ported from OpenHuman
-//! `memory_graph::query`, with the SQLite-backed `mem_tree_entity_index`
-//! replaced by an injected in-memory [`EntityOccurrenceIndex`] fixture.
+//! `memory_graph::query`, using an in-memory fixture for this pure derivation
+//! test. Storage behavior is exercised separately against the host testkit.
 
 use super::*;
 use crate::memory::graph::types::EntityOccurrenceIndex;
@@ -11,7 +11,7 @@ use anyhow::Result;
 /// In-memory stand-in for the occurrence index.
 ///
 /// Stores `(entity_id, node_id)` occurrences the way `index_entity` writes
-/// rows into `mem_tree_entity_index`, and answers the two reads the graph
+/// owner records, and answers the two reads the graph
 /// derivation needs. `BTreeSet`/`BTreeMap` give distinct ids and a stable,
 /// deterministic iteration order — the same guarantees the SQL `DISTINCT`
 /// clauses provide.
@@ -30,7 +30,7 @@ impl InMemoryIndex {
 
     /// Record one entity occurrence on a node. Idempotent on the
     /// `(entity_id, node_id)` pair, mirroring the composite primary key of
-    /// `mem_tree_entity_index`.
+    /// the entity occurrence collection.
     fn index_entity(&mut self, entity_id: &str, node_id: &str) {
         self.by_entity
             .entry(entity_id.to_string())
