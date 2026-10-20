@@ -208,17 +208,15 @@ pub(crate) async fn publish_record_async(config: &MemoryConfig, record: &JobReco
 
 fn hint_message(record: &JobRecord, now_ms: i64) -> NewMessage {
     let delay_ms = record.available_at_ms.saturating_sub(now_ms).max(0) as u64;
-    NewMessage::new(json!({"job_id": record.id, "generation": record.lease_epoch}))
+    NewMessage::new(json!({"job_id": record.id, "generation": record.hint_generation}))
         .priority(queue_priority(&record.kind))
         .delay_ms(delay_ms)
         // This is only a finite-window optimization. Duplicate hints are
-        // harmless because the durable lease generation is authoritative.
-        // Acknowledge consumes the current hint, but queue backends may retain
-        // its finite-window dedupe key. Use the durable lease generation so a
-        // failed/deferred/recovered job can immediately publish its next hint;
-        // republishing the same ready generation after a lost publish-ACK is
-        // still idempotent.
-        .dedupe_key(format!("job:{}", record.id))
+        // harmless because the durable hint generation is authoritative.
+        // Redelivery keeps the same key, while each new ready-state
+        // generation gets a fresh key even when the backend retains finite-
+        // window dedupe entries for acknowledged hints.
+        .dedupe_key(format!("job:{}:{}", record.id, record.hint_generation))
 }
 
 fn queue_priority(kind: &str) -> u8 {
@@ -459,7 +457,7 @@ pub fn claim_next(config: &MemoryConfig, lock_duration_ms: i64) -> Result<Option
             .payload
             .get("generation")
             .and_then(Value::as_u64)
-            .is_some_and(|generation| generation != record.lease_epoch)
+            .is_some_and(|generation| generation != record.hint_generation)
         {
             ack(config, &delivery.receipt)?;
             continue;
@@ -552,7 +550,7 @@ pub(crate) async fn claim_next_async(
             .payload
             .get("generation")
             .and_then(Value::as_u64)
-            .is_some_and(|generation| generation != record.lease_epoch)
+            .is_some_and(|generation| generation != record.hint_generation)
         {
             ack_async(config, &delivery.receipt).await?;
             continue;
@@ -701,6 +699,9 @@ pub(crate) fn commit_claimed(
     }
     next.lease_epoch = current.lease_epoch;
     next.hint_generation = current.hint_generation;
+    if next.status == JobStatus::Ready.as_str() {
+        next.hint_generation = next.hint_generation.saturating_add(1);
+    }
     next.lease_token = None;
     let mut expected = vec![StateChange {
         collection: JOBS.to_owned(),
@@ -837,6 +838,9 @@ pub(crate) async fn commit_claimed_async(
     }
     next.lease_epoch = current.lease_epoch;
     next.hint_generation = current.hint_generation;
+    if next.status == JobStatus::Ready.as_str() {
+        next.hint_generation = next.hint_generation.saturating_add(1);
+    }
     next.lease_token = None;
     let mut expected = vec![StateChange {
         collection: JOBS.to_owned(),
@@ -1022,7 +1026,7 @@ pub(crate) fn repair_pending_hints(config: &MemoryConfig) -> Result<usize> {
             // repair can recover even when the backend still remembers the
             // previous hint's finite-window dedupe key (for example after a
             // hint expired or was dead-lettered).
-            record.lease_epoch = record.lease_epoch.saturating_add(1);
+            record.hint_generation = record.hint_generation.saturating_add(1);
             if replace_record(config, &value, &record)? {
                 enqueue_hint(config, &record)?;
                 count += 1;
@@ -1042,7 +1046,7 @@ pub(crate) async fn repair_pending_hints_async(config: &MemoryConfig) -> Result<
         }
         let mut record = decode_job(&value)?;
         if record.status()? == JobStatus::Ready && record.available_at_ms <= now_ms {
-            record.lease_epoch = record.lease_epoch.saturating_add(1);
+            record.hint_generation = record.hint_generation.saturating_add(1);
             if versioned::commit_if_state_matches_async(
                 config,
                 &[StateChange {
