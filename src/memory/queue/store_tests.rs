@@ -149,6 +149,72 @@ async fn a_deferred_job_can_be_reclaimed_before_queue_dedupe_expires() {
     assert_eq!(retry.attempts, 1);
 }
 
+#[tokio::test]
+async fn a_redelivered_hint_reclaims_an_expired_worker_lease() {
+    use tinystoragedrivers_types::{QueueSpec, Retry};
+
+    let (_tmp, cfg) = test_config();
+    let storage = cfg.storage().unwrap();
+    storage
+        .queues()
+        .ensure_queue(
+            super::super::QUEUE_NAME,
+            &QueueSpec {
+                max_attempts: cfg.queue.max_attempts.max(1),
+                dedupe_window_ms: 60_000,
+            },
+        )
+        .await
+        .unwrap();
+    let mut new_job = NewJob::extract_chunk(&ExtractChunkPayload {
+        chunk_id: "c-crashed-worker".into(),
+    })
+    .unwrap();
+    new_job.id = Some("job:crashed-worker".into());
+    let id = enqueue_async(&cfg, &new_job).await.unwrap().unwrap();
+
+    let first = claim_next_async(&cfg, DEFAULT_LOCK_DURATION_MS)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(first.id, id);
+    let receipt = first.queue_receipt.as_ref().unwrap();
+
+    // Model lease expiry after the worker crashes without settling its
+    // receipt. NACK makes the same publication hint visible for redelivery;
+    // the second claimant must validate publication generation separately
+    // from the first claimant's incremented lease epoch.
+    let (old_value, mut record) = read_record_async(&cfg, &id).await.unwrap().unwrap();
+    record.locked_until_ms = Some(0);
+    assert!(
+        crate::memory::chunks::versioned::commit_if_state_matches_async(
+            &cfg,
+            &[StateChange {
+                collection: JOBS.to_owned(),
+                key: job_key(&id),
+                value: Some(old_value),
+            }],
+            &[],
+            &[state_change(&record).unwrap()],
+        )
+        .await
+        .unwrap()
+    );
+    storage
+        .queues()
+        .nack(super::super::QUEUE_NAME, receipt, Retry::After(0))
+        .await
+        .unwrap();
+
+    let reclaimed = claim_next_async(&cfg, DEFAULT_LOCK_DURATION_MS)
+        .await
+        .unwrap()
+        .expect("the redelivered hint should reclaim an expired durable lease");
+    assert_eq!(reclaimed.id, id);
+    assert_eq!(reclaimed.lease_epoch, first.lease_epoch + 1);
+    assert_eq!(reclaimed.attempts, 2);
+}
+
 #[test]
 fn stable_job_id_rejects_a_different_payload() {
     let (_tmp, cfg) = test_config();
