@@ -15,7 +15,8 @@ use parking_lot::Mutex;
 
 use crate::memory::config::MemoryConfig;
 use crate::memory::queue::handlers::{
-    AppendDecision, ExtractDecision, QueueDelegates, ReembedProgress, StaleBuffer,
+    AppendDecision, DelegateOutput, ExtractDecision, QueueDelegates, ReembedProgress,
+    StaleBuffer,
 };
 use crate::memory::queue::types::{AppendTarget, NodeRef, SealDocumentPayload, SealPayload};
 
@@ -81,9 +82,12 @@ impl QueueDelegates for RecordingDelegates {
         &self,
         _config: &MemoryConfig,
         _chunk_id: &str,
-    ) -> Result<Option<ExtractDecision>> {
+    ) -> Result<Option<DelegateOutput<ExtractDecision>>> {
         self.counts.extract.fetch_add(1, Ordering::Relaxed);
-        Ok(self.extract.clone())
+        Ok(self.extract.clone().map(|result| DelegateOutput {
+            result,
+            mutations: Vec::new(),
+        }))
     }
 
     async fn append_node(
@@ -91,9 +95,12 @@ impl QueueDelegates for RecordingDelegates {
         _config: &MemoryConfig,
         _node: &NodeRef,
         _target: &AppendTarget,
-    ) -> Result<Option<AppendDecision>> {
+    ) -> Result<Option<DelegateOutput<AppendDecision>>> {
         self.counts.append.fetch_add(1, Ordering::Relaxed);
-        Ok(self.append.clone())
+        Ok(self.append.clone().map(|result| DelegateOutput {
+            result,
+            mutations: Vec::new(),
+        }))
     }
 
     async fn seal_level(

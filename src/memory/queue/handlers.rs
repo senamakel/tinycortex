@@ -66,8 +66,8 @@ pub const L0_DEFAULT_FLUSH_AGE_SECS: i64 = 60 * 60;
 /// Delay before a deferred re-embed chain revisits its own row.
 pub const REEMBED_BACKFILL_REVISIT_MS: i64 = 750;
 
-/// Outcome of the external `extract_chunk` step (LLM scoring + admission +
-/// score/lifecycle persistence). The queue uses it to decide the follow-up.
+/// Outcome of the external `extract_chunk` computation (LLM scoring +
+/// admission). The queue uses it to decide the follow-up.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ExtractDecision {
     /// Whether the chunk was admitted into the tree pipeline.
@@ -183,42 +183,29 @@ pub struct DelegateOutput<T> {
 }
 
 /// The external, heavy-work seam for the queue handlers. Every method is the
-/// part the queue cannot do itself (it needs `memory_tree` / `memory_score` /
-/// `memory_store` internals). Implementations must be deterministic enough for
-/// tests; production impls wire the real subsystems.
-///
-/// ## Idempotency contract
-///
-/// The queue is at-least-once: a crash or `SQLITE_BUSY` after a delegate
-/// method has run its side effect but before parent settlement commits leaves
-/// the row `running` past its lease, so
-/// [`recover_stale_locks`](crate::memory::queue::store_settle::recover_stale_locks)
-/// puts it back to `ready` and the whole handler — including this delegate
-/// call — runs again. Follow-up jobs are committed atomically with settlement,
-/// but external/LLM delegate work cannot share that SQLite transaction.
-/// Implementations MUST therefore make their side effects safe to repeat:
-/// upsert rather than insert, treat
-/// "already applied" as success, and avoid effects that are observably wrong
-/// the second time (e.g. re-running a paid LLM call is wasteful but not
-/// incorrect; double-appending a chunk into a tree would be).
+/// part the queue cannot do itself (it needs host-owned inference and domain
+/// computation). Methods returning [`DelegateOutput`] are compute-only: their
+/// mutations are committed together with the job receipt and follow-up
+/// intents. Expensive inference may be repeated after a crash, so it should be
+/// deterministic where possible, but delegates must not persist domain state.
 #[async_trait]
 pub trait QueueDelegates: Send + Sync {
-    /// Score + admit one chunk and persist its score/lifecycle. `Ok(None)` when
-    /// the chunk row is missing (a no-op `Done`).
+    /// Score + admit one chunk and return score/lifecycle mutations without
+    /// persisting them. `Ok(None)` when the chunk row is missing.
     async fn extract_chunk(
         &self,
         config: &MemoryConfig,
         chunk_id: &str,
-    ) -> Result<Option<ExtractDecision>>;
+    ) -> Result<Option<DelegateOutput<ExtractDecision>>>;
 
-    /// Push a node into its target buffer. `Ok(None)` when the node or target
-    /// tree is missing (a no-op `Done`).
+    /// Compute a node's buffer append and return its mutations without
+    /// persisting them. `Ok(None)` when the node or target tree is missing.
     async fn append_node(
         &self,
         config: &MemoryConfig,
         node: &NodeRef,
         target: &AppendTarget,
-    ) -> Result<Option<AppendDecision>>;
+    ) -> Result<Option<DelegateOutput<AppendDecision>>>;
 
     /// Seal one buffer level. Returns the parent-level `SealPayload` to enqueue
     /// when the seal cascades, else `None`.
@@ -256,11 +243,12 @@ pub trait QueueDelegates: Send + Sync {
     fn has_uncovered_reembed_work(&self, config: &MemoryConfig, signature: &str) -> Result<bool>;
 }
 
-/// Handler outcome plus durable follow-up jobs. The worker commits all
-/// follow-ups in the same transaction that marks the parent job done.
+/// Handler outcome, compute-only domain mutations, and durable follow-up jobs.
+/// The worker commits all three with the lease-fenced job receipt.
 pub(crate) struct JobPlan {
     pub outcome: JobOutcome,
     pub follow_ups: Vec<NewJob>,
+    pub mutations: Vec<StateChange>,
 }
 
 impl JobPlan {
@@ -268,6 +256,7 @@ impl JobPlan {
         Self {
             outcome: JobOutcome::Done,
             follow_ups,
+            mutations: Vec::new(),
         }
     }
 
@@ -275,6 +264,7 @@ impl JobPlan {
         Self {
             outcome,
             follow_ups: Vec::new(),
+            mutations: Vec::new(),
         }
     }
 }
@@ -333,10 +323,16 @@ async fn handle_extract(
     delegates: &dyn QueueDelegates,
 ) -> Result<JobPlan> {
     let payload: ExtractChunkPayload = parse_payload(job, "ExtractChunk")?;
-    let Some(decision) = delegates.extract_chunk(config, &payload.chunk_id).await? else {
+    let Some(output) = delegates.extract_chunk(config, &payload.chunk_id).await? else {
         // Chunk row vanished between enqueue and claim — nothing to do.
         return Ok(JobPlan::done(Vec::new()));
     };
+    let decision = output.result;
+    let mutations = output
+        .mutations
+        .into_iter()
+        .map(JobMutation::into_state_change)
+        .collect();
 
     let mut follow_ups = Vec::new();
 
@@ -363,7 +359,11 @@ async fn handle_extract(
         }
     }
 
-    Ok(JobPlan::done(follow_ups))
+    Ok(JobPlan {
+        outcome: JobOutcome::Done,
+        follow_ups,
+        mutations,
+    })
 }
 
 async fn handle_append_buffer(
@@ -372,13 +372,19 @@ async fn handle_append_buffer(
     delegates: &dyn QueueDelegates,
 ) -> Result<JobPlan> {
     let payload: AppendBufferPayload = parse_payload(job, "AppendBuffer")?;
-    let Some(decision) = delegates
+    let Some(output) = delegates
         .append_node(config, &payload.node, &payload.target)
         .await?
     else {
         // Missing chunk/summary, or the target topic tree was archived — drop.
         return Ok(JobPlan::done(Vec::new()));
     };
+    let decision = output.result;
+    let mutations = output
+        .mutations
+        .into_iter()
+        .map(JobMutation::into_state_change)
+        .collect();
 
     let mut follow_ups = Vec::new();
     if decision.should_seal {
@@ -389,7 +395,11 @@ async fn handle_append_buffer(
         };
         follow_ups.push(NewJob::seal(&seal)?);
     }
-    Ok(JobPlan::done(follow_ups))
+    Ok(JobPlan {
+        outcome: JobOutcome::Done,
+        follow_ups,
+        mutations,
+    })
 }
 
 /// Run the `Seal` handler for exactly one buffer level.
