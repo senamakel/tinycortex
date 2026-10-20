@@ -12,11 +12,14 @@
 //! - `semantic` — heading- and paragraph-aware chunker used to split large
 //!   documents into LLM-context-sized pieces while preserving heading context.
 //!   Exported as [`chunk_semantic`].
-//! - `store` / `connection` / `migrations` / `raw_refs` / `embeddings` /
-//!   `embeddings_query` — the SQLite-backed chunk store (the `mem_tree_chunks`
-//!   table plus its per-model embedding sidecars and source ingest gates).
-//!   `embeddings` owns the writes and re-embed tombstones; `embeddings_query`
-//!   owns the signature-aware reads and the re-embed coverage probe.
+//! - `store` / `versioned` / `collections` — chunks and associated state in
+//!   the host document store, exposed through an immutable operation chain
+//!   and one compare-and-swap commit head.
+//! - `connection` / `migrations` / `recovery` and several transaction helpers
+//!   still support transaction-coupled chunks, tree, score, and queue paths
+//!   that are being migrated together.
+//! - `embeddings` / `embeddings_query` — versioned chunk vectors and
+//!   re-embed skips; summary embedding adjuncts remain with the tree store.
 //!
 //! ## Differences from OpenHuman
 //!
@@ -33,6 +36,7 @@ use std::time::Duration;
 
 use crate::memory::config::MemoryConfig;
 
+pub(crate) mod collections;
 mod schema;
 
 #[path = "connection.rs"]
@@ -63,7 +67,8 @@ mod store;
 mod store_delete;
 mod store_list;
 #[path = "store_sources.rs"]
-mod store_sources;
+pub(crate) mod store_sources;
+pub(crate) mod versioned;
 
 /// The persisted chunk value types now live in the dependency-light
 /// `tinycortex-api` crate. Aliasing the whole module (rather than importing
@@ -87,6 +92,8 @@ mod store_list_tests;
 #[cfg(test)]
 #[path = "store_tests.rs"]
 mod store_tests;
+#[cfg(test)]
+pub(crate) mod test_support;
 
 // ── Public API surface ───────────────────────────────────────────────────────
 
@@ -97,6 +104,7 @@ pub use types::{
     Chunk, DataSource, Metadata, SourceKind, SourceRef, StagedChunk,
 };
 
+pub use collections::collections;
 pub use connection::{shared_connection, with_connection};
 pub use embeddings::{
     clear_chunk_reembed_skipped, clear_reembed_skipped_for_signature,
@@ -122,14 +130,14 @@ pub use signature::{
     format_signature, parse_signature, signature_variants, signatures_equivalent, SignatureParts,
 };
 pub use store::{
-    claim_source_ingest_tx, count_chunks, count_chunks_by_lifecycle_status,
+    claim_source_ingest, claim_source_ingest_tx, count_chunks, count_chunks_by_lifecycle_status,
     count_raw_paths_ingested_with_prefix, delete_source_ingest, extraction_coverage,
-    filter_raw_paths_not_ingested, get_chunk, get_chunk_lifecycle_status, get_chunks_batch,
-    is_source_ingested, list_source_ids_with_prefix, mark_raw_paths_ingested,
-    set_chunk_lifecycle_status, update_chunk_content_sha256, update_summary_content_sha256,
-    upsert_chunks, upsert_chunks_tx, upsert_staged_chunks_tx, CHUNK_STATUS_ADMITTED,
-    CHUNK_STATUS_BUFFERED, CHUNK_STATUS_DROPPED, CHUNK_STATUS_PENDING_EXTRACTION,
-    CHUNK_STATUS_SEALED, RAW_FILE_GATE_KIND,
+    filter_raw_paths_not_ingested, get_chunk, get_chunk_async, get_chunk_lifecycle_status,
+    get_chunks_batch, get_chunks_batch_async, is_source_ingested, list_source_ids_with_prefix,
+    mark_raw_paths_ingested, set_chunk_lifecycle_status, update_chunk_content_sha256,
+    update_summary_content_sha256, upsert_chunks, upsert_chunks_tx, upsert_staged_chunks_tx,
+    CHUNK_STATUS_ADMITTED, CHUNK_STATUS_BUFFERED, CHUNK_STATUS_DROPPED,
+    CHUNK_STATUS_PENDING_EXTRACTION, CHUNK_STATUS_SEALED, RAW_FILE_GATE_KIND,
 };
 pub(crate) use store_delete::remove_unreferenced_content_files;
 pub use store_delete::{

@@ -1,4 +1,4 @@
-//! Signature-aware embedding **read** queries for the chunk store.
+//! Signature-aware host-document embedding **read** queries for chunk vectors.
 //!
 //! Split out of `embeddings` so that module stays a focused writer-side
 //! accessor and re-embed tombstone store, and this one owns the per-signature
@@ -7,13 +7,15 @@
 //! conventions can still see its own prior vectors.
 //!
 //! No embeddings are computed here — embeddings.rs takes vectors on the write
-//! side; this module only reads them back.
+//! side; this module only reads them back. The tree-owned re-embed coverage
+//! probe still accepts a SQLite connection while that coupled migration lands.
 
-use super::connection::with_connection;
-use super::embeddings::tree_active_signature;
+use super::collections::CHUNK_EMBEDDINGS;
+use super::embeddings::{chunk_embedding_key, tree_active_signature, ChunkEmbeddingRecord};
 use super::signature::{signature_in_clause, signature_variants};
-use anyhow::{Context, Result};
-use rusqlite::{Connection, OptionalExtension};
+use super::versioned::{read_state, read_states};
+use anyhow::Result;
+use rusqlite::Connection;
 use std::collections::HashMap;
 
 use crate::memory::config::MemoryConfig;
@@ -38,29 +40,21 @@ pub fn get_chunk_embedding_for_signature(
     model_signature: &str,
 ) -> Result<Option<Vec<f32>>> {
     let variants = signature_variants(model_signature);
-    with_connection(config, |conn| {
-        let mut params: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(variants.len() + 1);
-        params.push(&chunk_id as &dyn rusqlite::ToSql);
-        for variant in &variants {
-            params.push(variant as &dyn rusqlite::ToSql);
+    for variant in variants {
+        let Some(value) = read_state(
+            config,
+            CHUNK_EMBEDDINGS,
+            &chunk_embedding_key(chunk_id, &variant),
+        )?
+        else {
+            continue;
+        };
+        let record: ChunkEmbeddingRecord = serde_json::from_value(value)?;
+        if record.chunk_id == chunk_id && record.model_signature == variant {
+            return embedding_from_blob(&record.vector, record.dim, "chunk embedding");
         }
-        let row: Option<(Vec<u8>, i64)> = conn
-            .query_row(
-                &format!(
-                    "SELECT vector, dim
-                       FROM mem_tree_chunk_embeddings
-                      WHERE chunk_id = ?1 AND model_signature {}",
-                    signature_in_clause(variants.len(), 2)
-                ),
-                params.as_slice(),
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .optional()?;
-        match row {
-            None => Ok(None),
-            Some((bytes, dim)) => embedding_from_blob(&bytes, dim, "chunk embedding"),
-        }
-    })
+    }
+    Ok(None)
 }
 
 /// Fetch a chunk's embedding for the active model signature (see
@@ -163,21 +157,14 @@ pub fn has_uncovered_reembed_work(
     )
 }
 
-/// Defensive cap for batched `IN (?,?,…)` reads, well below SQLite's
-/// `SQLITE_MAX_VARIABLE_NUMBER` (32 766).
-const MAX_EMBEDDING_BATCH: usize = 500;
-
 /// Batched read of chunk embeddings under a single `model_signature`.
 ///
 /// Returns a `HashMap<chunk_id, Vec<f32>>` containing only the chunks that have
 /// a vector under `model_signature`. Missing chunks are simply absent (callers
 /// treat that the same as a `None` from the single-row helper).
 ///
-/// `chunk_ids` is split into windows of at most `MAX_EMBEDDING_BATCH` so a
-/// single query never approaches SQLite's bound-parameter limit; each window
-/// runs as its own `SELECT ... WHERE chunk_id IN (...)` inside the same
-/// [`super::connection::with_connection`] call (not separately transacted —
-/// reads only).
+/// Each id is read against the same host-owned version chain. Missing chunks
+/// are absent from the result.
 ///
 /// # Errors
 /// Returns `Err` if `chunk_ids` is non-empty and any window's query
@@ -193,48 +180,34 @@ pub fn get_chunk_embeddings_for_signature_batch(
         return Ok(HashMap::new());
     }
     let variants = signature_variants(model_signature);
-    with_connection(config, |conn| {
-        let mut out: HashMap<String, Vec<f32>> = HashMap::with_capacity(chunk_ids.len());
-        for window in chunk_ids.chunks(MAX_EMBEDDING_BATCH) {
-            let placeholders = std::iter::repeat_n("?", window.len())
-                .collect::<Vec<_>>()
-                .join(",");
-            let sql = format!(
-                "SELECT chunk_id, vector, dim
-                   FROM mem_tree_chunk_embeddings
-                  WHERE chunk_id IN ({placeholders})
-                    AND model_signature {sig_clause}",
-                sig_clause = signature_in_clause(variants.len(), window.len() + 1),
-            );
-            let mut stmt = conn
-                .prepare(&sql)
-                .context("prepare get_chunk_embeddings_for_signature_batch")?;
-            let mut params: Vec<&dyn rusqlite::ToSql> =
-                Vec::with_capacity(window.len() + variants.len());
-            for id in window {
-                params.push(id as &dyn rusqlite::ToSql);
-            }
-            for variant in &variants {
-                params.push(variant as &dyn rusqlite::ToSql);
-            }
-            let rows = stmt
-                .query_map(params.as_slice(), |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, Vec<u8>>(1)?,
-                        row.get::<_, i64>(2)?,
-                    ))
-                })
-                .context("query get_chunk_embeddings_for_signature_batch")?;
-            for row in rows {
-                let (chunk_id, bytes, dim) = row?;
-                if let Some(v) = embedding_from_blob(&bytes, dim, "chunk embedding")? {
-                    out.insert(chunk_id, v);
+    let keys = chunk_ids
+        .iter()
+        .flat_map(|id| {
+            variants
+                .iter()
+                .map(|variant| chunk_embedding_key(id, variant))
+        })
+        .collect::<Vec<_>>();
+    let records = read_states(config, CHUNK_EMBEDDINGS, &keys)?;
+    let mut out = HashMap::with_capacity(chunk_ids.len());
+    for id in chunk_ids {
+        for variant in &variants {
+            let key = chunk_embedding_key(id, variant);
+            let Some(value) = records.get(&key) else {
+                continue;
+            };
+            let record: ChunkEmbeddingRecord = serde_json::from_value(value.clone())?;
+            if record.chunk_id == *id && record.model_signature == *variant {
+                if let Some(vector) =
+                    embedding_from_blob(&record.vector, record.dim, "chunk embedding")?
+                {
+                    out.insert(id.clone(), vector);
+                    break;
                 }
             }
         }
-        Ok(out)
-    })
+    }
+    Ok(out)
 }
 
 /// Batched read of chunk embeddings under the **active** model signature. See

@@ -231,7 +231,7 @@ pub async fn seal_one_level_with_services(
     let level = buf.level;
     let target_level = level + 1;
 
-    let inputs = hydrate_inputs(config, level, &buf.item_ids)?;
+    let inputs = hydrate_inputs(config, level, &buf.item_ids).await?;
     if inputs.is_empty() {
         anyhow::bail!(
             "refused to seal empty buffer tree_id={} level={}",

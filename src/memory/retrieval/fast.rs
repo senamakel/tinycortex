@@ -11,7 +11,7 @@ use crate::memory::score::embed::Embedder;
 use crate::memory::score::store::lookup_entity;
 use crate::memory::tree::store::{get_summaries_batch, get_tree};
 
-use super::fetch::fetch_leaves;
+use super::fetch::fetch_leaves_async;
 use super::source::query_source;
 use super::types::{hydrated_summary_hit, QueryResponse};
 
@@ -116,7 +116,7 @@ pub async fn fast_retrieve(
         )
         .await;
     }
-    resolve_local(config, candidates, source_scope, limit)
+    resolve_local(config, candidates, source_scope, limit).await
 }
 
 #[derive(Clone, Debug)]
@@ -156,7 +156,7 @@ fn local_candidates(
     Ok(output)
 }
 
-fn resolve_local(
+async fn resolve_local(
     config: &MemoryConfig,
     candidates: HashMap<String, Candidate>,
     source_scope: Option<&HashSet<String>>,
@@ -186,7 +186,7 @@ fn resolve_local(
         .collect();
     let mut by_id = HashMap::new();
     for ids in leaf_ids.chunks(config.retrieval.limits.fetch_batch_limit) {
-        for hit in fetch_leaves(config, ids)? {
+        for hit in fetch_leaves_async(config, ids).await? {
             by_id.insert(hit.node_id.clone(), hit);
         }
     }

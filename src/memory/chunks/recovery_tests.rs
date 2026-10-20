@@ -9,7 +9,7 @@ use tempfile::TempDir;
 
 fn corrupt_test_config() -> (TempDir, MemoryConfig) {
     let tmp = TempDir::new().unwrap();
-    let cfg = MemoryConfig::new(tmp.path());
+    let cfg = super::super::test_support::host_config(tmp.path());
     (tmp, cfg)
 }
 

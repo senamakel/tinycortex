@@ -2,6 +2,54 @@
 
 use super::*;
 
+#[tokio::test]
+async fn storage_preparation_requires_host_supplied_ports() {
+    let mut config = MemoryConfig::new("workspace");
+
+    let error = config.prepare_storage().await.unwrap_err();
+
+    assert!(error.to_string().contains("host-supplied storage"));
+}
+
+#[tokio::test]
+async fn storage_preparation_installs_chunk_collection_declarations() {
+    let scope = tinystoragedrivers_types::Scope::new("test:chunk-preparation").unwrap();
+    let storage = tinystoragedrivers_testkit::memory_storage(&scope);
+    let config = MemoryConfig::open_with_storage("workspace", storage)
+        .await
+        .unwrap();
+
+    for spec in crate::memory::chunks::collections() {
+        config
+            .storage()
+            .unwrap()
+            .documents()
+            .validate_collection_spec(&spec)
+            .await
+            .unwrap();
+    }
+    assert!(config
+        .storage()
+        .unwrap()
+        .queues()
+        .stats(crate::memory::queue::QUEUE_NAME)
+        .await
+        .is_ok());
+}
+
+#[test]
+fn host_bundle_is_not_exposed_before_collection_preparation() {
+    let scope = tinystoragedrivers_types::Scope::new("test:unprepared").unwrap();
+    let storage = tinystoragedrivers_testkit::memory_storage(&scope);
+    let config = MemoryConfig::new("workspace").with_storage(storage);
+
+    assert!(config
+        .storage()
+        .unwrap_err()
+        .to_string()
+        .contains("prepared"));
+}
+
 #[test]
 fn sync_secrets_are_redacted_and_not_serialized() {
     let secret = SecretString::new("super-secret");

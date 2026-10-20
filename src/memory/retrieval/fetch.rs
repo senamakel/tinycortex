@@ -13,7 +13,7 @@
 
 use anyhow::Result;
 
-use crate::memory::chunks::get_chunks_batch;
+use crate::memory::chunks::{get_chunks_batch, get_chunks_batch_async};
 use crate::memory::config::MemoryConfig;
 use crate::memory::score::store::get_scores_batch;
 
@@ -51,6 +51,33 @@ pub fn fetch_leaves(config: &MemoryConfig, chunk_ids: &[String]) -> Result<Vec<R
         // back to the chunk's own source id so consumers still see provenance.
         let scope = chunk.metadata.source_id.clone();
         out.push(hydrated_chunk_hit(config, chunk, "", &scope, score));
+    }
+    Ok(out)
+}
+
+/// Async counterpart used from retrieval routines hosted on Tokio runtimes.
+pub async fn fetch_leaves_async(
+    config: &MemoryConfig,
+    chunk_ids: &[String],
+) -> Result<Vec<RetrievalHit>> {
+    if chunk_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let max_batch = config.retrieval.limits.fetch_batch_limit;
+    let ids: &[String] = if chunk_ids.len() > max_batch {
+        &chunk_ids[..max_batch]
+    } else {
+        chunk_ids
+    };
+    let chunk_by_id = get_chunks_batch_async(config, ids).await?;
+    let score_by_id = get_scores_batch(config, ids)?;
+    let mut out = Vec::with_capacity(ids.len());
+    for id in ids {
+        if let Some(chunk) = chunk_by_id.get(id) {
+            let score = score_by_id.get(id).copied().unwrap_or(0.0);
+            let scope = chunk.metadata.source_id.clone();
+            out.push(hydrated_chunk_hit(config, chunk, "", &scope, score));
+        }
     }
     Ok(out)
 }

@@ -44,6 +44,7 @@ async fn run_once_parks_unparseable_payload_as_unrecoverable() {
     // it on the FIRST failure rather than burning the retry budget. FlushStale is
     // deliberately not LLM-bound, so this test never touches the shared LLM gate.
     let poison = NewJob {
+        id: None,
         kind: JobKind::FlushStale,
         payload_json: "{ this is not valid json".into(),
         dedupe_key: None,
@@ -83,6 +84,7 @@ fn pipeline_failure_downcast_fails_fast_as_unrecoverable() {
 
     let (_tmp, cfg) = test_config();
     let poison = NewJob {
+        id: None,
         kind: JobKind::FlushStale,
         payload_json: "{}".into(),
         dedupe_key: None,

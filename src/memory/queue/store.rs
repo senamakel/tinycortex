@@ -74,7 +74,10 @@ pub(crate) fn enqueue_conn(
     job: &NewJob,
     default_max_attempts: u32,
 ) -> Result<Option<String>> {
-    let id = format!("job:{}", Uuid::new_v4());
+    let id = job
+        .id
+        .clone()
+        .unwrap_or_else(|| format!("job:{}", Uuid::new_v4()));
     let now_ms = Utc::now().timestamp_millis();
     let available_at = job.available_at_ms.unwrap_or(now_ms);
     let max_attempts = job.max_attempts.unwrap_or(default_max_attempts) as i64;

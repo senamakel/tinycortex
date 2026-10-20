@@ -2,21 +2,23 @@
 //!
 //! [`RawRef`] lets ingest pipelines mirror full message bodies to on-disk
 //! archives under `<content_root>/raw/` while storing only a ≤500-char preview
-//! in the SQLite `content` column. Retrieval reads the archive directly instead
-//! of going through the SQL preview path.
+//! in the chunk record. Retrieval reads the archive directly instead of using
+//! the inline preview.
 //!
-//! For email chunks, the raw archive referenced by `raw_refs_json` is the
-//! *only* copy of the message body — the SQLite `content` column holds just
-//! the preview. This module only reads/writes the pointers; it does not
+//! For email chunks, the raw archive referenced by the versioned raw-ref state
+//! is the *only* copy of the message body — the chunk record holds just the
+//! preview. This module only reads/writes the pointers; it does not
 //! delete the archive files themselves. Chunk deletion
 //! ([`super::store_delete`]) owns reachability-based cleanup of unreferenced
 //! raw files and their ingest-gate rows.
 
-use anyhow::{Context, Result};
-use rusqlite::{params, OptionalExtension, Transaction};
+use rusqlite::{params, OptionalExtension};
 
+use super::collections::{CHUNK_CONTENT_POINTERS, RAW_REFS};
 use super::connection::with_connection;
+use super::versioned::{list_state, read_state, write_state, StateChange};
 use crate::memory::config::MemoryConfig;
+use anyhow::{Context, Result};
 
 /// One pointer into the raw archive. A chunk's body is reconstructed by reading
 /// each [`RawRef`] in order and joining with `"\n\n"`.
@@ -24,7 +26,7 @@ use crate::memory::config::MemoryConfig;
 /// `start` / `end` are byte offsets into the raw `.md` file. `end = None` means
 /// "read to end of file". Both default to "the whole file" (`start = 0`,
 /// `end = None`).
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RawRef {
     /// Forward-slash relative path under `<content_root>/`.
     pub path: String,
@@ -36,22 +38,31 @@ pub struct RawRef {
     pub end: Option<usize>,
 }
 
-/// Stash a list of [`RawRef`] entries on a chunk row. Replaces any previous
+#[derive(serde::Deserialize)]
+struct ChunkContentPointer {
+    chunk_id: String,
+    content_path: String,
+    content_sha256: String,
+}
+
+/// Stash a list of [`RawRef`] entries on a chunk. Replaces any previous
 /// value (last write wins; not additive).
 ///
 /// # Errors
-/// Returns `Err` if `refs` fails to serialize (practically unreachable — the
-/// type has no fallible `Serialize` impl) or the `UPDATE` fails. Silently
-/// affects zero rows (no error) if `chunk_id` does not exist.
+/// Returns `Err` if serialization or host storage fails. Silently affects no
+/// state if `chunk_id` does not exist.
 pub fn set_chunk_raw_refs(config: &MemoryConfig, chunk_id: &str, refs: &[RawRef]) -> Result<()> {
-    let json = serde_json::to_string(refs).context("serialize raw_refs")?;
-    with_connection(config, |conn| {
-        conn.execute(
-            "UPDATE mem_tree_chunks SET raw_refs_json = ?1 WHERE id = ?2",
-            params![json, chunk_id],
-        )?;
-        Ok(())
-    })
+    if super::versioned::get_chunk(config, chunk_id)?.is_none() {
+        return Ok(());
+    }
+    write_state(
+        config,
+        StateChange {
+            collection: RAW_REFS.into(),
+            key: chunk_id.into(),
+            value: Some(serde_json::to_value(refs).context("serialize raw_refs")?),
+        },
+    )
 }
 
 /// Stash raw archive pointers on a chunk row inside a caller-owned
@@ -59,57 +70,40 @@ pub fn set_chunk_raw_refs(config: &MemoryConfig, chunk_id: &str, refs: &[RawRef]
 ///
 /// # Errors
 /// See [`set_chunk_raw_refs`].
-pub fn set_chunk_raw_refs_tx(tx: &Transaction<'_>, chunk_id: &str, refs: &[RawRef]) -> Result<()> {
-    let json = serde_json::to_string(refs).context("serialize raw_refs")?;
-    tx.execute(
-        "UPDATE mem_tree_chunks SET raw_refs_json = ?1 WHERE id = ?2",
-        params![json, chunk_id],
-    )?;
-    Ok(())
+pub fn set_chunk_raw_refs_tx(
+    _tx: &rusqlite::Transaction<'_>,
+    _chunk_id: &str,
+    _refs: &[RawRef],
+) -> Result<()> {
+    anyhow::bail!("raw refs must be committed with host storage, not a SQLite transaction")
 }
 
-/// Return the raw-archive pointers stored in SQLite for `chunk_id`, or `None`
-/// if no `raw_refs_json` was recorded (row missing, column NULL, or empty
-/// string are all treated as "none").
+/// Return the raw-archive pointers stored for `chunk_id`, or `None` if no raw
+/// reference state was recorded.
 ///
 /// # Errors
-/// Returns `Err` if the query fails, or if a non-empty `raw_refs_json` value
-/// fails to deserialize as `Vec<RawRef>` (a malformed/corrupt row — this is
+/// Returns `Err` if the host read fails or the stored value fails to deserialize
+/// as `Vec<RawRef>` (a malformed/corrupt record — this is
 /// surfaced as an error here, unlike [`list_chunk_raw_ref_paths_with_prefix`]
 /// which tolerates the same failure per-row).
 pub fn get_chunk_raw_refs(config: &MemoryConfig, chunk_id: &str) -> Result<Option<Vec<RawRef>>> {
-    with_connection(config, |conn| {
-        let row = conn
-            .query_row(
-                "SELECT raw_refs_json FROM mem_tree_chunks WHERE id = ?1",
-                params![chunk_id],
-                |r| r.get::<_, Option<String>>(0),
-            )
-            .optional()?
-            .flatten();
-        match row {
-            Some(json) if !json.is_empty() => {
-                let refs: Vec<RawRef> =
-                    serde_json::from_str(&json).context("deserialize raw_refs_json")?;
-                Ok(Some(refs))
-            }
-            _ => Ok(None),
-        }
-    })
+    read_state(config, RAW_REFS, chunk_id)?
+        .map(serde_json::from_value)
+        .transpose()
+        .context("deserialize raw refs")
 }
 
-/// Collect every raw-archive path referenced by ANY chunk row whose
-/// `raw_refs_json` is set, restricted to paths under `rel_prefix`. Rust-side
+/// Collect every raw-archive path referenced by any chunk raw-ref record,
+/// restricted to paths under `rel_prefix`. Rust-side
 /// prefix filter so `_` / `%` in slugs are treated literally (a SQL `LIKE`
 /// prefix would otherwise treat those as wildcard metacharacters).
 ///
-/// Scans the full `mem_tree_chunks` table (every row with non-empty
-/// `raw_refs_json`) — there is no index on the JSON contents, so this cost
-/// scales with total chunk count, not with the number of matching paths.
+/// Scans the raw-ref state namespace, so cost scales with stored raw-ref
+/// records rather than the number of matching paths.
 ///
 /// # Errors
-/// Returns `Err` only if the query itself fails (statement prepare/execute).
-/// A row whose `raw_refs_json` fails to deserialize is silently skipped
+/// Returns `Err` only if a host read fails. A value that fails to deserialize
+/// is silently skipped
 /// rather than failing the whole scan, so a corrupt individual row cannot
 /// block coverage computation — but its paths are also invisible to the
 /// caller as a result.
@@ -117,28 +111,20 @@ pub fn list_chunk_raw_ref_paths_with_prefix(
     config: &MemoryConfig,
     rel_prefix: &str,
 ) -> Result<std::collections::HashSet<String>> {
-    with_connection(config, |conn| {
-        let mut stmt = conn.prepare(
-            "SELECT raw_refs_json FROM mem_tree_chunks \
-              WHERE raw_refs_json IS NOT NULL AND raw_refs_json != ''",
-        )?;
-        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
-        let mut out: std::collections::HashSet<String> = std::collections::HashSet::new();
-        for row in rows {
-            let json = row?;
-            if let Ok(refs) = serde_json::from_str::<Vec<RawRef>>(&json) {
-                for raw_ref in refs {
-                    if raw_ref.path.starts_with(rel_prefix) {
-                        out.insert(raw_ref.path);
-                    }
+    let mut out = std::collections::HashSet::new();
+    for (_, value) in list_state(config, RAW_REFS)? {
+        if let Ok(refs) = serde_json::from_value::<Vec<RawRef>>(value) {
+            for raw_ref in refs {
+                if raw_ref.path.starts_with(rel_prefix) {
+                    out.insert(raw_ref.path);
                 }
             }
         }
-        Ok(out)
-    })
+    }
+    Ok(out)
 }
 
-/// Return both `content_path` and `content_sha256` stored in SQLite for
+/// Return both `content_path` and `content_sha256` stored in host state for
 /// `chunk_id`.
 ///
 /// Returns `None` when the row is missing, either column is SQL NULL, or the
@@ -152,23 +138,17 @@ pub fn get_chunk_content_pointers(
     config: &MemoryConfig,
     chunk_id: &str,
 ) -> Result<Option<(String, String)>> {
-    with_connection(config, |conn| {
-        let row = conn
-            .query_row(
-                "SELECT content_path, content_sha256 FROM mem_tree_chunks WHERE id = ?1",
-                params![chunk_id],
-                |r| {
-                    let path: Option<String> = r.get(0)?;
-                    let sha: Option<String> = r.get(1)?;
-                    Ok((path, sha))
-                },
-            )
-            .optional()?;
-        Ok(row.and_then(|(p, s)| p.zip(s).filter(|(path, _)| !path.is_empty())))
-    })
+    let Some(value) = read_state(config, CHUNK_CONTENT_POINTERS, chunk_id)? else {
+        return Ok(None);
+    };
+    let pointer: ChunkContentPointer = serde_json::from_value(value)?;
+    if pointer.chunk_id != chunk_id || pointer.content_path.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some((pointer.content_path, pointer.content_sha256)))
 }
 
-/// Return the `content_path` stored in SQLite for `chunk_id`, if any.
+/// Return the `content_path` stored in host state for `chunk_id`, if any.
 ///
 /// Empty strings are normalised to `None`, matching
 /// [`get_chunk_content_pointers`].
@@ -176,17 +156,7 @@ pub fn get_chunk_content_pointers(
 /// # Errors
 /// Returns `Err` only if the underlying query fails.
 pub fn get_chunk_content_path(config: &MemoryConfig, chunk_id: &str) -> Result<Option<String>> {
-    with_connection(config, |conn| {
-        let row = conn
-            .query_row(
-                "SELECT content_path FROM mem_tree_chunks WHERE id = ?1",
-                params![chunk_id],
-                |r| r.get::<_, Option<String>>(0),
-            )
-            .optional()?
-            .flatten();
-        Ok(row.filter(|path| !path.is_empty()))
-    })
+    Ok(get_chunk_content_pointers(config, chunk_id)?.map(|(path, _)| path))
 }
 
 /// Return both `content_path` and `content_sha256` stored in SQLite for

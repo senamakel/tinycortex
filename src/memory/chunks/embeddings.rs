@@ -1,22 +1,24 @@
 //! Per-(chunk, embedding-model) vector accessors and re-embed tombstones.
 //!
-//! Embeddings are stored in the `mem_tree_chunk_embeddings` sidecar table keyed
-//! by `(chunk_id, model_signature)` so multiple vector spaces can coexist. This
-//! module is pure storage: it does not compute embeddings (that backend is not
-//! ported here) — callers pass vectors in. The signature-aware *read* side
-//! lives in the [`super::embeddings_query`] sibling, which this module's
-//! re-exports also expose at the `chunks` level.
+//! Chunk embeddings and re-embed skips are versioned host-document records
+//! keyed by `(chunk_id, model_signature)` so multiple vector spaces can
+//! coexist. This module does not compute embeddings — callers pass vectors in.
+//! Summary embedding adjuncts remain with the tree's SQLite store until that
+//! coupled tree migration lands. Signature-aware chunk reads live in the
+//! [`super::embeddings_query`] sibling.
 
+use super::collections::{CHUNK_EMBEDDINGS, CHUNK_REEMBED_SKIPS};
 use super::connection::with_connection;
 use super::signature::format_signature;
+use super::versioned::{list_state, write_chunk_state_changes, write_state_changes, StateChange};
 use anyhow::{Context, Result};
 use chrono::Utc;
 use rusqlite::Connection;
+use serde::{Deserialize, Serialize};
 
 use crate::memory::config::MemoryConfig;
 
-/// The active embedding vector dimension for `config`. Drives the legacy
-/// migration's dim-match decision.
+/// The active embedding vector dimension for `config`.
 pub(crate) fn active_embedding_dims(config: &MemoryConfig) -> usize {
     config.embedding.dim
 }
@@ -52,45 +54,11 @@ pub fn set_chunk_embedding(config: &MemoryConfig, chunk_id: &str, embedding: &[f
     set_chunk_embedding_for_signature(config, chunk_id, &signature, embedding)
 }
 
-/// Core upsert into `mem_tree_chunk_embeddings` over an arbitrary `&Connection`.
-/// `rusqlite::Transaction` derefs to `Connection`, so an in-tx caller passes
-/// `&tx` and the sidecar row commits atomically with the surrounding work.
-///
-/// # Errors
-/// Returns `Err` if `embedding.len()` overflows `i64` (practically
-/// unreachable) or the `INSERT ... ON CONFLICT` statement fails.
-fn upsert_chunk_embedding_conn(
-    conn: &Connection,
-    chunk_id: &str,
-    model_signature: &str,
-    embedding: &[f32],
-) -> Result<()> {
-    let bytes = embedding_to_blob(embedding);
-    let dim = i64::try_from(embedding.len()).context("embedding dimension does not fit i64")?;
-    let created_at = Utc::now().timestamp_millis() as f64 / 1000.0;
-    conn.execute(
-        "INSERT INTO mem_tree_chunk_embeddings
-             (chunk_id, model_signature, vector, dim, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5)
-             ON CONFLICT(chunk_id, model_signature) DO UPDATE SET
-                vector = excluded.vector,
-                dim = excluded.dim,
-                created_at = excluded.created_at",
-        rusqlite::params![chunk_id, model_signature, bytes, dim, created_at],
-    )?;
-    conn.execute(
-        "DELETE FROM mem_tree_chunk_reembed_skipped
-          WHERE chunk_id = ?1 AND model_signature = ?2",
-        rusqlite::params![chunk_id, model_signature],
-    )?;
-    Ok(())
-}
-
 /// Core upsert into `mem_tree_summary_embeddings` over an arbitrary
 /// `&Connection`. Used only by the legacy→sidecar migration here.
 ///
 /// # Errors
-/// See [`upsert_chunk_embedding_conn`] (identical failure modes).
+/// Returns `Err` if serializing the vector fails or the SQLite write fails.
 fn upsert_summary_embedding_conn(
     conn: &Connection,
     summary_id: &str,
@@ -119,30 +87,57 @@ fn upsert_summary_embedding_conn(
 /// same key; the latest call wins.
 ///
 /// # Errors
-/// See [`set_chunk_embedding`].
+/// Returns an error if the dimension cannot be represented or the host store
+/// rejects the write. The target chunk must exist at the committed head.
 pub fn set_chunk_embedding_for_signature(
     config: &MemoryConfig,
     chunk_id: &str,
     model_signature: &str,
     embedding: &[f32],
 ) -> Result<()> {
-    with_connection(config, |conn| {
-        upsert_chunk_embedding_conn(conn, chunk_id, model_signature, embedding)
-    })
+    let dim = i64::try_from(embedding.len()).context("embedding dimension does not fit i64")?;
+    let key = chunk_embedding_key(chunk_id, model_signature);
+    let record = ChunkEmbeddingRecord {
+        chunk_id: chunk_id.to_owned(),
+        model_signature: model_signature.to_owned(),
+        vector: embedding_to_blob(embedding),
+        dim,
+        created_at_ms: Utc::now().timestamp_millis(),
+    };
+    if !write_chunk_state_changes(
+        config,
+        chunk_id,
+        &[
+            StateChange {
+                collection: CHUNK_EMBEDDINGS.into(),
+                key: key.clone(),
+                value: Some(serde_json::to_value(record)?),
+            },
+            StateChange {
+                collection: CHUNK_REEMBED_SKIPS.into(),
+                key,
+                value: None,
+            },
+        ],
+    )? {
+        anyhow::bail!("cannot store an embedding for missing chunk {chunk_id}");
+    }
+    Ok(())
 }
 
-/// Transaction-scoped variant of [`set_chunk_embedding_for_signature`]; the
-/// caller commits (or rolls back) `tx`.
+/// Legacy SQLite transaction seam retained for source compatibility during
+/// the tree-owned migration. Chunk embeddings cannot be written through it.
 ///
 /// # Errors
-/// Uses the same validation as the connection-scoped upsert helper.
+/// Always returns an error directing callers to host storage.
 pub fn set_chunk_embedding_for_signature_tx(
     tx: &rusqlite::Transaction<'_>,
     chunk_id: &str,
     model_signature: &str,
     embedding: &[f32],
 ) -> Result<()> {
-    upsert_chunk_embedding_conn(tx, chunk_id, model_signature, embedding)
+    let _ = (tx, chunk_id, model_signature, embedding);
+    anyhow::bail!("chunk embeddings must be committed with host storage, not a SQLite transaction")
 }
 
 /// Transaction-scoped summary embedding upsert (used by the legacy migration).
@@ -177,19 +172,24 @@ pub fn mark_chunk_reembed_skipped(
 ) -> Result<()> {
     let chunk_id = validate_reembed_skip_key("chunk_id", chunk_id)?;
     let model_signature = validate_reembed_skip_key("model_signature", model_signature)?;
-    with_connection(config, |conn| {
-        let now_ms = Utc::now().timestamp_millis();
-        conn.execute(
-            "INSERT INTO mem_tree_chunk_reembed_skipped
-                 (chunk_id, model_signature, reason, skipped_at_ms)
-                 VALUES (?1, ?2, ?3, ?4)
-                 ON CONFLICT(chunk_id, model_signature) DO UPDATE SET
-                    reason = excluded.reason,
-                    skipped_at_ms = excluded.skipped_at_ms",
-            rusqlite::params![chunk_id, model_signature, reason, now_ms],
-        )?;
-        Ok(())
-    })
+    let key = chunk_embedding_key(chunk_id, model_signature);
+    if !write_chunk_state_changes(
+        config,
+        chunk_id,
+        &[StateChange {
+            collection: CHUNK_REEMBED_SKIPS.into(),
+            key,
+            value: Some(serde_json::to_value(ChunkReembedSkip {
+                chunk_id: chunk_id.into(),
+                model_signature: model_signature.into(),
+                reason: reason.into(),
+                skipped_at_ms: Utc::now().timestamp_millis(),
+            })?),
+        }],
+    )? {
+        anyhow::bail!("cannot mark re-embedding skip for missing chunk {chunk_id}");
+    }
+    Ok(())
 }
 
 /// Remove a single chunk tombstone so re-embed backfill can retry the row.
@@ -205,14 +205,14 @@ pub fn clear_chunk_reembed_skipped(
 ) -> Result<()> {
     let chunk_id = validate_reembed_skip_key("chunk_id", chunk_id)?;
     let model_signature = validate_reembed_skip_key("model_signature", model_signature)?;
-    with_connection(config, |conn| {
-        conn.execute(
-            "DELETE FROM mem_tree_chunk_reembed_skipped
-              WHERE chunk_id = ?1 AND model_signature = ?2",
-            rusqlite::params![chunk_id, model_signature],
-        )?;
-        Ok(())
-    })
+    write_state_changes(
+        config,
+        &[StateChange {
+            collection: CHUNK_REEMBED_SKIPS.into(),
+            key: chunk_embedding_key(chunk_id, model_signature),
+            value: None,
+        }],
+    )
 }
 
 pub fn mark_summary_reembed_skipped(
@@ -270,17 +270,48 @@ pub fn clear_reembed_skipped_for_signature(
     model_signature: &str,
 ) -> Result<usize> {
     let model_signature = validate_reembed_skip_key("model_signature", model_signature)?;
+    let chunk_deletes = list_state(config, CHUNK_REEMBED_SKIPS)?
+        .into_iter()
+        .filter_map(|(key, value)| {
+            let skip: ChunkReembedSkip = serde_json::from_value(value).ok()?;
+            (skip.model_signature == model_signature).then_some(StateChange {
+                collection: CHUNK_REEMBED_SKIPS.into(),
+                key,
+                value: None,
+            })
+        })
+        .collect::<Vec<_>>();
+    let chunk_deleted = chunk_deletes.len();
+    write_state_changes(config, &chunk_deletes)?;
     with_connection(config, |conn| {
-        let chunk_deleted = conn.execute(
-            "DELETE FROM mem_tree_chunk_reembed_skipped WHERE model_signature = ?1",
-            rusqlite::params![model_signature],
-        )?;
         let summary_deleted = conn.execute(
             "DELETE FROM mem_tree_summary_reembed_skipped WHERE model_signature = ?1",
             rusqlite::params![model_signature],
         )?;
         Ok(chunk_deleted + summary_deleted)
     })
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(super) struct ChunkEmbeddingRecord {
+    pub(super) chunk_id: String,
+    pub(super) model_signature: String,
+    pub(super) vector: Vec<u8>,
+    pub(super) dim: i64,
+    pub(super) created_at_ms: i64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(super) struct ChunkReembedSkip {
+    pub(super) chunk_id: String,
+    pub(super) model_signature: String,
+    pub(super) reason: String,
+    pub(super) skipped_at_ms: i64,
+}
+
+pub(super) fn chunk_embedding_key(chunk_id: &str, model_signature: &str) -> String {
+    serde_json::to_string(&(chunk_id, model_signature))
+        .expect("a pair of strings always serializes")
 }
 
 /// Bounds attacker-controlled ids/signatures passed to reembed-skipped admin

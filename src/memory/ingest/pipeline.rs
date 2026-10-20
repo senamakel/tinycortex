@@ -15,39 +15,89 @@
 use anyhow::{anyhow, bail, Result};
 use chrono::Utc;
 
+use crate::memory::chunks::collections::{
+    CHUNK_LIFECYCLE, INGESTED_SOURCES, INGEST_OUTBOX, RAW_REFS, SCORES,
+};
+use crate::memory::chunks::versioned::{
+    commit_if_state_matches, commit_staged_chunks_if_state_matches, list_state, read_state,
+    StateChange,
+};
 use crate::memory::chunks::{
-    self, chunk_markdown, claim_source_ingest_tx, get_chunk_lifecycle_status_tx,
-    is_source_ingested, set_chunk_lifecycle_status_tx, set_chunk_raw_refs_tx,
-    upsert_staged_chunks_tx, with_connection, ChunkerInput, ChunkerOptions, SourceKind,
+    self, chunk_markdown, is_source_ingested, ChunkerInput, ChunkerOptions, SourceKind,
     CHUNK_STATUS_PENDING_EXTRACTION,
 };
 use crate::memory::config::MemoryConfig;
-use crate::memory::score::{persist_score_tx, score_chunks_fast, ScoringConfig};
+use crate::memory::score::{score_chunks_fast, ScoringConfig};
 use crate::memory::store::content;
 
 use super::canonicalize::chat::{self, ChatBatch};
 use super::canonicalize::document::{self, DocumentInput};
 use super::canonicalize::email::{self, EmailThread};
 use super::canonicalize::CanonicalisedSource;
-use super::types::{IngestOptions, IngestSummary, TreeJobSink};
+use super::types::{ExtractJobIntent, IngestOptions, IngestSummary, QueuePublication, TreeJobSink};
+
+/// Publish queue hints for every committed ingest intent that has not yet
+/// received a durable publication receipt. Re-running this function is safe:
+/// queue adapters receive the same stable intent id, including after a lost
+/// enqueue acknowledgement.
+/// Async-facade variant that performs host-store reads and receipt writes on
+/// blocking workers while keeping the borrowed sink on the caller task.
+pub async fn dispatch_pending_extract_jobs_async(
+    config: &MemoryConfig,
+    sink: &dyn TreeJobSink,
+) -> Result<usize> {
+    let read_config = config.clone();
+    let pending = tokio::task::spawn_blocking(move || list_state(&read_config, INGEST_OUTBOX))
+        .await
+        .map_err(anyhow::Error::from)??;
+    let mut published_count = 0;
+    for (key, value) in pending {
+        let intent: ExtractJobIntent = serde_json::from_value(value.clone())?;
+        if intent.published {
+            continue;
+        }
+        let publication = sink
+            .enqueue_extract(config, &intent.id, &intent.chunk_id, intent.max_attempts)
+            .await?;
+        if publication == QueuePublication::Declined {
+            continue;
+        }
+        let mut completed = intent;
+        completed.published = true;
+        let expected = StateChange {
+            collection: INGEST_OUTBOX.into(),
+            key: key.clone(),
+            value: Some(value),
+        };
+        let update = StateChange {
+            collection: INGEST_OUTBOX.into(),
+            key,
+            value: Some(serde_json::to_value(completed)?),
+        };
+        let write_config = config.clone();
+        tokio::task::spawn_blocking(move || {
+            commit_if_state_matches(&write_config, &[expected], &[], &[update])
+        })
+        .await
+        .map_err(anyhow::Error::from)??;
+        published_count += usize::from(publication == QueuePublication::Published);
+    }
+    Ok(published_count)
+}
 
 /// Run the full ingest path for an already-canonicalised source.
 ///
-/// For documents an authoritative source-level gate is claimed transactionally
-/// before any chunk is persisted; chat and email have no such gate (their
+/// For documents an authoritative source-level gate is claimed in the same
+/// host commit as chunk and outbox state; chat and email have no such gate (their
 /// `source_id` is a stream identifier under which many batches accumulate) and
 /// rely on deterministic chunk ids for replay idempotency.
 ///
 /// # Atomicity (see `docs/spec/audit/04-queue-ingest.md`)
 ///
-/// - The document gate is claimed in the same SQLite transaction as chunk,
-///   score, lifecycle, raw-reference, and extract-job persistence. Scoring and
-///   content staging happen first, so no await or filesystem operation splits
-///   the authoritative database commit.
-/// - Chunk upsert, score persistence, lifecycle transition, raw pointers, and
-///   extract-job enqueue commit in one SQLite transaction. The prior lifecycle
-///   is read inside that transaction, preventing re-ingest from resetting a
-///   chunk a worker has already admitted (QI-12).
+/// - The document gate, chunk versions, scores, lifecycle, raw references, and
+///   extract-job outbox intents commit through one host commit-head CAS.
+/// - Queue publication follows the commit. Stable hint ids and retained
+///   outbox receipts make lost acknowledgements repairable.
 /// - Chat/email logical-unit ids derive from complete message content rather
 ///   than batch-local sequence, so overlapping deliveries reuse persisted rows
 ///   and active queue dedupe keys.
@@ -60,6 +110,7 @@ pub async fn ingest_canonical(
     opts: &IngestOptions,
 ) -> Result<IngestSummary> {
     let source_kind = canonical.metadata.source_kind;
+    dispatch_pending_extract_jobs_async(config, sink).await?;
 
     // 1. Chunk the canonical markdown.
     let input = ChunkerInput {
@@ -102,66 +153,28 @@ async fn persist_score_enqueue(
         );
     }
 
-    // 5. Persist the whole database tail atomically. Snapshot lifecycle before
-    // the upsert while holding this transaction; the worker cannot advance a
-    // row between the check and its guarded re-schedule.
-    let persisted = with_connection(config, |connection| {
-        let transaction = connection.unchecked_transaction()?;
-        if source_kind == SourceKind::Document {
-            let gate_key = match opts.gate_version_ms {
-                Some(version) => format!("{source_id}@{version}"),
-                None => source_id.to_string(),
-            };
-            if !claim_source_ingest_tx(
-                &transaction,
-                source_kind,
-                &gate_key,
-                Utc::now().timestamp_millis(),
-            )? {
-                return Ok(None);
-            }
-        }
-        let prior = chunks
-            .iter()
-            .map(|chunk| get_chunk_lifecycle_status_tx(&transaction, &chunk.id))
-            .collect::<Result<Vec<_>>>()?;
-        let chunks_written = upsert_staged_chunks_tx(&transaction, &staged)?;
-
-        if let Some(refs) = opts.raw_refs.as_ref() {
-            for chunk in &chunks {
-                set_chunk_raw_refs_tx(&transaction, &chunk.id, refs)?;
-            }
-        }
-
-        let mut jobs = 0usize;
-        for ((chunk, result), pre) in chunks.iter().zip(scores.iter()).zip(prior.iter()) {
-            let needs_processing =
-                matches!(pre.as_deref(), None | Some(CHUNK_STATUS_PENDING_EXTRACTION));
-            if !needs_processing {
-                continue;
-            }
-            persist_score_tx(
-                &transaction,
-                result,
-                chunk.metadata.timestamp.timestamp_millis(),
-                None,
-            )?;
-            set_chunk_lifecycle_status_tx(
-                &transaction,
-                &chunk.id,
-                CHUNK_STATUS_PENDING_EXTRACTION,
-            )?;
-            jobs += usize::from(sink.enqueue_extract_tx(
-                &transaction,
-                &chunk.id,
-                config.queue.max_attempts,
-            )?);
-        }
-        transaction.commit()?;
-        Ok(Some((chunks_written, jobs)))
-    })?;
-
-    let Some((chunks_written, extract_jobs_enqueued)) = persisted else {
+    let persist_config = config.clone();
+    let persist_source_id = source_id.to_owned();
+    let persist_chunks = chunks.clone();
+    let persist_staged = staged.clone();
+    let persist_scores = scores.clone();
+    let persist_opts = opts.clone();
+    let publish_jobs = sink.accepts_extract_jobs();
+    let intent_ids = tokio::task::spawn_blocking(move || {
+        persist_ingest_operation(
+            &persist_config,
+            &persist_source_id,
+            source_kind,
+            &persist_chunks,
+            &persist_staged,
+            &persist_scores,
+            &persist_opts,
+            publish_jobs,
+        )
+    })
+    .await
+    .map_err(anyhow::Error::from)??;
+    let Some(intent_ids) = intent_ids else {
         let staged_paths = staged
             .iter()
             .map(|chunk| chunk.content_path.clone())
@@ -169,6 +182,25 @@ async fn persist_score_enqueue(
         chunks::remove_unreferenced_content_files(config, &staged_paths)?;
         return Ok(IngestSummary::already_ingested(source_id));
     };
+    dispatch_pending_extract_jobs_async(config, sink).await?;
+    let publication_config = config.clone();
+    let extract_jobs_enqueued = tokio::task::spawn_blocking(move || {
+        let wanted = intent_ids
+            .into_iter()
+            .collect::<std::collections::HashSet<_>>();
+        Ok::<usize, anyhow::Error>(
+            list_state(&publication_config, INGEST_OUTBOX)?
+                .into_iter()
+                .filter(|(key, value)| {
+                    wanted.contains(key)
+                        && value.get("published").and_then(serde_json::Value::as_bool) == Some(true)
+                })
+                .count(),
+        )
+    })
+    .await
+    .map_err(anyhow::Error::from)??;
+    let chunks_written = staged.len();
 
     let chunks_dropped = scores.iter().filter(|result| !result.kept).count();
     let chunk_ids = chunks.iter().map(|chunk| chunk.id.clone()).collect();
@@ -181,6 +213,141 @@ async fn persist_score_enqueue(
         extract_jobs_enqueued,
         already_ingested: false,
     })
+}
+
+fn persist_ingest_operation(
+    config: &MemoryConfig,
+    source_id: &str,
+    source_kind: SourceKind,
+    chunks: &[crate::memory::chunks::Chunk],
+    staged: &[crate::memory::chunks::StagedChunk],
+    scores: &[crate::memory::score::ScoreResult],
+    opts: &IngestOptions,
+    publish_jobs: bool,
+) -> Result<Option<Vec<String>>> {
+    let gate_key = match opts.gate_version_ms {
+        Some(version) => format!("{source_id}@{version}"),
+        None => source_id.to_string(),
+    };
+    let source_key = crate::memory::chunks::store_sources::source_gate_key(source_kind, &gate_key);
+    if source_kind == SourceKind::Document
+        && read_state(config, INGESTED_SOURCES, &source_key)?.is_some()
+    {
+        return Ok(None);
+    }
+
+    // The scoring result is ready before this retry loop. Retries only
+    // recapture state preconditions and re-stage the same persistence values.
+    for _ in 0..8 {
+        let mut expected = Vec::with_capacity(chunks.len() + 1);
+        let mut changes = Vec::new();
+        let mut intent_ids = Vec::new();
+        if source_kind == SourceKind::Document {
+            if read_state(config, INGESTED_SOURCES, &source_key)?.is_some() {
+                return Ok(None);
+            }
+            expected.push(StateChange {
+                collection: INGESTED_SOURCES.into(),
+                key: source_key.clone(),
+                value: None,
+            });
+            changes.push(StateChange {
+                collection: INGESTED_SOURCES.into(),
+                key: source_key.clone(),
+                value: Some(serde_json::json!({
+                    "source_kind": source_kind.as_str(),
+                    "source_id": gate_key,
+                    "ingested_at_ms": Utc::now().timestamp_millis(),
+                })),
+            });
+        }
+
+        let current_lifecycle = chunks
+            .iter()
+            .map(|chunk| read_state(config, CHUNK_LIFECYCLE, &chunk.id))
+            .collect::<Result<Vec<_>>>()?;
+        for ((chunk, score), lifecycle) in chunks.iter().zip(scores).zip(&current_lifecycle) {
+            expected.push(StateChange {
+                collection: CHUNK_LIFECYCLE.into(),
+                key: chunk.id.clone(),
+                value: lifecycle.clone(),
+            });
+            let status = lifecycle
+                .as_ref()
+                .and_then(|value| value.get("status"))
+                .and_then(serde_json::Value::as_str);
+            let needs_processing = matches!(status, None | Some(CHUNK_STATUS_PENDING_EXTRACTION));
+            if needs_processing {
+                changes.push(StateChange {
+                    collection: SCORES.into(),
+                    key: chunk.id.clone(),
+                    value: Some(serde_json::json!({
+                        "chunk_id": chunk.id,
+                        "total": score.total,
+                        "token_count_signal": score.signals.token_count,
+                        "unique_words_signal": score.signals.unique_words,
+                        "metadata_weight": score.signals.metadata_weight,
+                        "source_weight": score.signals.source_weight,
+                        "interaction_weight": score.signals.interaction,
+                        "entity_density": score.signals.entity_density,
+                        "dropped": !score.kept,
+                        "reason": score.drop_reason,
+                        "computed_at_ms": Utc::now().timestamp_millis(),
+                        "canonical_entities": score.canonical_entities,
+                        "llm_importance_reason": score.extracted.llm_importance_reason,
+                    })),
+                });
+                changes.push(StateChange {
+                    collection: CHUNK_LIFECYCLE.into(),
+                    key: chunk.id.clone(),
+                    value: Some(serde_json::json!({"status": CHUNK_STATUS_PENDING_EXTRACTION})),
+                });
+                if publish_jobs {
+                    use sha2::Digest;
+                    let mut digest = sha2::Sha256::new();
+                    digest.update(chunk.id.as_bytes());
+                    digest.update(item_content_hash(staged, &chunk.id).as_bytes());
+                    let intent_id = format!("job:extract:{:x}", digest.finalize());
+                    let intent = ExtractJobIntent {
+                        id: intent_id.clone(),
+                        chunk_id: chunk.id.clone(),
+                        max_attempts: config.queue.max_attempts,
+                        published: false,
+                    };
+                    changes.push(StateChange {
+                        collection: INGEST_OUTBOX.into(),
+                        key: intent_id.clone(),
+                        value: Some(serde_json::to_value(intent)?),
+                    });
+                    intent_ids.push(intent_id);
+                }
+            }
+            if let Some(refs) = opts.raw_refs.as_ref() {
+                changes.push(StateChange {
+                    collection: RAW_REFS.into(),
+                    key: chunk.id.clone(),
+                    value: Some(serde_json::to_value(refs)?),
+                });
+            }
+        }
+        if commit_staged_chunks_if_state_matches(config, staged, &expected, &changes)? {
+            return Ok(Some(intent_ids));
+        }
+    }
+    if source_kind == SourceKind::Document
+        && read_state(config, INGESTED_SOURCES, &source_key)?.is_some()
+    {
+        return Ok(None);
+    }
+    bail!("ingest persistence preconditions changed too many times")
+}
+
+fn item_content_hash(staged: &[crate::memory::chunks::StagedChunk], chunk_id: &str) -> String {
+    staged
+        .iter()
+        .find(|item| item.chunk.id == chunk_id)
+        .map(|item| item.content_sha256.clone())
+        .unwrap_or_default()
 }
 
 /// Ingest a batch of chat messages. Returns a no-op summary on an empty batch.

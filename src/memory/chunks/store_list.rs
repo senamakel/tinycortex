@@ -2,10 +2,9 @@
 //! what it matched, the detail view of the same page, and the per-source
 //! rollup over the same scope.
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 
-use super::connection::with_connection;
-use super::store::{row_to_chunk, CHUNK_STATUS_DROPPED, SELECT_COLUMNS};
+use super::store::CHUNK_STATUS_DROPPED;
 use super::types::{Chunk, SourceKind};
 use crate::memory::config::MemoryConfig;
 
@@ -83,22 +82,114 @@ pub struct ListChunksQuery {
 }
 
 /// List chunks matching all supplied filters in deterministic newest-first
-/// order. Source allowlisting is applied in SQL before the row limit.
+/// order. Results come from one captured host-storage commit snapshot, with
+/// source allowlisting applied before the page limit.
 ///
 /// # Errors
-/// Returns an error when SQLite preparation, execution, or row decoding fails.
+/// Returns an error when the host read fails or an entity predicate is
+/// requested before the host entity-index port is available.
 pub fn list_chunks(config: &MemoryConfig, query: &ListChunksQuery) -> Result<Vec<Chunk>> {
-    with_connection(config, |conn| {
-        let mut sql = format!("SELECT {SELECT_COLUMNS} FROM mem_tree_chunks WHERE 1=1");
-        let mut bound: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
-        append_filters(&mut sql, &mut bound, query)?;
-        append_page(&mut sql, &mut bound, query);
-        let params = as_params(&bound);
-        conn.prepare(&sql)?
-            .query_map(params.as_slice(), row_to_chunk)?
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .context("Failed to collect chunks")
-    })
+    let (mut chunks, _) = matching_chunks(config, query, false)?;
+    let offset = query.offset.unwrap_or(0).min(chunks.len());
+    let limit = normalized_limit(query.limit) as usize;
+    Ok(chunks.drain(offset..).take(limit).collect())
+}
+
+fn matching_chunks(
+    config: &MemoryConfig,
+    query: &ListChunksQuery,
+    include_details: bool,
+) -> Result<(
+    Vec<Chunk>,
+    std::collections::HashMap<String, Vec<(String, serde_json::Value)>>,
+)> {
+    if !query.entity_ids.is_empty() || !query.entity_kinds.is_empty() {
+        anyhow::bail!("entity-filtered chunk listing requires the host entity-index port");
+    }
+    let mut collections = Vec::new();
+    if query.exclude_dropped || include_details {
+        collections.push(super::collections::CHUNK_LIFECYCLE);
+    }
+    if include_details {
+        collections.push(super::collections::CHUNK_EMBEDDINGS);
+        collections.push(super::collections::CHUNK_CONTENT_POINTERS);
+    }
+    let (mut chunks, states) = super::versioned::list_chunk_snapshot(config, &collections)?;
+    let lifecycle = states
+        .get(super::collections::CHUNK_LIFECYCLE)
+        .into_iter()
+        .flatten()
+        .cloned()
+        .collect::<std::collections::HashMap<_, _>>();
+    chunks.retain(|chunk| {
+        if query
+            .source_kind
+            .is_some_and(|kind| kind != chunk.metadata.source_kind)
+            || query
+                .source_id
+                .as_ref()
+                .is_some_and(|id| id != &chunk.metadata.source_id)
+            || query
+                .owner
+                .as_ref()
+                .is_some_and(|owner| owner != &chunk.metadata.owner)
+            || query
+                .since_ms
+                .is_some_and(|since| chunk.metadata.timestamp.timestamp_millis() < since)
+            || query
+                .until_ms
+                .is_some_and(|until| chunk.metadata.timestamp.timestamp_millis() > until)
+            || (!query.ids.is_empty() && !query.ids.contains(&chunk.id))
+            || (!query.source_kinds.is_empty()
+                && !query.source_kinds.contains(&chunk.metadata.source_kind))
+            || (!query.source_ids.is_empty()
+                && !query.source_ids.contains(&chunk.metadata.source_id))
+        {
+            return false;
+        }
+        if let Some(scope) = &query.source_scope {
+            let is_memory_source = chunk
+                .metadata
+                .tags
+                .iter()
+                .any(|tag| tag == "memory_sources");
+            let scoped = scope.iter().any(|source| {
+                chunk.metadata.source_id == *source
+                    || chunk
+                        .metadata
+                        .source_id
+                        .starts_with(&format!("mem_src:{source}:"))
+            });
+            if is_memory_source && !scoped {
+                return false;
+            }
+        }
+        if query.exclude_dropped
+            && lifecycle.get(&chunk.id).and_then(|value| value.as_str())
+                == Some(CHUNK_STATUS_DROPPED)
+        {
+            return false;
+        }
+        if let Some(needle) = &query.content_contains {
+            if !chunk
+                .content
+                .to_ascii_lowercase()
+                .contains(&needle.to_ascii_lowercase())
+            {
+                return false;
+            }
+        }
+        true
+    });
+    chunks.sort_by(|left, right| {
+        right
+            .metadata
+            .timestamp
+            .cmp(&left.metadata.timestamp)
+            .then_with(|| left.seq_in_source.cmp(&right.seq_in_source))
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    Ok((chunks, states))
 }
 
 /// One chunk plus the per-chunk facts stored beside it in the same row.
@@ -165,42 +256,49 @@ pub fn list_chunk_details(
     config: &MemoryConfig,
     query: &ListChunksQuery,
 ) -> Result<Vec<ChunkDetailRow>> {
-    with_connection(config, |conn| {
-        let mut sql = format!(
-            "SELECT {SELECT_COLUMNS},
-                    content_path,
-                    lifecycle_status,
-                    EXISTS (SELECT 1 FROM mem_tree_chunk_embeddings e
-                             WHERE e.chunk_id = mem_tree_chunks.id)
-               FROM mem_tree_chunks WHERE 1=1"
-        );
-        let mut bound: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
-        append_filters(&mut sql, &mut bound, query)?;
-        append_page(&mut sql, &mut bound, query);
-        let params = as_params(&bound);
-        conn.prepare(&sql)?
-            .query_map(params.as_slice(), |row| {
-                Ok(ChunkDetailRow {
-                    chunk: row_to_chunk(row)?,
-                    content_path: row
-                        .get::<_, Option<String>>(DETAIL_CONTENT_PATH_COLUMN)?
-                        .filter(|path| !path.is_empty()),
-                    lifecycle_status: row.get(DETAIL_LIFECYCLE_STATUS_COLUMN)?,
-                    has_embedding: row.get::<_, i64>(DETAIL_HAS_EMBEDDING_COLUMN)? != 0,
-                })
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .context("Failed to collect chunk details")
-    })
+    let (chunks, states) = matching_chunks(config, query, true)?;
+    let lifecycle = states
+        .get(super::collections::CHUNK_LIFECYCLE)
+        .into_iter()
+        .flatten()
+        .cloned()
+        .collect::<std::collections::HashMap<_, _>>();
+    let embeddings = states
+        .get(super::collections::CHUNK_EMBEDDINGS)
+        .into_iter()
+        .flatten()
+        .cloned()
+        .collect::<Vec<_>>();
+    let embedded_ids = embeddings
+        .into_iter()
+        .filter_map(|(_, value)| value.get("chunk_id")?.as_str().map(str::to_owned))
+        .collect::<std::collections::HashSet<_>>();
+    let content_paths = states
+        .get(super::collections::CHUNK_CONTENT_POINTERS)
+        .into_iter()
+        .flatten()
+        .filter_map(|(key, value)| {
+            let id = value.get("chunk_id")?.as_str()?;
+            if id != key {
+                return None;
+            }
+            let path = value.get("content_path")?.as_str()?;
+            (!path.is_empty()).then_some((id.to_owned(), path.to_owned()))
+        })
+        .collect::<std::collections::HashMap<_, _>>();
+    Ok(chunks
+        .into_iter()
+        .map(|chunk| ChunkDetailRow {
+            lifecycle_status: lifecycle
+                .get(&chunk.id)
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned),
+            has_embedding: embedded_ids.contains(&chunk.id),
+            content_path: content_paths.get(&chunk.id).cloned(),
+            chunk,
+        })
+        .collect())
 }
-
-// The three columns `list_chunk_details` selects past `SELECT_COLUMNS`, whose
-// fourteen columns `row_to_chunk` consumes as `0..=13`. Named rather than
-// spelled inline so adding a column to `SELECT_COLUMNS` moves them in one
-// place instead of silently shifting what each `row.get` reads.
-const DETAIL_CONTENT_PATH_COLUMN: usize = 14;
-const DETAIL_LIFECYCLE_STATUS_COLUMN: usize = 15;
-const DETAIL_HAS_EMBEDDING_COLUMN: usize = 16;
 
 /// How many rows [`list_chunks`] would match for `query`, ignoring its `limit`
 /// and `offset`.
@@ -216,16 +314,7 @@ const DETAIL_HAS_EMBEDDING_COLUMN: usize = 16;
 /// # Errors
 /// Returns an error when SQLite preparation or execution fails.
 pub fn count_chunks_matching(config: &MemoryConfig, query: &ListChunksQuery) -> Result<u64> {
-    with_connection(config, |conn| {
-        let mut sql = String::from("SELECT COUNT(*) FROM mem_tree_chunks WHERE 1=1");
-        let mut bound: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
-        append_filters(&mut sql, &mut bound, query)?;
-        let params = as_params(&bound);
-        let total: i64 = conn
-            .query_row(&sql, params.as_slice(), |row| row.get(0))
-            .context("Failed to count chunks")?;
-        Ok(total.max(0) as u64)
-    })
+    Ok(matching_chunks(config, query, false)?.0.len() as u64)
 }
 
 /// What the store holds under one `(source_kind, source_id)` pair.
@@ -266,250 +355,39 @@ pub fn source_totals(
     limit: Option<usize>,
     scope: Option<&std::collections::HashSet<String>>,
 ) -> Result<Vec<SourceTotal>> {
-    with_connection(config, |conn| {
-        let mut sql = String::from(
-            "SELECT source_kind, source_id, COUNT(*) AS chunk_count,
-                    MAX(timestamp_ms) AS last_timestamp_ms
-               FROM mem_tree_chunks WHERE 1=1",
-        );
-        let mut bound: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
-        append_source_scope(&mut sql, &mut bound, scope);
-        sql.push_str(
-            " GROUP BY source_kind, source_id
-              ORDER BY last_timestamp_ms DESC, chunk_count DESC,
-                       source_kind ASC, source_id ASC
-              LIMIT ?",
-        );
-        bound.push(Box::new(normalized_limit(limit)));
-        let params = as_params(&bound);
-        conn.prepare(&sql)?
-            .query_map(params.as_slice(), |row| {
-                let stored_kind: String = row.get(0)?;
-                let source_kind = SourceKind::parse(&stored_kind).map_err(|error| {
-                    rusqlite::Error::FromSqlConversionFailure(
-                        0,
-                        rusqlite::types::Type::Text,
-                        error.into(),
-                    )
-                })?;
-                let chunk_count: i64 = row.get(2)?;
-                Ok(SourceTotal {
-                    source_kind,
-                    source_id: row.get(1)?,
-                    chunk_count: chunk_count.max(0) as u64,
-                    last_timestamp_ms: row.get(3)?,
-                })
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .context("Failed to collect source totals")
-    })
-}
-
-/// Append every `WHERE` term the query asks for, binding in the same order.
-///
-/// Shared by [`list_chunks`], [`list_chunk_details`] and
-/// [`count_chunks_matching`]: everything that decides *which* rows match lives
-/// here, and nothing that decides how many of them are returned does. Ordering
-/// and the page bounds stay in [`append_page`] because the count deliberately
-/// ignores them — `limit` is a property of the page, not of the result set.
-///
-/// # Errors
-/// Returns an error when a list predicate's values cannot be encoded as the
-/// JSON array they are bound as.
-fn append_filters(
-    sql: &mut String,
-    bound: &mut Vec<Box<dyn rusqlite::ToSql>>,
-    query: &ListChunksQuery,
-) -> Result<()> {
-    if let Some(kind) = query.source_kind {
-        sql.push_str(" AND source_kind = ?");
-        bound.push(Box::new(kind.as_str().to_string()));
+    let chunks = matching_chunks(
+        config,
+        &ListChunksQuery {
+            source_scope: scope.cloned(),
+            ..Default::default()
+        },
+        false,
+    )?
+    .0;
+    let mut totals = std::collections::HashMap::<(SourceKind, String), SourceTotal>::new();
+    for chunk in chunks {
+        let key = (chunk.metadata.source_kind, chunk.metadata.source_id.clone());
+        let timestamp_ms = chunk.metadata.timestamp.timestamp_millis();
+        let total = totals.entry(key.clone()).or_insert_with(|| SourceTotal {
+            source_kind: key.0,
+            source_id: key.1,
+            chunk_count: 0,
+            last_timestamp_ms: timestamp_ms,
+        });
+        total.chunk_count += 1;
+        total.last_timestamp_ms = total.last_timestamp_ms.max(timestamp_ms);
     }
-    for (clause, value) in [
-        (" AND source_id = ?", query.source_id.as_ref()),
-        (" AND owner = ?", query.owner.as_ref()),
-    ] {
-        if let Some(value) = value {
-            sql.push_str(clause);
-            bound.push(Box::new(value.clone()));
-        }
-    }
-    if let Some(value) = query.since_ms {
-        sql.push_str(" AND timestamp_ms >= ?");
-        bound.push(Box::new(value));
-    }
-    if let Some(value) = query.until_ms {
-        sql.push_str(" AND timestamp_ms <= ?");
-        bound.push(Box::new(value));
-    }
-    append_in_list(sql, bound, "id", &query.ids)?;
-    let source_kinds = query
-        .source_kinds
-        .iter()
-        .map(|kind| kind.as_str().to_string())
-        .collect::<Vec<_>>();
-    append_in_list(sql, bound, "source_kind", &source_kinds)?;
-    append_in_list(sql, bound, "source_id", &query.source_ids)?;
-    append_entity_exists(sql, bound, "entity_id", &query.entity_ids)?;
-    append_entity_exists(sql, bound, "entity_kind", &query.entity_kinds)?;
-    if let Some(value) = query.content_contains.as_deref() {
-        sql.push_str(" AND content LIKE ? ESCAPE '\\'");
-        bound.push(Box::new(like_contains_pattern(value)));
-    }
-    if query.exclude_dropped {
-        sql.push_str(" AND lifecycle_status != ?");
-        bound.push(Box::new(CHUNK_STATUS_DROPPED.to_string()));
-    }
-    append_source_scope(sql, bound, query.source_scope.as_ref());
-    Ok(())
-}
-
-/// Append the deterministic order and the page bounds.
-///
-/// Separate from [`append_filters`] so [`count_chunks_matching`] cannot pick
-/// them up, and shared by the two listings so the same query cannot present
-/// the same rows in two different orders depending on which view asked.
-fn append_page(
-    sql: &mut String,
-    bound: &mut Vec<Box<dyn rusqlite::ToSql>>,
-    query: &ListChunksQuery,
-) {
-    sql.push_str(" ORDER BY timestamp_ms DESC, seq_in_source ASC, id ASC LIMIT ? OFFSET ?");
-    bound.push(Box::new(normalized_limit(query.limit)));
-    bound.push(Box::new(
-        i64::try_from(query.offset.unwrap_or(0)).unwrap_or(i64::MAX),
-    ));
-}
-
-/// Append `AND <column> IN (…)` for a non-empty list, binding the whole list
-/// as a single JSON array parameter.
-///
-/// One parameter however long the list, which is what makes this usable from a
-/// filter builder at all. [`get_chunks_batch`](super::get_chunks_batch) binds
-/// one placeholder per id and windows the ids to stay under SQLite's
-/// bound-parameter ceiling; it can window because it issues one statement per
-/// window and merges the results into a map. A filtered listing cannot — the
-/// order, `LIMIT` and `OFFSET` are properties of the whole result set, so
-/// splitting the statement splits the page and the total stops matching it.
-/// Binding through `json_each` removes the ceiling instead of managing it, and
-/// is already what the source-scope gate below relies on.
-///
-/// # Errors
-/// Returns an error when `values` cannot be encoded as a JSON array.
-fn append_in_list(
-    sql: &mut String,
-    bound: &mut Vec<Box<dyn rusqlite::ToSql>>,
-    column: &str,
-    values: &[String],
-) -> Result<()> {
-    let Some(json) = json_list(values)? else {
-        return Ok(());
-    };
-    sql.push_str(&format!(
-        " AND {column} IN (SELECT value FROM json_each(?))"
-    ));
-    bound.push(Box::new(json));
-    Ok(())
-}
-
-/// Append `AND EXISTS (…)` over the entity index for a non-empty list.
-///
-/// `EXISTS`, not a join: a chunk carrying three of the listed entities has
-/// three index rows, and a join would return it three times. That would be a
-/// duplicate page, and — worse — a total from [`count_chunks_matching`] three
-/// times the number of chunks that actually match, which is exactly the
-/// page/total disagreement the shared builder exists to prevent. `EXISTS`
-/// cannot multiply rows, so neither read needs a `SELECT COUNT(*) FROM (…)`
-/// wrapper or a `DISTINCT` to undo the damage.
-///
-/// # Errors
-/// Returns an error when `values` cannot be encoded as a JSON array.
-fn append_entity_exists(
-    sql: &mut String,
-    bound: &mut Vec<Box<dyn rusqlite::ToSql>>,
-    column: &str,
-    values: &[String],
-) -> Result<()> {
-    let Some(json) = json_list(values)? else {
-        return Ok(());
-    };
-    sql.push_str(&format!(
-        " AND EXISTS (SELECT 1 FROM mem_tree_entity_index ei
-              WHERE ei.node_id = mem_tree_chunks.id
-                AND ei.{column} IN (SELECT value FROM json_each(?)))"
-    ));
-    bound.push(Box::new(json));
-    Ok(())
-}
-
-/// Encode a filter list as the JSON array `json_each` reads, or `None` when
-/// the list is empty and the predicate is therefore not asked for.
-///
-/// # Errors
-/// Returns an error when the values cannot be encoded.
-fn json_list(values: &[String]) -> Result<Option<String>> {
-    if values.is_empty() {
-        return Ok(None);
-    }
-    serde_json::to_string(values)
-        .map(Some)
-        .context("Failed to encode chunk filter list")
-}
-
-/// Build the `LIKE` operand for "contains `value`", escaping the wildcards so
-/// the caller's text is matched literally.
-///
-/// `%`, `_` and the escape character itself are escaped with `\`, paired with
-/// `ESCAPE '\'` at the call site. Without this a source id or body fragment
-/// containing `_` silently matches any character in that position — the same
-/// literalness `delete_chunks_by_source_prefix` gets by filtering in Rust
-/// rather than with `LIKE`.
-fn like_contains_pattern(value: &str) -> String {
-    let mut pattern = String::with_capacity(value.len() + 2);
-    pattern.push('%');
-    for character in value.chars() {
-        if matches!(character, '\\' | '%' | '_') {
-            pattern.push('\\');
-        }
-        pattern.push(character);
-    }
-    pattern.push('%');
-    pattern
-}
-
-fn append_source_scope(
-    sql: &mut String,
-    bound: &mut Vec<Box<dyn rusqlite::ToSql>>,
-    allowed: Option<&std::collections::HashSet<String>>,
-) {
-    let Some(allowed) = allowed else { return };
-    sql.push_str(
-        " AND (NOT EXISTS (SELECT 1 FROM json_each(mem_tree_chunks.tags_json)
-          WHERE value = 'memory_sources')",
-    );
-    if !allowed.is_empty() {
-        sql.push_str(" OR (");
-        for (index, source_id) in allowed.iter().enumerate() {
-            if index > 0 {
-                sql.push_str(" OR ");
-            }
-            sql.push_str("source_id = ? OR substr(source_id, 1, length(?)) = ?");
-            bound.push(Box::new(source_id.clone()));
-            let prefix = format!("mem_src:{source_id}:");
-            bound.push(Box::new(prefix.clone()));
-            bound.push(Box::new(prefix));
-        }
-        sql.push(')');
-    }
-    sql.push(')');
-}
-
-/// Borrow the boxed bindings as the slice `rusqlite` takes.
-fn as_params(bound: &[Box<dyn rusqlite::ToSql>]) -> Vec<&dyn rusqlite::ToSql> {
-    bound
-        .iter()
-        .map(|value| value.as_ref() as &dyn rusqlite::ToSql)
-        .collect()
+    let mut totals = totals.into_values().collect::<Vec<_>>();
+    totals.sort_by(|left, right| {
+        right
+            .last_timestamp_ms
+            .cmp(&left.last_timestamp_ms)
+            .then_with(|| right.chunk_count.cmp(&left.chunk_count))
+            .then_with(|| left.source_kind.as_str().cmp(right.source_kind.as_str()))
+            .then_with(|| left.source_id.cmp(&right.source_id))
+    });
+    totals.truncate(normalized_limit(limit) as usize);
+    Ok(totals)
 }
 
 fn normalized_limit(requested: Option<usize>) -> i64 {

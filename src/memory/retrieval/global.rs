@@ -16,7 +16,7 @@
 use anyhow::Result;
 use chrono::{DateTime, TimeZone, Utc};
 
-use crate::memory::chunks::{get_chunk_embeddings_batch, get_chunks_batch, SourceKind};
+use crate::memory::chunks::{get_chunk_embeddings_batch, get_chunks_batch_async, SourceKind};
 use crate::memory::config::MemoryConfig;
 use crate::memory::score::embed::Embedder;
 use crate::memory::score::store::{get_dropped_chunk_ids_batch, lookup_entity_in_window};
@@ -99,7 +99,7 @@ pub async fn query_topic(
         return Ok(QueryResponse::empty());
     }
 
-    let mut scored = resolve_topic_hits(config, entity_id, since_ms, until_ms)?;
+    let mut scored = resolve_topic_hits(config, entity_id, since_ms, until_ms).await?;
 
     if since_ms.is_some() || until_ms.is_some() {
         let since = since_ms.map(ms_to_utc);
@@ -125,7 +125,7 @@ pub async fn query_topic(
 /// the fetched `dropped_chunk_ids` tombstone set. An entity-index row whose
 /// `node_id` resolves to neither a summary nor a chunk (a stale index entry) is
 /// silently skipped.
-fn resolve_topic_hits(
+async fn resolve_topic_hits(
     config: &MemoryConfig,
     entity_id: &str,
     since_ms: Option<i64>,
@@ -156,7 +156,7 @@ fn resolve_topic_hits(
     let summaries = get_summaries_batch(config, &summary_ids)?;
     let summary_embs = get_summary_embeddings_batch(config, &summary_ids)?;
     let dropped_chunk_ids = get_dropped_chunk_ids_batch(config, &leaf_ids)?;
-    let chunks = get_chunks_batch(config, &leaf_ids)?;
+    let chunks = get_chunks_batch_async(config, &leaf_ids).await?;
     let chunk_embs = get_chunk_embeddings_batch(config, &leaf_ids)?;
 
     // Distinct tree ids for summary scopes.

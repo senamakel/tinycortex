@@ -29,7 +29,7 @@ use std::collections::{HashMap, HashSet};
 
 use anyhow::Result;
 
-use crate::memory::chunks::{get_chunk, get_chunk_embeddings_batch, get_chunks_batch};
+use crate::memory::chunks::{get_chunk_async, get_chunk_embeddings_batch, get_chunks_batch_async};
 use crate::memory::config::MemoryConfig;
 use crate::memory::score::embed::Embedder;
 use crate::memory::tree::store::{get_summaries_batch, get_summary, get_tree, get_trees_batch};
@@ -64,7 +64,7 @@ pub async fn drill_down(
         return Ok(Vec::new());
     }
 
-    let (hits, embeddings) = walk_with_embeddings(config, node_id, max_depth)?;
+    let (hits, embeddings) = walk_with_embeddings(config, node_id, max_depth).await?;
 
     let hits = match query {
         Some(q) => rerank_by_semantic_similarity(embedder, q, hits, embeddings).await,
@@ -82,7 +82,7 @@ pub async fn drill_down(
 /// its stored embedding (if any) so the async rerank pass needs no second DB
 /// round-trip. Batched per BFS depth: at most four reads (summaries / trees /
 /// chunks / chunk-embeddings) per level.
-fn walk_with_embeddings(
+async fn walk_with_embeddings(
     config: &MemoryConfig,
     start_id: &str,
     max_depth: u32,
@@ -100,7 +100,7 @@ fn walk_with_embeddings(
         Some(s) => s.child_ids,
         None => {
             // A leaf has no children; an unknown id yields nothing either way.
-            let _ = get_chunk(config, start_id)?;
+            let _ = get_chunk_async(config, start_id).await?;
             return Ok((out, embeddings));
         }
     };
@@ -156,7 +156,7 @@ fn walk_with_embeddings(
             .filter(|id| !summary_by_id.contains_key(*id))
             .cloned()
             .collect();
-        let mut chunk_by_id = get_chunks_batch(config, &chunk_ids)?;
+        let mut chunk_by_id = get_chunks_batch_async(config, &chunk_ids).await?;
         let emb_by_id = get_chunk_embeddings_batch(config, &chunk_ids)?;
 
         let mut next_level: Vec<String> = if depth < max_depth {

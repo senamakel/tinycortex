@@ -268,6 +268,10 @@ pub struct Job {
 /// Keeps producers from having to mint timestamps and ids by hand.
 #[derive(Clone, Debug)]
 pub struct NewJob {
+    /// Optional caller-stable queue hint id. Repeated publication of a durable
+    /// outbox intent uses this id so a lost enqueue acknowledgement cannot
+    /// create a second hint after the first one has already completed.
+    pub id: Option<String>,
     /// Job discriminator selecting the handler and payload shape.
     pub kind: JobKind,
     /// Raw JSON payload, parsed lazily by the handler based on `kind`.
@@ -285,6 +289,7 @@ impl NewJob {
     /// Build a [`JobKind::ExtractChunk`] enqueue request.
     pub fn extract_chunk(p: &ExtractChunkPayload) -> Result<Self> {
         Ok(Self {
+            id: None,
             kind: JobKind::ExtractChunk,
             payload_json: serde_json::to_string(p)?,
             dedupe_key: Some(p.dedupe_key()),
@@ -296,6 +301,7 @@ impl NewJob {
     /// Build a [`JobKind::AppendBuffer`] enqueue request.
     pub fn append_buffer(p: &AppendBufferPayload) -> Result<Self> {
         Ok(Self {
+            id: None,
             kind: JobKind::AppendBuffer,
             payload_json: serde_json::to_string(p)?,
             dedupe_key: Some(p.dedupe_key()),
@@ -307,6 +313,7 @@ impl NewJob {
     /// Build a [`JobKind::Seal`] enqueue request.
     pub fn seal(p: &SealPayload) -> Result<Self> {
         Ok(Self {
+            id: None,
             kind: JobKind::Seal,
             payload_json: serde_json::to_string(p)?,
             dedupe_key: Some(p.dedupe_key()),
@@ -320,6 +327,7 @@ impl NewJob {
     /// `Utc::now()` reading so the dedupe key is boundary-safe.
     pub fn flush_stale(p: &FlushStalePayload, date_iso: &str, hour_block: u32) -> Result<Self> {
         Ok(Self {
+            id: None,
             kind: JobKind::FlushStale,
             payload_json: serde_json::to_string(p)?,
             dedupe_key: Some(p.dedupe_key(date_iso, hour_block)),
@@ -331,6 +339,7 @@ impl NewJob {
     /// Build a [`JobKind::ReembedBackfill`] enqueue request.
     pub fn reembed_backfill(p: &ReembedBackfillPayload) -> Result<Self> {
         Ok(Self {
+            id: None,
             kind: JobKind::ReembedBackfill,
             payload_json: serde_json::to_string(p)?,
             dedupe_key: Some(p.dedupe_key()),
@@ -342,6 +351,7 @@ impl NewJob {
     /// Build a [`JobKind::SealDocument`] enqueue request.
     pub fn seal_document(p: &SealDocumentPayload) -> Result<Self> {
         Ok(Self {
+            id: None,
             kind: JobKind::SealDocument,
             payload_json: serde_json::to_string(p)?,
             dedupe_key: Some(p.dedupe_key()),

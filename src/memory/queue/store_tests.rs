@@ -86,6 +86,24 @@ fn enqueue_after_done_creates_fresh_row() {
 }
 
 #[test]
+fn stable_outbox_hint_id_suppresses_republication_after_job_completion() {
+    use crate::memory::queue::store_settle::mark_done;
+    let (_tmp, cfg) = test_config();
+    let mut job = NewJob::extract_chunk(&ExtractChunkPayload {
+        chunk_id: "c-outbox".into(),
+    })
+    .unwrap();
+    job.id = Some("job:extract:stable-intent".into());
+    let id = enqueue(&cfg, &job).unwrap().unwrap();
+    let claimed = claim_next(&cfg, DEFAULT_LOCK_DURATION_MS).unwrap().unwrap();
+    mark_done(&cfg, &claimed).unwrap();
+
+    assert_eq!(enqueue(&cfg, &job).unwrap(), None);
+    assert_eq!(count_total(&cfg).unwrap(), 1);
+    assert_eq!(get_job(&cfg, &id).unwrap().unwrap().status, JobStatus::Done);
+}
+
+#[test]
 fn count_by_status_reports_each_state() {
     use crate::memory::queue::store_settle::mark_done;
     let (_tmp, cfg) = test_config();

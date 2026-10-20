@@ -47,7 +47,7 @@ pub async fn seal_document_subtree_with_services(
     let mut current_ids = chunk_ids.to_vec();
     let doc_root = loop {
         let batches = if level == 0 {
-            batch_leaves_by_token_budget(config, &current_ids)?
+            batch_leaves_by_token_budget(config, &current_ids).await?
         } else {
             batch_by_count(&current_ids, DOC_SUBTREE_MAX_FANIN)
         };
@@ -118,11 +118,11 @@ pub async fn seal_document_subtree_with_services(
     Ok(doc_root.id)
 }
 
-fn batch_leaves_by_token_budget(
+async fn batch_leaves_by_token_budget(
     config: &MemoryConfig,
     chunk_ids: &[String],
 ) -> Result<Vec<Vec<String>>> {
-    let chunks = crate::memory::chunks::get_chunks_batch(config, chunk_ids)?;
+    let chunks = crate::memory::chunks::get_chunks_batch_async(config, chunk_ids).await?;
     let mut batches = Vec::new();
     let mut current = Vec::new();
     let mut tokens = 0_i64;
@@ -166,7 +166,7 @@ async fn seal_explicit_children(
     strategy: &LabelStrategy,
 ) -> Result<SummaryNode> {
     let target_level = level + 1;
-    let inputs = hydrate_inputs(config, level, child_ids)?;
+    let inputs = hydrate_inputs(config, level, child_ids).await?;
     if inputs.is_empty() {
         anyhow::bail!("document seal has no hydrated inputs at level {level}");
     }

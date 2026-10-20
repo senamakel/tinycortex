@@ -78,6 +78,13 @@ pub fn bootstrap(config: &MemoryConfig) -> Result<(usize, usize)> {
 /// handler and drop it; the other blocks the only executor thread inside
 /// `acquire`).
 pub async fn run_once(config: &MemoryConfig, delegates: &dyn QueueDelegates) -> Result<bool> {
+    if config.storage().is_ok() {
+        crate::memory::ingest::pipeline::dispatch_pending_extract_jobs_async(
+            config,
+            &crate::memory::ingest::QueueJobSink,
+        )
+        .await?;
+    }
     let gate = {
         let mut gates = CONFIGURED_LLM_GATES.lock();
         Arc::clone(

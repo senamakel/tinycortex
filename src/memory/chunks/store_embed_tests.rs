@@ -39,7 +39,7 @@ use tempfile::TempDir;
 
 fn test_config() -> (TempDir, MemoryConfig) {
     let tmp = TempDir::new().expect("tempdir");
-    let cfg = MemoryConfig::new(tmp.path());
+    let cfg = super::test_support::host_config(tmp.path());
     (tmp, cfg)
 }
 

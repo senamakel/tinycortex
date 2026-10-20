@@ -57,6 +57,9 @@ pub mod testing;
 pub mod types;
 pub mod worker;
 
+/// TSD queue carrying persisted memory-tree worker jobs.
+pub const QUEUE_NAME: &str = "memory-tree-jobs";
+
 #[cfg(test)]
 pub(crate) mod test_support;
 

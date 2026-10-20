@@ -14,8 +14,8 @@ use crate::memory::config::MemoryConfig;
 use crate::memory::ingest::canonicalize::chat::{ChatBatch, ChatMessage};
 use crate::memory::ingest::canonicalize::document::DocumentInput;
 use crate::memory::ingest::canonicalize::email::{EmailMessage, EmailThread};
-use crate::memory::ingest::types::{NullJobSink, QueueJobSink, TreeJobSink};
-use crate::memory::queue::{count_by_status, JobStatus};
+use crate::memory::ingest::types::{NullJobSink, QueueJobSink, QueuePublication, TreeJobSink};
+use crate::memory::queue::QUEUE_NAME;
 use crate::memory::score::ScoringConfig;
 
 /// Records every enqueued extract job id for assertions.
@@ -24,15 +24,17 @@ struct RecordingJobSink {
     ids: Mutex<Vec<String>>,
 }
 
+#[async_trait::async_trait]
 impl TreeJobSink for RecordingJobSink {
-    fn enqueue_extract_tx(
+    async fn enqueue_extract(
         &self,
-        _tx: &rusqlite::Transaction<'_>,
+        _config: &MemoryConfig,
+        _intent_id: &str,
         chunk_id: &str,
         _default_max_attempts: u32,
-    ) -> anyhow::Result<bool> {
+    ) -> anyhow::Result<QueuePublication> {
         self.ids.lock().unwrap().push(chunk_id.to_string());
-        Ok(true)
+        Ok(QueuePublication::Published)
     }
 }
 
@@ -44,24 +46,52 @@ struct TogglingJobSink {
     ids: Mutex<Vec<String>>,
 }
 
-impl TreeJobSink for TogglingJobSink {
-    fn enqueue_extract_tx(
+#[derive(Default)]
+struct LostQueueAckSink {
+    lose_next_ack: AtomicBool,
+}
+
+#[async_trait::async_trait]
+impl TreeJobSink for LostQueueAckSink {
+    async fn enqueue_extract(
         &self,
-        _tx: &rusqlite::Transaction<'_>,
+        config: &MemoryConfig,
+        intent_id: &str,
+        chunk_id: &str,
+        default_max_attempts: u32,
+    ) -> anyhow::Result<QueuePublication> {
+        let publication = QueueJobSink
+            .enqueue_extract(config, intent_id, chunk_id, default_max_attempts)
+            .await?;
+        if publication == QueuePublication::Published
+            && self.lose_next_ack.swap(false, Ordering::SeqCst)
+        {
+            anyhow::bail!("simulated lost queue acknowledgement after enqueue");
+        }
+        Ok(publication)
+    }
+}
+
+#[async_trait::async_trait]
+impl TreeJobSink for TogglingJobSink {
+    async fn enqueue_extract(
+        &self,
+        _config: &MemoryConfig,
+        _intent_id: &str,
         chunk_id: &str,
         _default_max_attempts: u32,
-    ) -> anyhow::Result<bool> {
+    ) -> anyhow::Result<QueuePublication> {
         if self.fail.load(Ordering::SeqCst) {
             anyhow::bail!("simulated enqueue failure");
         }
         self.ids.lock().unwrap().push(chunk_id.to_string());
-        Ok(true)
+        Ok(QueuePublication::Published)
     }
 }
 
 fn test_config() -> (TempDir, MemoryConfig) {
     let tmp = TempDir::new().unwrap();
-    let cfg = MemoryConfig::new(tmp.path());
+    let cfg = crate::memory::chunks::test_support::host_config(tmp.path());
     (tmp, cfg)
 }
 
@@ -142,7 +172,7 @@ async fn queue_sink_commits_chunk_lifecycle_and_extract_job_together() {
 
     assert_eq!(out.extract_jobs_enqueued, out.chunk_ids.len());
     assert_eq!(
-        count_by_status(&cfg, JobStatus::Ready).unwrap(),
+        ready_queue_messages(&cfg).await,
         out.extract_jobs_enqueued as u64
     );
     for chunk_id in out.chunk_ids {
@@ -240,7 +270,7 @@ async fn second_document_ingest_with_same_source_id_is_short_circuited() {
 }
 
 #[tokio::test]
-async fn failed_document_ingest_rolls_back_gate_so_retry_ingests() {
+async fn failed_queue_hint_publication_keeps_committed_intent_recoverable() {
     let (_tmp, cfg) = test_config();
     let sink = TogglingJobSink::default();
     let scoring = ScoringConfig::default_regex_only();
@@ -253,8 +283,9 @@ async fn failed_document_ingest_rolls_back_gate_so_retry_ingests() {
         source_ref: Some("notion://page/abc".into()),
     };
 
-    // First attempt: enqueue fails inside the database tail. The whole
-    // transaction, including the source gate, must roll back.
+    // The source gate, staged chunks, and queue intent commit together. A
+    // failure publishing the non-authoritative queue hint leaves the durable
+    // intent available for repair.
     sink.fail.store(true, Ordering::SeqCst);
     let err = ingest_document(
         &cfg,
@@ -267,23 +298,157 @@ async fn failed_document_ingest_rolls_back_gate_so_retry_ingests() {
     )
     .await;
     assert!(err.is_err(), "forced enqueue failure should surface as Err");
-    assert!(
-        !is_source_ingested(&cfg, SourceKind::Document, "notion:abc").unwrap(),
-        "a failed ingest must release the source gate (no zero-chunk claim)",
+    assert!(is_source_ingested(&cfg, SourceKind::Document, "notion:abc").unwrap());
+    let persisted_chunks = count_chunks(&cfg).unwrap() as usize;
+    assert!(persisted_chunks > 0, "the committed source has chunks");
+    assert_eq!(
+        super::dispatch_pending_extract_jobs_async(&cfg, &NullJobSink)
+            .await
+            .unwrap(),
+        0,
+        "a sink that declines work must leave another sink's intent pending"
+    );
+    let unrelated = ingest_chat(
+        &cfg,
+        "slack:#null-sink",
+        "alice",
+        vec![],
+        substantive_batch(),
+        &NullJobSink,
+        &scoring,
+    )
+    .await
+    .unwrap();
+    assert_eq!(unrelated.extract_jobs_enqueued, 0);
+    assert_eq!(
+        ready_queue_messages(&cfg).await,
+        0,
+        "an unrelated no-queue ingest cannot acknowledge another source's intent"
     );
 
-    // Retry: the gate was released, so the document actually ingests this time.
+    // Recovery can publish the pending intent without replaying source parsing
+    // or scoring, and repeating the dispatcher does not enqueue it again.
     sink.fail.store(false, Ordering::SeqCst);
+    assert_eq!(
+        super::dispatch_pending_extract_jobs_async(&cfg, &sink)
+            .await
+            .unwrap(),
+        persisted_chunks
+    );
+    assert_eq!(
+        super::dispatch_pending_extract_jobs_async(&cfg, &sink)
+            .await
+            .unwrap(),
+        0
+    );
     let retry = ingest_document(&cfg, "notion:abc", "alice", vec![], doc, &sink, &scoring)
         .await
         .unwrap();
     assert!(
-        !retry.already_ingested,
-        "retry after a failed ingest must not report already-ingested",
+        retry.already_ingested,
+        "the source gate committed with the recoverable job intent",
     );
-    assert!(retry.chunks_written >= 1);
-    assert_eq!(retry.extract_jobs_enqueued, retry.chunk_ids.len());
+    assert_eq!(sink.ids.lock().unwrap().len(), persisted_chunks);
     assert!(is_source_ingested(&cfg, SourceKind::Document, "notion:abc").unwrap());
+}
+
+#[tokio::test]
+async fn ingest_head_failure_does_not_publish_or_expose_its_outbox_intent() {
+    use std::sync::Arc;
+    use tinystoragedrivers_api::Storage;
+    use tinystoragedrivers_testkit::Failing;
+    use tinystoragedrivers_types::{ErrorKind, Scope};
+
+    let tmp = TempDir::new().unwrap();
+    let scope = Scope::new("test:ingest-before-head-failure").unwrap();
+    let raw = tinystoragedrivers_testkit::memory_storage(&scope);
+    let failing = Failing::new(raw.documents().clone());
+    let faults = failing.faults.clone();
+    let storage = Storage::new(
+        Arc::new(failing),
+        raw.streams().clone(),
+        raw.kv().clone(),
+        raw.blobs().clone(),
+        raw.queues().clone(),
+        raw.secrets().clone(),
+    );
+    let cfg = MemoryConfig::open_with_storage(tmp.path(), storage)
+        .await
+        .unwrap();
+    faults.fail_operation_nth("documents.put_with", 1, ErrorKind::Unavailable);
+
+    let sink = RecordingJobSink::default();
+    let scoring = ScoringConfig::default_regex_only();
+    let doc = DocumentInput {
+        provider: "notion".into(),
+        title: "Uncommitted plan".into(),
+        body: "Phoenix ships Friday after staging review.".into(),
+        modified_at: Utc.timestamp_millis_opt(1_700_000_000_000).unwrap(),
+        source_ref: Some("notion://page/uncommitted".into()),
+    };
+    assert!(ingest_document(
+        &cfg,
+        "notion:uncommitted",
+        "alice",
+        vec![],
+        doc,
+        &sink,
+        &scoring
+    )
+    .await
+    .is_err());
+    assert!(sink.ids.lock().unwrap().is_empty());
+    assert_eq!(count_chunks(&cfg).unwrap(), 0);
+    assert!(!is_source_ingested(&cfg, SourceKind::Document, "notion:uncommitted").unwrap());
+}
+
+#[tokio::test]
+async fn current_thread_queue_sink_repairs_lost_hint_ack_without_duplicate_jobs() {
+    let (_tmp, cfg) = test_config();
+    let sink = LostQueueAckSink {
+        lose_next_ack: AtomicBool::new(true),
+    };
+    let scoring = ScoringConfig::default_regex_only();
+    let doc = DocumentInput {
+        provider: "notion".into(),
+        title: "Current thread queue".into(),
+        body: "Phoenix ships Friday after staging review.".into(),
+        modified_at: Utc.timestamp_millis_opt(1_700_000_000_000).unwrap(),
+        source_ref: Some("notion://page/current-thread".into()),
+    };
+    assert!(ingest_document(
+        &cfg,
+        "notion:current-thread",
+        "alice",
+        vec![],
+        doc,
+        &sink,
+        &scoring
+    )
+    .await
+    .is_err());
+    let expected_jobs = count_chunks(&cfg).unwrap();
+    assert!(expected_jobs > 0);
+    let published_before_repair = ready_queue_messages(&cfg).await;
+    assert!(published_before_repair > 0);
+    assert!(published_before_repair <= expected_jobs);
+
+    let repaired = super::dispatch_pending_extract_jobs_async(&cfg, &QueueJobSink)
+        .await
+        .unwrap();
+    assert_eq!(published_before_repair + repaired as u64, expected_jobs);
+    assert_eq!(ready_queue_messages(&cfg).await, expected_jobs);
+}
+
+async fn ready_queue_messages(config: &MemoryConfig) -> u64 {
+    config
+        .storage()
+        .unwrap()
+        .queues()
+        .stats(QUEUE_NAME)
+        .await
+        .unwrap()
+        .ready
 }
 
 #[tokio::test]
