@@ -1170,7 +1170,7 @@ pub(crate) fn expire_test_lease(config: &MemoryConfig, id: &str) -> Result<()> {
     })
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "tokio"))]
 pub(crate) async fn update_test_record_async(
     config: &MemoryConfig,
     id: &str,

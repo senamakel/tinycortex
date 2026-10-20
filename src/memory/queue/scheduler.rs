@@ -28,6 +28,7 @@ pub fn enqueue_flush_stale(config: &MemoryConfig) -> Result<Option<String>> {
     store::enqueue(config, &new_job)
 }
 
+#[cfg(feature = "tokio")]
 pub(crate) async fn enqueue_flush_stale_async(config: &MemoryConfig) -> Result<Option<String>> {
     let now = Utc::now();
     let today_iso = now.date_naive().format("%Y-%m-%d").to_string();

@@ -232,6 +232,7 @@ pub fn recover_stale_locks(config: &MemoryConfig) -> Result<usize> {
     Ok(recovered)
 }
 
+#[cfg(feature = "tokio")]
 pub(crate) async fn recover_stale_locks_async(config: &MemoryConfig) -> Result<usize> {
     let now = Utc::now().timestamp_millis();
     let jobs = store::all_job_records_async(config).await?;

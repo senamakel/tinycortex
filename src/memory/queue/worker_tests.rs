@@ -4,7 +4,7 @@ use crate::memory::queue::gate::DEFAULT_LLM_PERMITS;
 use crate::memory::queue::handlers::ReembedProgress;
 use crate::memory::queue::store::DEFAULT_LOCK_DURATION_MS;
 use crate::memory::queue::store::{
-    count_by_status, count_by_status_async, enqueue, enqueue_async, get_job, get_job_async,
+    count_by_status_async, enqueue, enqueue_async, get_job, get_job_async,
 };
 use crate::memory::queue::test_support::RecordingDelegates;
 use crate::memory::queue::types::{FlushStalePayload, JobStatus, NewJob, ReembedBackfillPayload};
