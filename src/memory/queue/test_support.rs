@@ -15,8 +15,8 @@ use parking_lot::Mutex;
 
 use crate::memory::config::MemoryConfig;
 use crate::memory::queue::handlers::{
-    AppendDecision, DelegateOutput, ExtractDecision, QueueDelegates, ReembedProgress,
-    StaleBuffer,
+    AppendDecision, DelegateOutput, ExtractDecision, JobMutation, QueueDelegates,
+    ReembedProgress, StaleBuffer,
 };
 use crate::memory::queue::types::{AppendTarget, NodeRef, SealDocumentPayload, SealPayload};
 
@@ -38,8 +38,10 @@ pub(crate) struct RecordingDelegates {
     pub counts: Arc<Counts>,
     /// `extract_chunk` decision; `None` simulates a missing chunk row.
     pub extract: Option<ExtractDecision>,
+    pub extract_mutations: Vec<JobMutation>,
     /// `append_node` decision; `None` simulates a missing node / archived tree.
     pub append: Option<AppendDecision>,
+    pub append_mutations: Vec<JobMutation>,
     /// `seal_level` follow-up parent (one-shot; consumed on first seal).
     pub seal_parent: Mutex<Option<SealPayload>>,
     /// Buffers `list_stale_buffers` returns.
@@ -63,10 +65,12 @@ impl RecordingDelegates {
                 uses_document_subtree: false,
                 tree_scope: "slack:#eng".into(),
             }),
+            extract_mutations: Vec::new(),
             append: Some(AppendDecision {
                 tree_id: "tree:slack".into(),
                 should_seal: true,
             }),
+            append_mutations: Vec::new(),
             seal_parent: Mutex::new(None),
             stale: Vec::new(),
             reembed: Mutex::new(VecDeque::new()),
@@ -86,7 +90,7 @@ impl QueueDelegates for RecordingDelegates {
         self.counts.extract.fetch_add(1, Ordering::Relaxed);
         Ok(self.extract.clone().map(|result| DelegateOutput {
             result,
-            mutations: Vec::new(),
+            mutations: self.extract_mutations.clone(),
         }))
     }
 
@@ -99,7 +103,7 @@ impl QueueDelegates for RecordingDelegates {
         self.counts.append.fetch_add(1, Ordering::Relaxed);
         Ok(self.append.clone().map(|result| DelegateOutput {
             result,
-            mutations: Vec::new(),
+            mutations: self.append_mutations.clone(),
         }))
     }
 
