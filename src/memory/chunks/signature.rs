@@ -118,9 +118,8 @@ pub fn signatures_equivalent(a: &str, b: &str) -> bool {
 
 /// Every spelling of `signature` a stored row might carry, `signature` first.
 ///
-/// Bind these into an `IN (…)` predicate (see `signature_in_clause`) instead
-/// of `= ?`: that is what makes a read find rows written under the other
-/// convention without rewriting them.
+/// This allows reads to find rows written under older signature conventions
+/// without rewriting them.
 pub fn signature_variants(signature: &str) -> Vec<String> {
     let mut variants = vec![signature.trim().to_string()];
     let Some(parts) = parse_signature(signature) else {
@@ -138,16 +137,6 @@ pub fn signature_variants(signature: &str) -> Vec<String> {
         }
     }
     variants
-}
-
-/// Build `IN (?n, ?n+1, …)` for `count` variants starting at parameter
-/// `first_index` (rusqlite parameters are 1-based).
-pub(crate) fn signature_in_clause(count: usize, first_index: usize) -> String {
-    let placeholders = (0..count)
-        .map(|offset| format!("?{}", first_index + offset))
-        .collect::<Vec<_>>()
-        .join(", ");
-    format!("IN ({placeholders})")
 }
 
 #[cfg(test)]

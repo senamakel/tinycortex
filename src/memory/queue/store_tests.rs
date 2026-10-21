@@ -1,5 +1,4 @@
 use super::*;
-use crate::memory::chunks::with_connection;
 use crate::memory::config::MemoryConfig;
 use crate::memory::queue::types::{
     AppendBufferPayload, AppendTarget, ExtractChunkPayload, FlushStalePayload, NodeRef,
@@ -9,7 +8,7 @@ use tempfile::TempDir;
 
 fn test_config() -> (TempDir, MemoryConfig) {
     let tmp = TempDir::new().unwrap();
-    let cfg = MemoryConfig::new(tmp.path());
+    let cfg = crate::memory::chunks::test_support::host_config(tmp.path());
     (tmp, cfg)
 }
 
@@ -86,6 +85,537 @@ fn enqueue_after_done_creates_fresh_row() {
 }
 
 #[test]
+fn stable_outbox_hint_id_suppresses_republication_after_job_completion() {
+    use crate::memory::queue::store_settle::mark_done;
+    let (_tmp, cfg) = test_config();
+    let mut job = NewJob::extract_chunk(&ExtractChunkPayload {
+        chunk_id: "c-outbox".into(),
+    })
+    .unwrap();
+    job.id = Some("job:extract:stable-intent".into());
+    let id = enqueue(&cfg, &job).unwrap().unwrap();
+    let claimed = claim_next(&cfg, DEFAULT_LOCK_DURATION_MS).unwrap().unwrap();
+    mark_done(&cfg, &claimed).unwrap();
+
+    assert_eq!(enqueue(&cfg, &job).unwrap(), None);
+    assert_eq!(count_total(&cfg).unwrap(), 1);
+    assert_eq!(get_job(&cfg, &id).unwrap().unwrap().status, JobStatus::Done);
+}
+
+#[tokio::test]
+async fn a_deferred_job_can_be_reclaimed_before_queue_dedupe_expires() {
+    use crate::memory::queue::store_settle::mark_deferred_async;
+    use tinystoragedrivers_types::QueueSpec;
+
+    let (_tmp, cfg) = test_config();
+    cfg.storage()
+        .unwrap()
+        .queues()
+        .ensure_queue(
+            super::super::QUEUE_NAME,
+            &QueueSpec {
+                max_attempts: cfg.queue.max_attempts.max(1),
+                dedupe_window_ms: 60_000,
+            },
+        )
+        .await
+        .unwrap();
+    let mut new_job = NewJob::extract_chunk(&ExtractChunkPayload {
+        chunk_id: "c-immediate-retry".into(),
+    })
+    .unwrap();
+    new_job.id = Some("job:immediate-retry".into());
+    let id = enqueue_async(&cfg, &new_job).await.unwrap().unwrap();
+
+    let first = claim_next_async(&cfg, DEFAULT_LOCK_DURATION_MS)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(first.id, id);
+    mark_deferred_async(
+        &cfg,
+        &first,
+        chrono::Utc::now().timestamp_millis() - 1,
+        "retry now",
+    )
+    .await
+    .unwrap();
+
+    let retry = claim_next_async(&cfg, DEFAULT_LOCK_DURATION_MS)
+        .await
+        .unwrap()
+        .expect("a new ready-generation hint must not be suppressed by the old ACKed hint");
+    assert_eq!(retry.id, id);
+    assert_eq!(retry.attempts, 1);
+}
+
+#[tokio::test]
+async fn typed_import_jobs_stage_dedupe_atomically_before_hint_publication() {
+    let (_tmp, cfg) = test_config();
+    let job = NewJob::extract_chunk(&ExtractChunkPayload {
+        chunk_id: "legacy-import-chunk".into(),
+    })
+    .unwrap();
+    let imported = |id: &str, job: &NewJob| ImportedJob {
+        id: id.to_owned(),
+        kind: job.kind,
+        payload_json: job.payload_json.clone(),
+        dedupe_key: job.dedupe_key.clone(),
+        status: JobStatus::Ready,
+        attempts: 0,
+        max_attempts: 3,
+        available_at_ms: 1_750_000_000_000,
+        created_at_ms: 1_700_000_000_000,
+        started_at_ms: None,
+        completed_at_ms: None,
+        last_error: None,
+        failure_reason: None,
+        failure_class: None,
+    };
+    let job = imported("legacy-import-job", &job);
+
+    let snapshot = crate::memory::chunks::versioned::capture_state_snapshot_async(&cfg)
+        .await
+        .unwrap();
+    let staged = stage_import_jobs_at_snapshot(&cfg, &snapshot, std::slice::from_ref(&job))
+        .await
+        .unwrap();
+    assert_eq!(staged.publish.len(), 1);
+    assert!(get_job_async(&cfg, "legacy-import-job")
+        .await
+        .unwrap()
+        .is_none());
+
+    // A conflicting dedupe owner rejects the import plan before either the
+    // job row or its hint can be published.
+    let mut conflict = job.clone();
+    conflict.id = "different-import-job".into();
+    let active = staged.changes.clone();
+    crate::memory::chunks::versioned::commit_if_state_matches_async(
+        &cfg,
+        &staged.expected,
+        &[],
+        &active,
+    )
+    .await
+    .unwrap();
+    let conflict_snapshot = crate::memory::chunks::versioned::capture_state_snapshot_async(&cfg)
+        .await
+        .unwrap();
+    assert!(
+        stage_import_jobs_at_snapshot(&cfg, &conflict_snapshot, &[conflict])
+            .await
+            .is_err()
+    );
+    assert!(get_job_async(&cfg, "different-import-job")
+        .await
+        .unwrap()
+        .is_none());
+
+    let snapshot = crate::memory::chunks::versioned::capture_state_snapshot_async(&cfg)
+        .await
+        .unwrap();
+    let staged = stage_import_jobs_at_snapshot(&cfg, &snapshot, &[job])
+        .await
+        .unwrap();
+    assert!(
+        crate::memory::chunks::versioned::commit_if_state_matches_async(
+            &cfg,
+            &staged.expected,
+            &[],
+            &staged.changes,
+        )
+        .await
+        .unwrap()
+    );
+    publish_import_job_hints_async(&cfg, &staged.publish)
+        .await
+        .unwrap();
+    assert_eq!(
+        get_job_async(&cfg, "legacy-import-job")
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        JobStatus::Ready
+    );
+}
+
+#[tokio::test]
+async fn typed_import_preserves_job_history_and_recovers_running_work() {
+    let (_tmp, cfg) = test_config();
+    let statuses = [
+        ("ready", JobStatus::Ready),
+        ("running", JobStatus::Running),
+        ("done", JobStatus::Done),
+        ("failed", JobStatus::Failed),
+        ("cancelled", JobStatus::Cancelled),
+    ];
+    let jobs: Vec<_> = statuses
+        .iter()
+        .enumerate()
+        .map(|(index, (name, status))| ImportedJob {
+            id: format!("legacy-{name}"),
+            kind: JobKind::ExtractChunk,
+            payload_json: format!(r#"{{"chunk_id":"chunk-{name}"}}"#),
+            dedupe_key: Some(format!("extract:chunk-{name}")),
+            status: *status,
+            attempts: index as u32,
+            max_attempts: 4,
+            available_at_ms: 1_750_000_000_000 + index as i64,
+            created_at_ms: 1_700_000_000_000 + index as i64,
+            started_at_ms: (index > 0).then_some(1_700_000_100_000 + index as i64),
+            completed_at_ms: status
+                .is_terminal()
+                .then_some(1_700_000_200_000 + index as i64),
+            last_error: (index > 0).then(|| format!("source error {name}")),
+            failure_reason: (*status == JobStatus::Failed).then(|| "historical_failure".into()),
+            failure_class: (*status == JobStatus::Failed).then(|| "transient".into()),
+        })
+        .collect();
+    let snapshot = crate::memory::chunks::versioned::capture_state_snapshot_async(&cfg)
+        .await
+        .unwrap();
+    let staged = stage_import_jobs_at_snapshot(&cfg, &snapshot, &jobs)
+        .await
+        .unwrap();
+    assert_eq!(
+        staged.publish.len(),
+        2,
+        "only Ready and recovered Running jobs publish"
+    );
+    assert!(
+        crate::memory::chunks::versioned::commit_if_state_matches_async(
+            &cfg,
+            &staged.expected,
+            &[],
+            &staged.changes,
+        )
+        .await
+        .unwrap()
+    );
+
+    for (name, source_status) in statuses {
+        let row = get_job_async(&cfg, &format!("legacy-{name}"))
+            .await
+            .unwrap()
+            .unwrap();
+        let expected_status = if source_status == JobStatus::Running {
+            JobStatus::Ready
+        } else {
+            source_status
+        };
+        assert_eq!(row.status, expected_status);
+        let index = statuses.iter().position(|entry| entry.0 == name).unwrap() as u32;
+        assert_eq!(row.created_at_ms, 1_700_000_000_000 + index as i64);
+        assert_eq!(row.attempts, index);
+        assert_eq!(
+            row.started_at_ms,
+            (index > 0).then_some(1_700_000_100_000 + index as i64)
+        );
+        assert_eq!(
+            row.completed_at_ms,
+            source_status
+                .is_terminal()
+                .then_some(1_700_000_200_000 + index as i64)
+        );
+    }
+
+    // Reapplying the same source snapshot cannot roll a job back after the
+    // destination worker has advanced it.
+    update_test_record_async(&cfg, "legacy-ready", |record| {
+        record.status = JobStatus::Done.as_str().to_owned();
+        record.attempts = 3;
+        record.completed_at_ms = Some(1_800_000_000_000);
+    })
+    .await
+    .unwrap();
+    update_test_record_async(&cfg, "legacy-running", |record| {
+        record.status = JobStatus::Done.as_str().to_owned();
+        record.attempts = 4;
+        record.completed_at_ms = Some(1_800_000_000_001);
+    })
+    .await
+    .unwrap();
+    let snapshot = crate::memory::chunks::versioned::capture_state_snapshot_async(&cfg)
+        .await
+        .unwrap();
+    let retry = stage_import_jobs_at_snapshot(&cfg, &snapshot, &jobs)
+        .await
+        .unwrap();
+    assert!(retry.changes.is_empty());
+    assert!(retry.publish.is_empty());
+    let progressed = get_job_async(&cfg, "legacy-ready").await.unwrap().unwrap();
+    assert_eq!(progressed.status, JobStatus::Done);
+    assert_eq!(progressed.attempts, 3);
+    assert_eq!(progressed.completed_at_ms, Some(1_800_000_000_000));
+}
+
+#[tokio::test]
+async fn a_redelivered_hint_reclaims_an_expired_worker_lease() {
+    use tinystoragedrivers_types::{QueueSpec, Retry};
+
+    let (_tmp, cfg) = test_config();
+    let storage = cfg.storage().unwrap();
+    storage
+        .queues()
+        .ensure_queue(
+            super::super::QUEUE_NAME,
+            &QueueSpec {
+                max_attempts: cfg.queue.max_attempts.max(1),
+                dedupe_window_ms: 60_000,
+            },
+        )
+        .await
+        .unwrap();
+    let mut new_job = NewJob::extract_chunk(&ExtractChunkPayload {
+        chunk_id: "c-crashed-worker".into(),
+    })
+    .unwrap();
+    new_job.id = Some("job:crashed-worker".into());
+    let id = enqueue_async(&cfg, &new_job).await.unwrap().unwrap();
+
+    let first = claim_next_async(&cfg, DEFAULT_LOCK_DURATION_MS)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(first.id, id);
+    let receipt = first.queue_receipt.as_ref().unwrap();
+
+    // Model lease expiry after the worker crashes without settling its
+    // receipt. NACK makes the same publication hint visible for redelivery;
+    // the second claimant must validate publication generation separately
+    // from the first claimant's incremented lease epoch.
+    let (old_value, mut record) = read_record_async(&cfg, &id).await.unwrap().unwrap();
+    record.locked_until_ms = Some(0);
+    assert!(
+        crate::memory::chunks::versioned::commit_if_state_matches_async(
+            &cfg,
+            &[StateChange {
+                collection: JOBS.to_owned(),
+                key: job_key(&id),
+                value: Some(old_value),
+            }],
+            &[],
+            &[state_change(&record).unwrap()],
+        )
+        .await
+        .unwrap()
+    );
+    storage
+        .queues()
+        .nack(super::super::QUEUE_NAME, receipt, Retry::After(0))
+        .await
+        .unwrap();
+
+    let reclaimed = claim_next_async(&cfg, DEFAULT_LOCK_DURATION_MS)
+        .await
+        .unwrap()
+        .expect("the redelivered hint should reclaim an expired durable lease");
+    assert_eq!(reclaimed.id, id);
+    assert_eq!(reclaimed.lease_epoch, first.lease_epoch + 1);
+    assert_eq!(reclaimed.attempts, 2);
+}
+
+#[test]
+fn stable_job_id_rejects_a_different_payload() {
+    let (_tmp, cfg) = test_config();
+    let mut original = NewJob::extract_chunk(&ExtractChunkPayload {
+        chunk_id: "original".into(),
+    })
+    .unwrap();
+    original.id = Some("job:stable-intent".into());
+    enqueue(&cfg, &original).unwrap();
+
+    let mut conflicting = NewJob::extract_chunk(&ExtractChunkPayload {
+        chunk_id: "different".into(),
+    })
+    .unwrap();
+    conflicting.id = original.id.clone();
+    let error = enqueue(&cfg, &conflicting).unwrap_err();
+    assert!(error.to_string().contains("different intent"));
+}
+
+#[test]
+fn bootstrap_republishes_ready_jobs_even_without_an_outbox_hint() {
+    let (_tmp, cfg) = test_config();
+    let new_job = NewJob::extract_chunk(&ExtractChunkPayload {
+        chunk_id: "c-lost-hint".into(),
+    })
+    .unwrap();
+    let record = super::record_from_new(&cfg, &new_job, "job:lost-hint".into());
+    insert_test_record(&cfg, &record).unwrap();
+
+    assert_eq!(
+        crate::memory::queue::worker::bootstrap(&cfg).unwrap(),
+        (0, 0)
+    );
+    let claimed = claim_next(&cfg, DEFAULT_LOCK_DURATION_MS).unwrap().unwrap();
+    assert_eq!(claimed.id, "job:lost-hint");
+}
+
+#[test]
+fn idle_worker_repairs_a_ready_job_whose_hint_was_lost() {
+    let (_tmp, cfg) = test_config();
+    let new_job = NewJob::extract_chunk(&ExtractChunkPayload {
+        chunk_id: "c-idle-repair".into(),
+    })
+    .unwrap();
+    let record = super::record_from_new(&cfg, &new_job, "job:idle-repair".into());
+    insert_test_record(&cfg, &record).unwrap();
+
+    let claimed = claim_next(&cfg, DEFAULT_LOCK_DURATION_MS)
+        .unwrap()
+        .expect("a later poll must repair the missing hint without process restart");
+    assert_eq!(claimed.id, "job:idle-repair");
+}
+
+#[test]
+fn owner_head_commit_fences_domain_changes_and_follow_ups_together() {
+    use crate::memory::chunks::versioned::{self, StateChange};
+    use crate::memory::queue::store::{commit_claimed, JobRecord};
+    use serde_json::json;
+
+    let (_tmp, cfg) = test_config();
+    let id = enqueue(
+        &cfg,
+        &NewJob::extract_chunk(&ExtractChunkPayload {
+            chunk_id: "c-owner-cas".into(),
+        })
+        .unwrap(),
+    )
+    .unwrap()
+    .unwrap();
+    let claim = claim_next(&cfg, DEFAULT_LOCK_DURATION_MS).unwrap().unwrap();
+    let child = NewJob::seal(&SealPayload {
+        tree_id: "tree:owner-cas".into(),
+        level: 0,
+        force_now_ms: None,
+    })
+    .unwrap();
+    let mut child = child;
+    child.id = Some("job:owner-cas-child".into());
+    let expected = [StateChange {
+        collection: "test_domain".into(),
+        key: "record".into(),
+        value: None,
+    }];
+    versioned::write_state(
+        &cfg,
+        StateChange {
+            collection: "test_domain".into(),
+            key: "record".into(),
+            value: Some(json!({"writer": "raced"})),
+        },
+    )
+    .unwrap();
+    let mut next = JobRecord::from_public(&claim);
+    next.status = JobStatus::Done.as_str().into();
+    next.completed_at_ms = Some(Utc::now().timestamp_millis());
+
+    let committed = commit_claimed(
+        &cfg,
+        &claim,
+        next,
+        &expected,
+        &[StateChange {
+            collection: "test_domain".into(),
+            key: "record".into(),
+            value: Some(json!({"writer": "worker"})),
+        }],
+        &[child],
+    )
+    .unwrap();
+
+    assert!(!committed, "the stale delegate snapshot must lose the CAS");
+    assert_eq!(
+        get_job(&cfg, &id).unwrap().unwrap().status,
+        JobStatus::Running
+    );
+    assert_eq!(
+        versioned::read_state(&cfg, "test_domain", "record").unwrap(),
+        Some(json!({"writer": "raced"}))
+    );
+    assert!(get_job(&cfg, "job:owner-cas-child").unwrap().is_none());
+}
+
+#[test]
+fn same_parent_dedupe_follow_up_is_suppressed_while_parent_is_active() {
+    use crate::memory::queue::store_settle::mark_done_with_followups;
+
+    let (_tmp, cfg) = test_config();
+    let payload = ExtractChunkPayload {
+        chunk_id: "c-same-dedupe".into(),
+    };
+    let parent_id = enqueue(&cfg, &NewJob::extract_chunk(&payload).unwrap())
+        .unwrap()
+        .unwrap();
+    let claim = claim_next(&cfg, DEFAULT_LOCK_DURATION_MS).unwrap().unwrap();
+    let duplicate = NewJob::extract_chunk(&payload).unwrap();
+
+    assert!(mark_done_with_followups(&cfg, &claim, &[duplicate]).unwrap());
+    assert_eq!(
+        get_job(&cfg, &parent_id).unwrap().unwrap().status,
+        JobStatus::Done
+    );
+    assert_eq!(count_total(&cfg).unwrap(), 1);
+}
+
+#[test]
+fn expired_receipt_cannot_settle_after_a_new_claim_generation() {
+    let (_tmp, cfg) = test_config();
+    let id = enqueue(
+        &cfg,
+        &NewJob::extract_chunk(&ExtractChunkPayload {
+            chunk_id: "c-lease-epoch".into(),
+        })
+        .unwrap(),
+    )
+    .unwrap()
+    .unwrap();
+    let old_claim = claim_next(&cfg, DEFAULT_LOCK_DURATION_MS).unwrap().unwrap();
+    update_test_record(&cfg, &id, |record| record.locked_until_ms = Some(0)).unwrap();
+    assert!(
+        !crate::memory::queue::store_settle::mark_done_with_changes(
+            &cfg,
+            &old_claim,
+            &[],
+            &[],
+            &[StateChange {
+                collection: "test_domain".into(),
+                key: "expired-owner-write".into(),
+                value: Some(json!({"must_not_commit": true})),
+            }],
+        )
+        .unwrap(),
+        "an expired lease cannot settle or commit domain effects"
+    );
+    assert_eq!(
+        versioned::read_state(&cfg, "test_domain", "expired-owner-write").unwrap(),
+        None
+    );
+    // Make a fresh hint available after expiring the first test receipt.
+    ack(&cfg, old_claim.queue_receipt.as_ref().unwrap()).unwrap();
+    crate::memory::queue::store_settle::recover_stale_locks(&cfg).unwrap();
+    let new_claim = claim_next(&cfg, DEFAULT_LOCK_DURATION_MS).unwrap().unwrap();
+    assert!(new_claim.lease_epoch > old_claim.lease_epoch);
+
+    assert!(
+        !crate::memory::queue::store_settle::mark_done_with_followups(&cfg, &old_claim, &[],)
+            .unwrap()
+    );
+    assert_eq!(
+        get_job(&cfg, &id).unwrap().unwrap().status,
+        JobStatus::Running
+    );
+    assert!(
+        crate::memory::queue::store_settle::mark_done_with_followups(&cfg, &new_claim, &[],)
+            .unwrap()
+    );
+    assert_eq!(get_job(&cfg, &id).unwrap().unwrap().status, JobStatus::Done);
+}
+
+#[test]
 fn count_by_status_reports_each_state() {
     use crate::memory::queue::store_settle::mark_done;
     let (_tmp, cfg) = test_config();
@@ -121,21 +651,32 @@ fn retired_kind_rows_are_skipped_then_purged() {
     let (_tmp, cfg) = test_config();
 
     // Insert two raw retired rows directly (no NewJob path exists for them).
-    with_connection(&cfg, |conn| {
-        for (id, kind) in [
-            ("job:retired-1", "topic_route"),
-            ("job:retired-2", "digest_daily"),
-        ] {
-            conn.execute(
-                "INSERT INTO mem_tree_jobs (id, kind, payload_json, status, attempts,
-                    max_attempts, available_at_ms, created_at_ms)
-                 VALUES (?1, ?2, '{}', 'ready', 0, 5, 0, 0)",
-                params![id, kind],
-            )?;
-        }
-        Ok(())
-    })
-    .unwrap();
+    for (id, kind) in [("retired-1", "topic_route"), ("retired-2", "digest_daily")] {
+        insert_test_record(
+            &cfg,
+            &JobRecord {
+                id: id.to_owned(),
+                kind: kind.to_owned(),
+                payload_json: "{}".to_owned(),
+                dedupe_key: None,
+                status: JobStatus::Ready.as_str().to_owned(),
+                attempts: 0,
+                max_attempts: 5,
+                available_at_ms: 0,
+                locked_until_ms: None,
+                last_error: None,
+                failure_reason: None,
+                failure_class: None,
+                created_at_ms: 0,
+                started_at_ms: None,
+                completed_at_ms: None,
+                hint_generation: 0,
+                lease_epoch: 0,
+                lease_token: None,
+            },
+        )
+        .unwrap();
+    }
 
     // A live job alongside them.
     let live = NewJob::extract_chunk(&ExtractChunkPayload {

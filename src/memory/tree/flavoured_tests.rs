@@ -14,7 +14,7 @@ const ASK: &str = "Distill the author's tweet-writing style: voice, tone, struct
 
 fn test_config() -> (TempDir, MemoryConfig) {
     let tmp = TempDir::new().unwrap();
-    let cfg = MemoryConfig::new(tmp.path());
+    let cfg = crate::memory::chunks::test_support::host_config(tmp.path());
     (tmp, cfg)
 }
 
@@ -40,7 +40,13 @@ fn seed_chunk(cfg: &MemoryConfig, seq: u32, content: &str) -> Chunk {
         created_at: ts,
         partial_message: false,
     };
-    upsert_chunks(cfg, std::slice::from_ref(&chunk)).unwrap();
+    let cfg = cfg.clone();
+    let chunk_for_write = chunk.clone();
+    std::thread::spawn(move || {
+        upsert_chunks(&cfg, std::slice::from_ref(&chunk_for_write)).unwrap();
+    })
+    .join()
+    .unwrap();
     chunk
 }
 
@@ -68,12 +74,18 @@ async fn compile_root_stages_md_with_ask_and_budget() {
     let factory = TreeFactory::flavoured("tweet-style", ASK);
     seed_and_seal(&cfg, &factory, 3).await;
 
-    let tree = factory.get_or_create(&cfg).unwrap();
+    let tree = crate::memory::tree::registry::get_or_create_tree_async(
+        &cfg,
+        factory.kind(),
+        factory.scope(),
+    )
+    .await
+    .unwrap();
     assert_eq!(tree.kind, TreeKind::Flavoured);
     assert_eq!(tree.ask.as_deref(), Some(ASK));
     assert!(tree.root_id.is_some(), "seal must set a root");
 
-    let md = compile_flavoured_root(&cfg, &tree.id).unwrap();
+    let md = compile_flavoured_root_async(&cfg, &tree.id).await.unwrap();
 
     // Front-matter carries the ask and identity.
     assert!(md.starts_with("---\n"));
@@ -98,8 +110,14 @@ async fn compile_root_body_is_clamped_to_budget() {
     let factory = TreeFactory::flavoured("tiny", ASK);
     seed_and_seal(&cfg, &factory, 12).await;
 
-    let tree = factory.get_or_create(&cfg).unwrap();
-    let md = compile_flavoured_root(&cfg, &tree.id).unwrap();
+    let tree = crate::memory::tree::registry::get_or_create_tree_async(
+        &cfg,
+        factory.kind(),
+        factory.scope(),
+    )
+    .await
+    .unwrap();
+    let md = compile_flavoured_root_async(&cfg, &tree.id).await.unwrap();
 
     // token_estimate front-matter must respect the budget.
     let estimate: u32 = md
@@ -114,10 +132,16 @@ async fn compile_root_body_is_clamped_to_budget() {
 #[tokio::test]
 async fn compile_root_rejects_non_flavoured_tree() {
     let (_tmp, cfg) = test_config();
-    let source = TreeFactory::source("slack:#eng")
-        .get_or_create(&cfg)
-        .unwrap();
-    let err = compile_flavoured_root(&cfg, &source.id).unwrap_err();
+    let source = crate::memory::tree::registry::get_or_create_tree_async(
+        &cfg,
+        TreeKind::Source,
+        "slack:#eng",
+    )
+    .await
+    .unwrap();
+    let err = compile_flavoured_root_async(&cfg, &source.id)
+        .await
+        .unwrap_err();
     assert!(err.to_string().contains("not flavoured"));
 }
 

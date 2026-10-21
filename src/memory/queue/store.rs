@@ -1,319 +1,1458 @@
-//! SQLite persistence for the memory-tree job queue (claim / enqueue side).
+//! Durable job metadata over the owner-scoped versioned state store.
 //!
-//! Producers call [`enqueue`] inside their own writes (or with a fresh tx) to
-//! atomically commit the side-effect plus its follow-up job. The worker pool
-//! calls [`claim_next`] to lease a job; settlement (`mark_done` /
-//! `mark_failed` / `mark_deferred` / recovery / requeue) lives in
-//! [`super::store_settle`].
-//!
-//! All persistence lives in the shared `chunks.db` (opened via
-//! [`crate::memory::chunks::with_connection`]) so a producer can insert its
-//! side-effect and its follow-up job in one transaction. The `mem_tree_jobs`
-//! table and its partial-unique dedupe index are owned by the chunks schema —
-//! this module never issues DDL.
-//!
-//! Concurrency:
-//! - The dedupe key is enforced by a partial `UNIQUE` index that only covers
-//!   `status IN ('ready', 'running')`. Producers use `INSERT OR IGNORE` so a
-//!   duplicate enqueue while a job is in flight or queued is a silent no-op; a
-//!   duplicate enqueue after the first completes creates a fresh row.
-//! - `claim_next` is one statement (`UPDATE … WHERE id = (SELECT … LIMIT 1)
-//!   RETURNING …`). SQLite serialises writes, so no two workers claim the same
-//!   row.
+//! Queue messages are deliberately only wake-up hints. The versioned state
+//! head is authoritative for lifecycle, dedupe, attempts and lease generation;
+//! every transition is a head-CAS. This keeps correctness independent of a
+//! backend's optional queue dedupe support and fences stale workers.
+
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use anyhow::{Context, Result};
 use chrono::Utc;
-use rusqlite::{params, Connection, OptionalExtension, Transaction};
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use tinystoragedrivers_types::{NewMessage, Retry};
 use uuid::Uuid;
 
-use crate::memory::chunks::with_connection;
+use crate::memory::chunks::versioned::{self, StateChange};
 use crate::memory::config::MemoryConfig;
-use crate::memory::queue::types::{Job, JobKind, JobStatus, NewJob, RETIRED_JOB_KINDS};
+use crate::memory::queue::types::{
+    ImportedJob, Job, JobKind, JobStatus, NewJob, RETIRED_JOB_KINDS,
+};
 
-/// Default visibility lock — a worker that crashes mid-job will have its row
-/// recovered after this window. 5 min is comfortably larger than any expected
-/// single-job runtime without leaving real failures stuck for hours.
+pub(crate) const JOBS: &str = "memory_tree_jobs";
+pub(crate) const JOB_PREFIX: &str = "job:";
+const DEDUPE_PREFIX: &str = "dedupe:";
+const PUBLISH_RETRIES: usize = 8;
+const MAX_STALE_HINTS: usize = 64;
+
+/// Default visibility lock — a crashed worker is redelivered after this window.
 pub const DEFAULT_LOCK_DURATION_MS: i64 = 5 * 60 * 1_000;
-
 /// Backoff math for retry. Returns `now + min(base * 2^attempts, cap)`.
 #[cfg(test)]
 pub(crate) const RETRY_BASE_MS: i64 = 60 * 1_000;
 #[cfg(test)]
 pub(crate) const RETRY_CAP_MS: i64 = 60 * 60 * 1_000;
-pub(crate) const DEFAULT_MAX_ATTEMPTS: u32 = 5;
 
-/// Enqueue one job. Idempotent on `dedupe_key` while another active row (status
-/// `ready`/`running`) shares it. Returns `Some(id)` if inserted, `None` if a
-/// duplicate was suppressed.
-pub fn enqueue(config: &MemoryConfig, job: &NewJob) -> Result<Option<String>> {
-    with_connection(config, |conn| {
-        enqueue_conn(conn, job, config.queue.max_attempts)
-    })
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub(crate) struct JobRecord {
+    pub(crate) id: String,
+    pub(crate) kind: String,
+    pub(crate) payload_json: String,
+    pub(crate) dedupe_key: Option<String>,
+    pub(crate) status: String,
+    pub(crate) attempts: u32,
+    pub(crate) max_attempts: u32,
+    pub(crate) available_at_ms: i64,
+    pub(crate) locked_until_ms: Option<i64>,
+    pub(crate) last_error: Option<String>,
+    pub(crate) failure_reason: Option<String>,
+    pub(crate) failure_class: Option<String>,
+    pub(crate) created_at_ms: i64,
+    pub(crate) started_at_ms: Option<i64>,
+    pub(crate) completed_at_ms: Option<i64>,
+    /// Identity of the current Ready-state queue publication. This is
+    /// separate from `lease_epoch`, which changes on every worker claim.
+    #[serde(default)]
+    pub(crate) hint_generation: u64,
+    #[serde(default)]
+    pub(crate) lease_epoch: u64,
+    #[serde(default)]
+    pub(crate) lease_token: Option<String>,
 }
 
-/// Enqueue inside a caller-owned transaction. Use this when the producer is
-/// already mid-tx (e.g. writing chunks + jobs in one commit) so the queue
-/// insert lands atomically with the side-effect. `Transaction` derefs to
-/// `Connection`, so callers just pass `&tx`.
-pub fn enqueue_tx(tx: &Transaction<'_>, job: &NewJob) -> Result<Option<String>> {
-    enqueue_conn(tx, job, DEFAULT_MAX_ATTEMPTS)
-}
-
-/// Enqueue inside a transaction using the caller's configured default retry
-/// budget when the job does not override it.
-pub(crate) fn enqueue_tx_with_default(
-    tx: &Transaction<'_>,
-    job: &NewJob,
-    default_max_attempts: u32,
-) -> Result<Option<String>> {
-    enqueue_conn(tx, job, default_max_attempts)
-}
-
-pub(crate) fn enqueue_conn(
-    conn: &Connection,
-    job: &NewJob,
-    default_max_attempts: u32,
-) -> Result<Option<String>> {
-    let id = format!("job:{}", Uuid::new_v4());
-    let now_ms = Utc::now().timestamp_millis();
-    let available_at = job.available_at_ms.unwrap_or(now_ms);
-    let max_attempts = job.max_attempts.unwrap_or(default_max_attempts) as i64;
-
-    let inserted = conn.execute(
-        "INSERT OR IGNORE INTO mem_tree_jobs (
-            id, kind, payload_json, dedupe_key, status, attempts, max_attempts,
-            available_at_ms, locked_until_ms, last_error,
-            created_at_ms, started_at_ms, completed_at_ms
-        ) VALUES (?1, ?2, ?3, ?4, 'ready', 0, ?5, ?6, NULL, NULL, ?7, NULL, NULL)",
-        params![
-            id,
-            job.kind.as_str(),
-            job.payload_json,
-            job.dedupe_key,
-            max_attempts,
-            available_at,
-            now_ms,
-        ],
-    )?;
-
-    if inserted == 0 {
-        // Dedupe-suppressed: a row with this key is already ready/running.
-        return Ok(None);
+impl JobRecord {
+    pub(crate) fn from_public(job: &Job) -> Self {
+        Self {
+            id: job.id.clone(),
+            kind: job.kind.as_str().to_owned(),
+            payload_json: job.payload_json.clone(),
+            dedupe_key: job.dedupe_key.clone(),
+            status: job.status.as_str().to_owned(),
+            attempts: job.attempts,
+            max_attempts: job.max_attempts,
+            available_at_ms: job.available_at_ms,
+            locked_until_ms: job.locked_until_ms,
+            last_error: job.last_error.clone(),
+            failure_reason: job.failure_reason.clone(),
+            failure_class: job.failure_class.clone(),
+            created_at_ms: job.created_at_ms,
+            started_at_ms: job.started_at_ms,
+            completed_at_ms: job.completed_at_ms,
+            hint_generation: 0,
+            lease_epoch: job.lease_epoch,
+            lease_token: job
+                .queue_receipt
+                .as_ref()
+                .map(|receipt| receipt.token.clone()),
+        }
     }
-    Ok(Some(id))
+    fn public(&self, receipt: Option<tinystoragedrivers_types::Receipt>) -> Result<Job> {
+        Ok(Job {
+            id: self.id.clone(),
+            kind: JobKind::parse(&self.kind)?,
+            payload_json: self.payload_json.clone(),
+            dedupe_key: self.dedupe_key.clone(),
+            status: JobStatus::parse(&self.status)?,
+            attempts: self.attempts,
+            max_attempts: self.max_attempts,
+            available_at_ms: self.available_at_ms,
+            locked_until_ms: self.locked_until_ms,
+            last_error: self.last_error.clone(),
+            failure_reason: self.failure_reason.clone(),
+            failure_class: self.failure_class.clone(),
+            created_at_ms: self.created_at_ms,
+            started_at_ms: self.started_at_ms,
+            completed_at_ms: self.completed_at_ms,
+            lease_epoch: self.lease_epoch,
+            queue_receipt: receipt,
+        })
+    }
+
+    fn status(&self) -> Result<JobStatus> {
+        JobStatus::parse(&self.status)
+    }
 }
 
-/// Atomically claim the next ready job whose `available_at_ms` has come due.
-/// Sets `status=running`, bumps `attempts`, stamps `started_at_ms` and
-/// `locked_until_ms`. Returns `None` when the queue is empty / not yet due.
-///
-/// Due rows are ranked by kind — `seal`, then `reembed_backfill`, then
-/// `flush_stale`, then `append_buffer`, then everything else — and by
-/// `available_at_ms` within a rank (the query below explains why).
-///
-/// Retired kinds (`topic_route`, `digest_daily`) are excluded from the claim so
-/// a leftover old-queue row never reaches `row_to_job` (which would fail to
-/// parse it). [`purge_retired_jobs`] removes such rows.
-pub fn claim_next(config: &MemoryConfig, lock_duration_ms: i64) -> Result<Option<Job>> {
-    with_connection(config, |conn| {
-        let now_ms = Utc::now().timestamp_millis();
-        let lock_until = now_ms.saturating_add(lock_duration_ms);
+pub(crate) fn job_key(id: &str) -> String {
+    format!("{JOB_PREFIX}{id}")
+}
 
-        let row = conn
-            .query_row(
-                // Drain forward, don't widen. Most-downstream kinds run first so
-                // a slow LLM-bound `extract_chunk` can't starve the seal pipeline
-                // behind it.
-                //
-                // `reembed_backfill` ranks right after `seal`: it is the only
-                // path that writes chunk vectors (extract no longer embeds
-                // inline) and it shares the single-permit LLM gate with every
-                // `extract_chunk`. Left in the ELSE bucket, the gate-busy defer
-                // round-robins it behind the whole extraction backlog, so
-                // vectors trail extraction by the length of that backlog
-                // (tinyhumansai/tinycortex#168). Ranked here, each freed permit
-                // goes to the backfill while it has work; one step embeds one
-                // bounded batch, defers `REEMBED_BACKFILL_REVISIT_MS`, and
-                // settles `Done` once covered, so extraction is never starved
-                // in return.
-                "UPDATE mem_tree_jobs
-                    SET status = 'running',
-                        attempts = attempts + 1,
-                        started_at_ms = ?1,
-                        locked_until_ms = ?2,
-                        last_error = NULL
-                  WHERE id = (
-                      SELECT id FROM mem_tree_jobs
-                       WHERE status = 'ready'
-                         AND available_at_ms <= ?1
-                         AND kind NOT IN ('topic_route', 'digest_daily')
-                       ORDER BY
-                         CASE kind
-                           WHEN 'seal'             THEN 1
-                           WHEN 'reembed_backfill' THEN 2
-                           WHEN 'flush_stale'      THEN 3
-                           WHEN 'append_buffer'    THEN 4
-                           ELSE 5
-                         END ASC,
-                         available_at_ms ASC
-                       LIMIT 1
-                  )
-              RETURNING id, kind, payload_json, dedupe_key, status, attempts,
-                        max_attempts, available_at_ms, locked_until_ms, last_error,
-                        created_at_ms, started_at_ms, completed_at_ms,
-                        failure_reason, failure_class",
-                params![now_ms, lock_until],
-                row_to_job,
-            )
-            .optional()
-            .context("Failed to claim next mem_tree_jobs row")?;
-        Ok(row)
+pub(crate) fn dedupe_state_key(key: &str) -> String {
+    let digest = sha256_hex(key.as_bytes());
+    format!("{DEDUPE_PREFIX}{digest}")
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn decode_job(value: &Value) -> Result<JobRecord> {
+    serde_json::from_value(value.clone()).context("decode durable queue job")
+}
+
+fn encode_job(job: &JobRecord) -> Result<Value> {
+    Ok(serde_json::to_value(job)?)
+}
+
+pub(crate) fn state_change(job: &JobRecord) -> Result<StateChange> {
+    Ok(StateChange {
+        collection: JOBS.to_owned(),
+        key: job_key(&job.id),
+        value: Some(encode_job(job)?),
     })
 }
 
-/// Delete any retired-kind rows (`topic_route`, `digest_daily`) left over from
-/// before the global/topic trees were removed. The chunks schema is shared DDL
-/// and never migrated by this crate, so this is the queue's own one-shot
-/// cleanup; callers run it at worker startup. Returns the number deleted.
-pub fn purge_retired_jobs(config: &MemoryConfig) -> Result<usize> {
-    with_connection(config, |conn| {
-        let n = conn.execute(
-            "DELETE FROM mem_tree_jobs WHERE kind IN ('topic_route', 'digest_daily')",
-            [],
-        )?;
-        Ok(n)
+pub(crate) fn read_record(config: &MemoryConfig, id: &str) -> Result<Option<(Value, JobRecord)>> {
+    let key = job_key(id);
+    let Some(value) = versioned::read_state(config, JOBS, &key)? else {
+        return Ok(None);
+    };
+    Ok(Some((value.clone(), decode_job(&value)?)))
+}
+
+pub(crate) async fn read_record_async(
+    config: &MemoryConfig,
+    id: &str,
+) -> Result<Option<(Value, JobRecord)>> {
+    let key = job_key(id);
+    let Some(value) = versioned::read_state_async(config, JOBS, &key).await? else {
+        return Ok(None);
+    };
+    Ok(Some((value.clone(), decode_job(&value)?)))
+}
+
+pub(crate) fn all_job_records(config: &MemoryConfig) -> Result<Vec<(Value, JobRecord)>> {
+    versioned::list_state(config, JOBS)?
+        .into_iter()
+        .filter(|(key, _)| key.starts_with(JOB_PREFIX))
+        .map(|(_, value)| Ok((value.clone(), decode_job(&value)?)))
+        .collect()
+}
+
+#[cfg(any(feature = "tokio", test))]
+pub(crate) async fn all_job_records_async(
+    config: &MemoryConfig,
+) -> Result<Vec<(Value, JobRecord)>> {
+    versioned::list_state_async(config, JOBS)
+        .await?
+        .into_iter()
+        .filter(|(key, _)| key.starts_with(JOB_PREFIX))
+        .map(|(_, value)| Ok((value.clone(), decode_job(&value)?)))
+        .collect()
+}
+
+/// Stage removal of every durable queue record at an already captured owner
+/// snapshot. Callers combine this with the rest of a purge's expected values
+/// and mutations, then commit with
+/// `commit_if_state_matches_at_snapshot_async`; any enqueue before that commit
+/// advances the head and forces the caller to replan. Queue messages are only
+/// wake-up hints, so messages left behind by the purge are harmless.
+pub(crate) async fn stage_purge_jobs_at_snapshot(
+    config: &MemoryConfig,
+    snapshot: &versioned::HeadSnapshot,
+) -> Result<(Vec<StateChange>, Vec<StateChange>)> {
+    let rows = versioned::list_state_at_snapshot_async(config, snapshot, JOBS).await?;
+    let mut expected = Vec::with_capacity(rows.len());
+    let mut changes = Vec::with_capacity(rows.len());
+    for (key, value) in rows {
+        expected.push(StateChange {
+            collection: JOBS.to_owned(),
+            key: key.clone(),
+            value: Some(value),
+        });
+        changes.push(StateChange {
+            collection: JOBS.to_owned(),
+            key,
+            value: None,
+        });
+    }
+    Ok((expected, changes))
+}
+
+/// Queue rows staged as part of a typed source import. `expected` and
+/// `changes` are committed with the caller's imported domain state under the
+/// same captured owner snapshot; `publish` contains only ready records whose
+/// wake-up hints may be sent after that commit succeeds.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct StagedImportJobs {
+    pub(crate) expected: Vec<StateChange>,
+    pub(crate) changes: Vec<StateChange>,
+    pub(crate) publish: Vec<JobRecord>,
+}
+
+/// Stage imported queue jobs and their dedupe pointers against one captured
+/// owner snapshot. Imports must supply stable job IDs. A repeated ID is
+/// idempotent only when it describes the same job intent; an active dedupe
+/// pointer owned by another job is a conflict and leaves the caller's source
+/// untouched.
+pub(crate) async fn stage_import_jobs_at_snapshot(
+    config: &MemoryConfig,
+    snapshot: &versioned::HeadSnapshot,
+    jobs: &[ImportedJob],
+) -> Result<StagedImportJobs> {
+    let rows = versioned::list_state_at_snapshot_async(config, snapshot, JOBS).await?;
+    let current: HashMap<_, _> = rows.into_iter().collect();
+    let mut expected = BTreeMap::<String, Option<Value>>::new();
+    let mut changes = BTreeMap::<String, Option<Value>>::new();
+    let mut seen_ids = HashSet::new();
+    let mut seen_dedupe = HashMap::<String, String>::new();
+    let mut publish = Vec::new();
+
+    for job in jobs {
+        let id = job.id.as_str();
+        anyhow::ensure!(!id.is_empty(), "typed queue import job ID cannot be empty");
+        anyhow::ensure!(
+            job.max_attempts > 0,
+            "typed queue import job {id} has a zero attempt budget"
+        );
+        anyhow::ensure!(
+            job.created_at_ms >= 0,
+            "typed queue import job {id} has a negative creation timestamp"
+        );
+        if let Some(started_at_ms) = job.started_at_ms {
+            anyhow::ensure!(
+                started_at_ms >= job.created_at_ms,
+                "typed queue import job {id} started before it was created"
+            );
+        }
+        if let Some(completed_at_ms) = job.completed_at_ms {
+            anyhow::ensure!(
+                completed_at_ms >= job.created_at_ms
+                    && job
+                        .started_at_ms
+                        .is_none_or(|started| completed_at_ms >= started),
+                "typed queue import job {id} completed before its creation or start"
+            );
+        }
+        anyhow::ensure!(
+            job.status != JobStatus::Running || job.completed_at_ms.is_none(),
+            "typed queue import running job {id} has a completion timestamp"
+        );
+        anyhow::ensure!(
+            seen_ids.insert(id.to_owned()),
+            "typed queue import contains duplicate job ID {id}"
+        );
+
+        if let Some(dedupe_key) = &job.dedupe_key {
+            if let Some(other_id) = seen_dedupe.insert(dedupe_key.clone(), id.to_owned()) {
+                anyhow::ensure!(
+                    other_id == id,
+                    "typed queue import reuses dedupe key {dedupe_key} for multiple jobs"
+                );
+            }
+        }
+
+        let key = job_key(id);
+        let mut proposed = record_from_imported(job);
+        let existing = current.get(&key).cloned();
+        expected.insert(key.clone(), existing.clone());
+        let record = if let Some(value) = existing {
+            let record = decode_job(&value)?;
+            anyhow::ensure!(
+                record.kind == proposed.kind
+                    && record.payload_json == proposed.payload_json
+                    && record.dedupe_key == proposed.dedupe_key
+                    && record.max_attempts == proposed.max_attempts
+                    && record.created_at_ms == proposed.created_at_ms,
+                "stable imported queue job ID {id} was reused with a different intent"
+            );
+            // Source import is idempotent and must never roll back progress
+            // made by a destination worker since a previous import attempt.
+            record
+        } else {
+            if job.status == JobStatus::Running {
+                proposed.status = JobStatus::Ready.as_str().to_owned();
+            }
+            changes.insert(key, Some(encode_job(&proposed)?));
+            proposed
+        };
+
+        let active = matches!(record.status()?, JobStatus::Ready | JobStatus::Running);
+        if active {
+            if let Some(dedupe) = &job.dedupe_key {
+                let dkey = dedupe_state_key(dedupe);
+                let pointer = current.get(&dkey).cloned();
+                expected.insert(dkey.clone(), pointer.clone());
+                let pointer_id = pointer
+                    .as_ref()
+                    .map(|value| value.as_str().context("decode queue dedupe pointer"))
+                    .transpose()?;
+                if let Some(active_id) = pointer_id.filter(|active_id| *active_id != id) {
+                    if let Some(active_value) = current.get(&job_key(active_id)) {
+                        let active = decode_job(active_value)?;
+                        anyhow::ensure!(
+                        !matches!(active.status()?, JobStatus::Ready | JobStatus::Running),
+                        "imported dedupe key {dedupe} is already owned by active job {active_id}"
+                    );
+                    }
+                }
+                if pointer_id != Some(id) {
+                    changes.insert(dkey, Some(Value::String(id.to_owned())));
+                }
+            }
+        }
+
+        if record.status()? == JobStatus::Ready {
+            publish.push(record);
+        }
+    }
+
+    Ok(StagedImportJobs {
+        expected: expected
+            .into_iter()
+            .map(|(key, value)| StateChange {
+                collection: JOBS.to_owned(),
+                key,
+                value,
+            })
+            .collect(),
+        changes: changes
+            .into_iter()
+            .map(|(key, value)| StateChange {
+                collection: JOBS.to_owned(),
+                key,
+                value,
+            })
+            .collect(),
+        publish,
     })
 }
 
-/// Quick count helper for tests / diagnostics.
-pub fn count_by_status(config: &MemoryConfig, status: JobStatus) -> Result<u64> {
-    with_connection(config, |conn| {
-        let n: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM mem_tree_jobs WHERE status = ?1",
-            params![status.as_str()],
-            |r| r.get(0),
-        )?;
-        Ok(n.max(0) as u64)
-    })
+fn record_from_imported(job: &ImportedJob) -> JobRecord {
+    let recovered_status = match job.status {
+        JobStatus::Running => JobStatus::Ready,
+        status => status,
+    };
+    JobRecord {
+        id: job.id.clone(),
+        kind: job.kind.as_str().to_owned(),
+        payload_json: job.payload_json.clone(),
+        dedupe_key: job.dedupe_key.clone(),
+        status: recovered_status.as_str().to_owned(),
+        attempts: job.attempts,
+        max_attempts: job.max_attempts,
+        available_at_ms: job.available_at_ms,
+        locked_until_ms: None,
+        last_error: job.last_error.clone(),
+        failure_reason: job.failure_reason.clone(),
+        failure_class: job.failure_class.clone(),
+        created_at_ms: job.created_at_ms,
+        started_at_ms: job.started_at_ms,
+        completed_at_ms: job.completed_at_ms,
+        hint_generation: 0,
+        lease_epoch: 0,
+        lease_token: None,
+    }
 }
 
-/// Count terminally-`failed` jobs whose typed class is `unrecoverable` — the
-/// ones [`super::store_settle::requeue_transient_failed`] deliberately leaves
-/// parked (budget / auth / dim-mismatch) because retrying can't help. The
-/// predicate is the exact complement of the requeue gate's
-/// `IS NULL OR != 'unrecoverable'`, so the two never drift.
-pub fn count_failed_unrecoverable(config: &MemoryConfig) -> Result<u64> {
-    with_connection(config, |conn| {
-        let n: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM mem_tree_jobs \
-              WHERE status = 'failed' AND failure_class = 'unrecoverable'",
-            [],
-            |r| r.get(0),
-        )?;
-        Ok(n.max(0) as u64)
-    })
+/// Publish the queue hints for an import only after its owner-state CAS has
+/// committed. If publication fails, periodic ready-job repair can safely retry
+/// these same stable job IDs.
+pub(crate) async fn publish_import_job_hints_async(
+    config: &MemoryConfig,
+    records: &[JobRecord],
+) -> Result<()> {
+    for record in records {
+        if record.status()? == JobStatus::Ready {
+            enqueue_hint_async(config, record).await?;
+        }
+    }
+    Ok(())
 }
 
-/// Total count regardless of status — handy for assertions.
-pub fn count_total(config: &MemoryConfig) -> Result<u64> {
-    with_connection(config, |conn| {
-        let n: i64 = conn.query_row("SELECT COUNT(*) FROM mem_tree_jobs", [], |r| r.get(0))?;
-        Ok(n.max(0) as u64)
-    })
+pub(crate) fn replace_record(
+    config: &MemoryConfig,
+    old_value: &Value,
+    next: &JobRecord,
+) -> Result<bool> {
+    versioned::commit_if_state_matches(
+        config,
+        &[StateChange {
+            collection: JOBS.to_owned(),
+            key: job_key(&next.id),
+            value: Some(old_value.clone()),
+        }],
+        &[],
+        &[state_change(next)?],
+    )
 }
 
-/// Fetch one job by id (test/diagnostic helper).
-pub fn get_job(config: &MemoryConfig, id: &str) -> Result<Option<Job>> {
-    with_connection(config, |conn| {
-        let job = conn
-            .query_row(
-                "SELECT id, kind, payload_json, dedupe_key, status, attempts, max_attempts,
-                        available_at_ms, locked_until_ms, last_error,
-                        created_at_ms, started_at_ms, completed_at_ms,
-                        failure_reason, failure_class
-                   FROM mem_tree_jobs WHERE id = ?1",
-                params![id],
-                row_to_job,
-            )
-            .optional()?;
-        Ok(job)
-    })
+pub(crate) fn publish_record(config: &MemoryConfig, record: &JobRecord) -> Result<()> {
+    enqueue_hint(config, record)
 }
 
-/// Map one `mem_tree_jobs` row (in the fixed column order used by every query
-/// in this module: `id, kind, payload_json, dedupe_key, status, attempts,
-/// max_attempts, available_at_ms, locked_until_ms, last_error, created_at_ms,
-/// started_at_ms, completed_at_ms, failure_reason, failure_class`) into a
-/// [`Job`]. Negative `attempts`/`max_attempts` (which should never occur) are
-/// clamped to 0 rather than panicking. Returns `Err` if `kind` or `status`
-/// fails to parse — callers should treat that as a schema/data invariant
-/// violation, not a transient error.
-pub(crate) fn row_to_job(row: &rusqlite::Row<'_>) -> rusqlite::Result<Job> {
-    let id: String = row.get(0)?;
-    let kind_s: String = row.get(1)?;
-    let payload_json: String = row.get(2)?;
-    let dedupe_key: Option<String> = row.get(3)?;
-    let status_s: String = row.get(4)?;
-    let attempts: i64 = row.get(5)?;
-    let max_attempts: i64 = row.get(6)?;
-    let available_at_ms: i64 = row.get(7)?;
-    let locked_until_ms: Option<i64> = row.get(8)?;
-    let last_error: Option<String> = row.get(9)?;
-    let created_at_ms: i64 = row.get(10)?;
-    let started_at_ms: Option<i64> = row.get(11)?;
-    let completed_at_ms: Option<i64> = row.get(12)?;
-    let failure_reason: Option<String> = row.get(13)?;
-    let failure_class: Option<String> = row.get(14)?;
+#[cfg(any(feature = "tokio", test))]
+pub(crate) async fn publish_record_async(config: &MemoryConfig, record: &JobRecord) -> Result<()> {
+    enqueue_hint_async(config, record).await
+}
 
-    let kind = JobKind::parse(&kind_s).map_err(|e| {
-        rusqlite::Error::FromSqlConversionFailure(1, rusqlite::types::Type::Text, e.into())
-    })?;
-    let status = JobStatus::parse(&status_s).map_err(|e| {
-        rusqlite::Error::FromSqlConversionFailure(4, rusqlite::types::Type::Text, e.into())
-    })?;
+fn hint_message(record: &JobRecord, now_ms: i64) -> NewMessage {
+    let delay_ms = record.available_at_ms.saturating_sub(now_ms).max(0) as u64;
+    NewMessage::new(json!({"job_id": record.id, "generation": record.hint_generation}))
+        .priority(queue_priority(&record.kind))
+        .delay_ms(delay_ms)
+        // This is only a finite-window optimization. Duplicate hints are
+        // harmless because the durable hint generation is authoritative.
+        // Redelivery keeps the same key, while each new ready-state
+        // generation gets a fresh key even when the backend retains finite-
+        // window dedupe entries for acknowledged hints.
+        .dedupe_key(format!("job:{}:{}", record.id, record.hint_generation))
+}
 
-    Ok(Job {
+fn queue_priority(kind: &str) -> u8 {
+    match kind {
+        "seal" => 9,
+        "reembed_backfill" => 8,
+        "flush_stale" => 7,
+        "append_buffer" => 6,
+        _ => 5,
+    }
+}
+
+fn enqueue_hint(config: &MemoryConfig, record: &JobRecord) -> Result<()> {
+    let queues = config.storage()?.queues().clone();
+    let message = hint_message(record, Utc::now().timestamp_millis());
+    config
+        .storage_blocking()?
+        .run(async move {
+            queues
+                .enqueue(crate::memory::queue::QUEUE_NAME, &[message])
+                .await
+        })?
+        .map_err(anyhow::Error::from)?;
+    Ok(())
+}
+
+async fn enqueue_hint_async(config: &MemoryConfig, record: &JobRecord) -> Result<()> {
+    let queues = config.storage()?.queues().clone();
+    let message = hint_message(record, Utc::now().timestamp_millis());
+    config
+        .storage_blocking()?
+        .run_async(async move {
+            queues
+                .enqueue(crate::memory::queue::QUEUE_NAME, &[message])
+                .await
+        })
+        .await?
+        .map_err(anyhow::Error::from)?;
+    Ok(())
+}
+
+fn record_from_new(config: &MemoryConfig, job: &NewJob, id: String) -> JobRecord {
+    let now = Utc::now().timestamp_millis();
+    JobRecord {
         id,
-        kind,
-        payload_json,
-        dedupe_key,
-        status,
-        attempts: attempts.max(0) as u32,
-        max_attempts: max_attempts.max(0) as u32,
-        available_at_ms,
-        locked_until_ms,
-        last_error,
-        failure_reason,
-        failure_class,
-        created_at_ms,
-        started_at_ms,
-        completed_at_ms,
-    })
+        kind: job.kind.as_str().to_owned(),
+        payload_json: job.payload_json.clone(),
+        dedupe_key: job.dedupe_key.clone(),
+        status: JobStatus::Ready.as_str().to_owned(),
+        attempts: 0,
+        max_attempts: job.max_attempts.unwrap_or(config.queue.max_attempts.max(1)),
+        available_at_ms: job.available_at_ms.unwrap_or(now),
+        locked_until_ms: None,
+        last_error: None,
+        failure_reason: None,
+        failure_class: None,
+        created_at_ms: now,
+        started_at_ms: None,
+        completed_at_ms: None,
+        hint_generation: 0,
+        lease_epoch: 0,
+        lease_token: None,
+    }
 }
 
-/// Exponential backoff: attempt 1 → 60s, 2 → 120s, 3 → 240s, capped at 1h.
+/// Enqueue one durable job. An optional dedupe key suppresses another active
+/// job with the same key. A message is published only after the owner-head CAS;
+/// bootstrap repairs the crash window between that CAS and queue publication.
+pub fn enqueue(config: &MemoryConfig, job: &NewJob) -> Result<Option<String>> {
+    let id = job
+        .id
+        .clone()
+        .unwrap_or_else(|| format!("job:{}", Uuid::new_v4()));
+    let record = record_from_new(config, job, id.clone());
+    let key = job_key(&id);
+
+    for _ in 0..PUBLISH_RETRIES {
+        let existing = versioned::read_state(config, JOBS, &key)?;
+        if let Some(value) = &existing {
+            let current = decode_job(value)?;
+            if job.id.is_some()
+                && (current.kind != record.kind
+                    || current.payload_json != record.payload_json
+                    || current.dedupe_key != record.dedupe_key
+                    || current.max_attempts != record.max_attempts)
+            {
+                anyhow::bail!("stable queue job ID was reused with a different intent");
+            }
+            if current.status()? == JobStatus::Ready {
+                enqueue_hint(config, &current)?;
+            }
+            // Stable outbox IDs suppress a retry even after completion.
+            if job.id.is_some() {
+                return Ok(None);
+            }
+        }
+
+        let mut expected = vec![StateChange {
+            collection: JOBS.to_owned(),
+            key: key.clone(),
+            value: existing,
+        }];
+        let mut changes = vec![state_change(&record)?];
+        if let Some(dedupe) = &job.dedupe_key {
+            let dkey = dedupe_state_key(dedupe);
+            let current_id = versioned::read_state(config, JOBS, &dkey)?;
+            if let Some(value) = &current_id {
+                if let Some(active_id) = value.as_str() {
+                    if let Some((_, active)) = read_record(config, active_id)? {
+                        if matches!(active.status()?, JobStatus::Ready | JobStatus::Running) {
+                            enqueue_hint(config, &active)?;
+                            return Ok(None);
+                        }
+                    }
+                }
+            }
+            expected.push(StateChange {
+                collection: JOBS.to_owned(),
+                key: dkey.clone(),
+                value: current_id,
+            });
+            changes.push(StateChange {
+                collection: JOBS.to_owned(),
+                key: dkey,
+                value: Some(Value::String(id.clone())),
+            });
+        }
+        if versioned::commit_if_state_matches(config, &expected, &[], &changes)? {
+            enqueue_hint(config, &record)?;
+            return Ok(Some(id));
+        }
+    }
+    anyhow::bail!("queue enqueue compare-and-swap did not succeed within retry budget")
+}
+
+pub(crate) async fn enqueue_async(config: &MemoryConfig, job: &NewJob) -> Result<Option<String>> {
+    let id = job
+        .id
+        .clone()
+        .unwrap_or_else(|| format!("job:{}", Uuid::new_v4()));
+    let record = record_from_new(config, job, id.clone());
+    let key = job_key(&id);
+
+    for _ in 0..PUBLISH_RETRIES {
+        let existing = versioned::read_state_async(config, JOBS, &key).await?;
+        if let Some(value) = &existing {
+            let current = decode_job(value)?;
+            if job.id.is_some()
+                && (current.kind != record.kind
+                    || current.payload_json != record.payload_json
+                    || current.dedupe_key != record.dedupe_key
+                    || current.max_attempts != record.max_attempts)
+            {
+                anyhow::bail!("stable queue job ID was reused with a different intent");
+            }
+            if current.status()? == JobStatus::Ready {
+                enqueue_hint_async(config, &current).await?;
+            }
+            if job.id.is_some() {
+                return Ok(None);
+            }
+        }
+
+        let mut expected = vec![StateChange {
+            collection: JOBS.to_owned(),
+            key: key.clone(),
+            value: existing,
+        }];
+        let mut changes = vec![state_change(&record)?];
+        if let Some(dedupe) = &job.dedupe_key {
+            let dkey = dedupe_state_key(dedupe);
+            let current_id = versioned::read_state_async(config, JOBS, &dkey).await?;
+            if let Some(active_id) = current_id.as_ref().and_then(Value::as_str) {
+                if let Some((_, active)) = read_record_async(config, active_id).await? {
+                    if matches!(active.status()?, JobStatus::Ready | JobStatus::Running) {
+                        enqueue_hint_async(config, &active).await?;
+                        return Ok(None);
+                    }
+                }
+            }
+            expected.push(StateChange {
+                collection: JOBS.to_owned(),
+                key: dkey.clone(),
+                value: current_id,
+            });
+            changes.push(StateChange {
+                collection: JOBS.to_owned(),
+                key: dkey,
+                value: Some(Value::String(id.clone())),
+            });
+        }
+        if versioned::commit_if_state_matches_async(config, &expected, &[], &changes).await? {
+            enqueue_hint_async(config, &record).await?;
+            return Ok(Some(id));
+        }
+    }
+    anyhow::bail!("queue enqueue compare-and-swap did not succeed within retry budget")
+}
+
+/// Claim the next due job by receiving one queue hint and CASing its durable
+/// lease generation. Stale and duplicate hints are acknowledged and skipped.
+pub fn claim_next(config: &MemoryConfig, lock_duration_ms: i64) -> Result<Option<Job>> {
+    let queues = config.storage()?.queues().clone();
+    let consumer = format!("tinycortex:{}", Uuid::new_v4());
+    let visibility = lock_duration_ms.max(1) as u64;
+    let mut repaired = false;
+    for _ in 0..MAX_STALE_HINTS {
+        let deliveries = config
+            .storage_blocking()?
+            .run({
+                let queues = queues.clone();
+                let consumer = consumer.clone();
+                async move {
+                    queues
+                        .receive(crate::memory::queue::QUEUE_NAME, 1, visibility, &consumer)
+                        .await
+                }
+            })?
+            .map_err(anyhow::Error::from)?;
+        let Some(delivery) = deliveries.into_iter().next() else {
+            if !repaired {
+                repaired = true;
+                if repair_pending_hints(config)? > 0 {
+                    continue;
+                }
+            }
+            return Ok(None);
+        };
+        let Some(id) = delivery.payload.get("job_id").and_then(Value::as_str) else {
+            ack(config, &delivery.receipt)?;
+            continue;
+        };
+        let Some((old_value, mut record)) = read_record(config, id)? else {
+            ack(config, &delivery.receipt)?;
+            continue;
+        };
+        if is_retired_kind(&record.kind) {
+            ack(config, &delivery.receipt)?;
+            continue;
+        }
+        if delivery
+            .payload
+            .get("generation")
+            .and_then(Value::as_u64)
+            .is_some_and(|generation| generation != record.hint_generation)
+        {
+            ack(config, &delivery.receipt)?;
+            continue;
+        }
+        let status = record.status()?;
+        if !matches!(status, JobStatus::Ready | JobStatus::Running) {
+            ack(config, &delivery.receipt)?;
+            continue;
+        }
+        let now_ms = Utc::now().timestamp_millis();
+        if status == JobStatus::Running
+            && record
+                .locked_until_ms
+                .is_some_and(|lease_until| lease_until > now_ms)
+        {
+            // An optional-dedupe backend may deliver duplicate hints while a
+            // separate valid receipt still owns this job. Do not steal it.
+            ack(config, &delivery.receipt)?;
+            continue;
+        }
+        if record.available_at_ms > now_ms {
+            nack(
+                config,
+                &delivery.receipt,
+                (record.available_at_ms - now_ms) as u64,
+            )?;
+            continue;
+        }
+        record.status = JobStatus::Running.as_str().to_owned();
+        record.attempts = record.attempts.saturating_add(1);
+        record.started_at_ms = Some(now_ms);
+        record.locked_until_ms = Some(delivery.lease_until_ms);
+        record.lease_epoch = record.lease_epoch.saturating_add(1);
+        record.lease_token = Some(delivery.receipt.token.clone());
+        let expected = [StateChange {
+            collection: JOBS.to_owned(),
+            key: job_key(id),
+            value: Some(old_value),
+        }];
+        if versioned::commit_if_state_matches(config, &expected, &[], &[state_change(&record)?])? {
+            return Ok(Some(record.public(Some(delivery.receipt))?));
+        }
+        // Another receiver changed the durable generation after this delivery
+        // was issued. Release the stale hint and continue looking.
+        ack(config, &delivery.receipt)?;
+    }
+    Ok(None)
+}
+
+pub(crate) async fn claim_next_async(
+    config: &MemoryConfig,
+    lock_duration_ms: i64,
+) -> Result<Option<Job>> {
+    let queues = config.storage()?.queues().clone();
+    let consumer = format!("tinycortex:{}", Uuid::new_v4());
+    let visibility = lock_duration_ms.max(1) as u64;
+    let mut repaired = false;
+    for _ in 0..MAX_STALE_HINTS {
+        let deliveries = config
+            .storage_blocking()?
+            .run_async({
+                let queues = queues.clone();
+                let consumer = consumer.clone();
+                async move {
+                    queues
+                        .receive(crate::memory::queue::QUEUE_NAME, 1, visibility, &consumer)
+                        .await
+                }
+            })
+            .await?
+            .map_err(anyhow::Error::from)?;
+        let Some(delivery) = deliveries.into_iter().next() else {
+            if !repaired {
+                repaired = true;
+                if repair_pending_hints_async(config).await? > 0 {
+                    continue;
+                }
+            }
+            return Ok(None);
+        };
+        let Some(id) = delivery.payload.get("job_id").and_then(Value::as_str) else {
+            ack_async(config, &delivery.receipt).await?;
+            continue;
+        };
+        let Some((old_value, mut record)) = read_record_async(config, id).await? else {
+            ack_async(config, &delivery.receipt).await?;
+            continue;
+        };
+        if is_retired_kind(&record.kind) {
+            ack_async(config, &delivery.receipt).await?;
+            continue;
+        }
+        if delivery
+            .payload
+            .get("generation")
+            .and_then(Value::as_u64)
+            .is_some_and(|generation| generation != record.hint_generation)
+        {
+            ack_async(config, &delivery.receipt).await?;
+            continue;
+        }
+        let status = record.status()?;
+        if !matches!(status, JobStatus::Ready | JobStatus::Running) {
+            ack_async(config, &delivery.receipt).await?;
+            continue;
+        }
+        let now_ms = Utc::now().timestamp_millis();
+        if status == JobStatus::Running
+            && record
+                .locked_until_ms
+                .is_some_and(|lease_until| lease_until > now_ms)
+        {
+            ack_async(config, &delivery.receipt).await?;
+            continue;
+        }
+        if record.available_at_ms > now_ms {
+            nack_async(
+                config,
+                &delivery.receipt,
+                (record.available_at_ms - now_ms) as u64,
+            )
+            .await?;
+            continue;
+        }
+        record.status = JobStatus::Running.as_str().to_owned();
+        record.attempts = record.attempts.saturating_add(1);
+        record.started_at_ms = Some(now_ms);
+        record.locked_until_ms = Some(delivery.lease_until_ms);
+        record.lease_epoch = record.lease_epoch.saturating_add(1);
+        record.lease_token = Some(delivery.receipt.token.clone());
+        let expected = [StateChange {
+            collection: JOBS.to_owned(),
+            key: job_key(id),
+            value: Some(old_value),
+        }];
+        if versioned::commit_if_state_matches_async(
+            config,
+            &expected,
+            &[],
+            &[state_change(&record)?],
+        )
+        .await?
+        {
+            return Ok(Some(record.public(Some(delivery.receipt))?));
+        }
+        ack_async(config, &delivery.receipt).await?;
+    }
+    Ok(None)
+}
+
+fn ack(config: &MemoryConfig, receipt: &tinystoragedrivers_types::Receipt) -> Result<bool> {
+    let queues = config.storage()?.queues().clone();
+    let receipt = receipt.clone();
+    config
+        .storage_blocking()?
+        .run(async move { queues.ack(crate::memory::queue::QUEUE_NAME, &receipt).await })?
+        .map_err(anyhow::Error::from)
+}
+
+async fn ack_async(
+    config: &MemoryConfig,
+    receipt: &tinystoragedrivers_types::Receipt,
+) -> Result<bool> {
+    let queues = config.storage()?.queues().clone();
+    let receipt = receipt.clone();
+    config
+        .storage_blocking()?
+        .run_async(async move { queues.ack(crate::memory::queue::QUEUE_NAME, &receipt).await })
+        .await?
+        .map_err(anyhow::Error::from)
+}
+
+fn nack(
+    config: &MemoryConfig,
+    receipt: &tinystoragedrivers_types::Receipt,
+    delay_ms: u64,
+) -> Result<bool> {
+    let queues = config.storage()?.queues().clone();
+    let receipt = receipt.clone();
+    config
+        .storage_blocking()?
+        .run(async move {
+            queues
+                .nack(
+                    crate::memory::queue::QUEUE_NAME,
+                    &receipt,
+                    Retry::After(delay_ms.max(1)),
+                )
+                .await
+        })?
+        .map_err(anyhow::Error::from)
+}
+
+async fn nack_async(
+    config: &MemoryConfig,
+    receipt: &tinystoragedrivers_types::Receipt,
+    delay_ms: u64,
+) -> Result<bool> {
+    let queues = config.storage()?.queues().clone();
+    let receipt = receipt.clone();
+    config
+        .storage_blocking()?
+        .run_async(async move {
+            queues
+                .nack(
+                    crate::memory::queue::QUEUE_NAME,
+                    &receipt,
+                    Retry::After(delay_ms.max(1)),
+                )
+                .await
+        })
+        .await?
+        .map_err(anyhow::Error::from)
+}
+
+/// Commit a claimed job transition, domain mutations and follow-up rows under
+/// one versioned-head CAS. Follow-up queue hints are published afterwards and
+/// are repaired from durable ready rows on bootstrap if publication fails.
+pub(crate) fn commit_claimed(
+    config: &MemoryConfig,
+    claimed: &Job,
+    mut next: JobRecord,
+    domain_expected: &[StateChange],
+    domain_changes: &[StateChange],
+    follow_ups: &[NewJob],
+) -> Result<bool> {
+    let Some((old_value, current)) = read_record(config, &claimed.id)? else {
+        return Ok(false);
+    };
+    let now_ms = Utc::now().timestamp_millis();
+    if current.status()? != JobStatus::Running
+        || current.lease_epoch != claimed.lease_epoch
+        || current.lease_token.as_deref()
+            != claimed
+                .queue_receipt
+                .as_ref()
+                .map(|receipt| receipt.token.as_str())
+        || current
+            .locked_until_ms
+            .is_none_or(|lease_until| lease_until <= now_ms)
+    {
+        return Ok(false);
+    }
+    next.lease_epoch = current.lease_epoch;
+    next.hint_generation = current.hint_generation;
+    if next.status == JobStatus::Ready.as_str() {
+        next.hint_generation = next.hint_generation.saturating_add(1);
+    }
+    next.lease_token = None;
+    let mut expected = vec![StateChange {
+        collection: JOBS.to_owned(),
+        key: job_key(&claimed.id),
+        value: Some(old_value),
+    }];
+    expected.extend_from_slice(domain_expected);
+    let mut changes = vec![state_change(&next)?];
+    let mut child_records = Vec::with_capacity(follow_ups.len());
+    for (index, follow_up) in follow_ups.iter().enumerate() {
+        let id = follow_up.id.clone().unwrap_or_else(|| {
+            format!(
+                "job:followup:{}:{}:{index}",
+                claimed.id, claimed.lease_epoch
+            )
+        });
+        let child = record_from_new(config, follow_up, id.clone());
+        let key = job_key(&id);
+        let existing = versioned::read_state(config, JOBS, &key)?;
+        if let Some(existing_value) = existing {
+            // Follow-up IDs are stable outbox identities; an earlier commit
+            // already made this intent durable. Fence that observation so a
+            // concurrent delete cannot make this parent commit lose its only
+            // copy of the intent.
+            expected.push(StateChange {
+                collection: JOBS.to_owned(),
+                key,
+                value: Some(existing_value),
+            });
+            continue;
+        }
+        if let Some(dedupe) = &follow_up.dedupe_key {
+            let dkey = dedupe_state_key(dedupe);
+            let current_id = versioned::read_state(config, JOBS, &dkey)?;
+            if let Some(value) = &current_id {
+                if let Some(active_id) = value.as_str() {
+                    if let Some((active_value, active)) = read_record(config, active_id)? {
+                        if matches!(active.status()?, JobStatus::Ready | JobStatus::Running) {
+                            // Preserve the queue's active-dedupe contract, but
+                            // fence both observations so a concurrent terminal
+                            // transition cannot erase the only follow-up intent.
+                            expected.push(StateChange {
+                                collection: JOBS.to_owned(),
+                                key: dkey,
+                                value: current_id.clone(),
+                            });
+                            expected.push(StateChange {
+                                collection: JOBS.to_owned(),
+                                key: job_key(active_id),
+                                value: Some(active_value),
+                            });
+                            continue;
+                        }
+                    }
+                }
+            }
+            expected.push(StateChange {
+                collection: JOBS.to_owned(),
+                key: dkey.clone(),
+                value: current_id,
+            });
+            changes.push(StateChange {
+                collection: JOBS.to_owned(),
+                key: dkey,
+                value: Some(Value::String(id)),
+            });
+        }
+        expected.push(StateChange {
+            collection: JOBS.to_owned(),
+            key,
+            value: None,
+        });
+        changes.push(state_change(&child)?);
+        child_records.push(child);
+    }
+    if next.status != JobStatus::Ready.as_str() && next.status != JobStatus::Running.as_str() {
+        if let Some(dedupe) = &current.dedupe_key {
+            let key = dedupe_state_key(dedupe);
+            let mapped = versioned::read_state(config, JOBS, &key)?;
+            if mapped.as_ref().and_then(Value::as_str) == Some(claimed.id.as_str()) {
+                expected.push(StateChange {
+                    collection: JOBS.to_owned(),
+                    key: key.clone(),
+                    value: mapped,
+                });
+                changes.push(StateChange {
+                    collection: JOBS.to_owned(),
+                    key,
+                    value: None,
+                });
+            }
+        }
+    }
+    changes.extend_from_slice(domain_changes);
+    if !versioned::commit_if_state_matches(config, &expected, &[], &changes)? {
+        return Ok(false);
+    }
+    if let Some(receipt) = &claimed.queue_receipt {
+        ack(config, receipt)?;
+    }
+    if next.status == JobStatus::Ready.as_str() {
+        enqueue_hint(config, &next)?;
+    }
+    for child in &child_records {
+        enqueue_hint(config, child)?;
+    }
+    Ok(true)
+}
+
+pub(crate) async fn commit_claimed_async(
+    config: &MemoryConfig,
+    claimed: &Job,
+    mut next: JobRecord,
+    domain_expected: &[StateChange],
+    domain_changes: &[StateChange],
+    follow_ups: &[NewJob],
+) -> Result<bool> {
+    let Some((old_value, current)) = read_record_async(config, &claimed.id).await? else {
+        return Ok(false);
+    };
+    let now_ms = Utc::now().timestamp_millis();
+    if current.status()? != JobStatus::Running
+        || current.lease_epoch != claimed.lease_epoch
+        || current.lease_token.as_deref()
+            != claimed
+                .queue_receipt
+                .as_ref()
+                .map(|receipt| receipt.token.as_str())
+        || current
+            .locked_until_ms
+            .is_none_or(|lease_until| lease_until <= now_ms)
+    {
+        return Ok(false);
+    }
+    next.lease_epoch = current.lease_epoch;
+    next.hint_generation = current.hint_generation;
+    if next.status == JobStatus::Ready.as_str() {
+        next.hint_generation = next.hint_generation.saturating_add(1);
+    }
+    next.lease_token = None;
+    let mut expected = vec![StateChange {
+        collection: JOBS.to_owned(),
+        key: job_key(&claimed.id),
+        value: Some(old_value),
+    }];
+    expected.extend_from_slice(domain_expected);
+    let mut changes = vec![state_change(&next)?];
+    let mut child_records = Vec::with_capacity(follow_ups.len());
+    for (index, follow_up) in follow_ups.iter().enumerate() {
+        let id = follow_up.id.clone().unwrap_or_else(|| {
+            format!(
+                "job:followup:{}:{}:{index}",
+                claimed.id, claimed.lease_epoch
+            )
+        });
+        let child = record_from_new(config, follow_up, id.clone());
+        let key = job_key(&id);
+        let existing = versioned::read_state_async(config, JOBS, &key).await?;
+        if let Some(existing_value) = existing {
+            expected.push(StateChange {
+                collection: JOBS.to_owned(),
+                key,
+                value: Some(existing_value),
+            });
+            continue;
+        }
+        if let Some(dedupe) = &follow_up.dedupe_key {
+            let dkey = dedupe_state_key(dedupe);
+            let current_id = versioned::read_state_async(config, JOBS, &dkey).await?;
+            if let Some(active_id) = current_id.as_ref().and_then(Value::as_str) {
+                if let Some((active_value, active)) = read_record_async(config, active_id).await? {
+                    if matches!(active.status()?, JobStatus::Ready | JobStatus::Running) {
+                        expected.push(StateChange {
+                            collection: JOBS.to_owned(),
+                            key: dkey,
+                            value: current_id.clone(),
+                        });
+                        expected.push(StateChange {
+                            collection: JOBS.to_owned(),
+                            key: job_key(active_id),
+                            value: Some(active_value),
+                        });
+                        continue;
+                    }
+                }
+            }
+            expected.push(StateChange {
+                collection: JOBS.to_owned(),
+                key: dkey.clone(),
+                value: current_id,
+            });
+            changes.push(StateChange {
+                collection: JOBS.to_owned(),
+                key: dkey,
+                value: Some(Value::String(id)),
+            });
+        }
+        expected.push(StateChange {
+            collection: JOBS.to_owned(),
+            key,
+            value: None,
+        });
+        changes.push(state_change(&child)?);
+        child_records.push(child);
+    }
+    if next.status != JobStatus::Ready.as_str() && next.status != JobStatus::Running.as_str() {
+        if let Some(dedupe) = &current.dedupe_key {
+            let key = dedupe_state_key(dedupe);
+            let mapped = versioned::read_state_async(config, JOBS, &key).await?;
+            if mapped.as_ref().and_then(Value::as_str) == Some(claimed.id.as_str()) {
+                expected.push(StateChange {
+                    collection: JOBS.to_owned(),
+                    key: key.clone(),
+                    value: mapped,
+                });
+                changes.push(StateChange {
+                    collection: JOBS.to_owned(),
+                    key,
+                    value: None,
+                });
+            }
+        }
+    }
+    changes.extend_from_slice(domain_changes);
+    if !versioned::commit_if_state_matches_async(config, &expected, &[], &changes).await? {
+        return Ok(false);
+    }
+    if let Some(receipt) = &claimed.queue_receipt {
+        ack_async(config, receipt).await?;
+    }
+    if next.status == JobStatus::Ready.as_str() {
+        enqueue_hint_async(config, &next).await?;
+    }
+    for child in &child_records {
+        enqueue_hint_async(config, child).await?;
+    }
+    Ok(true)
+}
+
+/// Remove legacy retired-kind records with a conditional owner-head commit.
+/// Ready-hint repair is handled separately by `repair_pending_hints`.
+/// Returns the number of retired rows removed.
+pub fn purge_retired_jobs(config: &MemoryConfig) -> Result<usize> {
+    for _ in 0..PUBLISH_RETRIES {
+        let records = versioned::list_state(config, JOBS)?;
+        let mut expected = Vec::new();
+        let mut changes = Vec::new();
+        for (key, value) in records {
+            if !key.starts_with(JOB_PREFIX) {
+                continue;
+            }
+            let record = decode_job(&value)?;
+            if RETIRED_JOB_KINDS.contains(&record.kind.as_str()) {
+                expected.push(StateChange {
+                    collection: JOBS.to_owned(),
+                    key: key.clone(),
+                    value: Some(value),
+                });
+                changes.push(StateChange {
+                    collection: JOBS.to_owned(),
+                    key,
+                    value: None,
+                });
+            }
+        }
+        if changes.is_empty() {
+            return Ok(0);
+        }
+        let count = changes.len();
+        if versioned::commit_if_state_matches(config, &expected, &[], &changes)? {
+            return Ok(count);
+        }
+    }
+    anyhow::bail!("retired queue job cleanup conflicted within retry budget")
+}
+
+#[cfg(any(feature = "tokio", test))]
+pub(crate) async fn purge_retired_jobs_async(config: &MemoryConfig) -> Result<usize> {
+    for _ in 0..PUBLISH_RETRIES {
+        let records = versioned::list_state_async(config, JOBS).await?;
+        let mut expected = Vec::new();
+        let mut changes = Vec::new();
+        for (key, value) in records {
+            if !key.starts_with(JOB_PREFIX) {
+                continue;
+            }
+            let record = decode_job(&value)?;
+            if RETIRED_JOB_KINDS.contains(&record.kind.as_str()) {
+                expected.push(StateChange {
+                    collection: JOBS.to_owned(),
+                    key: key.clone(),
+                    value: Some(value),
+                });
+                changes.push(StateChange {
+                    collection: JOBS.to_owned(),
+                    key,
+                    value: None,
+                });
+            }
+        }
+        if changes.is_empty() {
+            return Ok(0);
+        }
+        let count = changes.len();
+        if versioned::commit_if_state_matches_async(config, &expected, &[], &changes).await? {
+            return Ok(count);
+        }
+    }
+    anyhow::bail!("retired queue job cleanup conflicted within retry budget")
+}
+
+pub(crate) fn repair_pending_hints(config: &MemoryConfig) -> Result<usize> {
+    let records = versioned::list_state(config, JOBS)?;
+    let mut count = 0;
+    let now_ms = Utc::now().timestamp_millis();
+    for (key, value) in records {
+        if !key.starts_with(JOB_PREFIX) {
+            continue;
+        }
+        let mut record = decode_job(&value)?;
+        if !is_retired_kind(&record.kind)
+            && record.status()? == JobStatus::Ready
+            && record.available_at_ms <= now_ms
+        {
+            // Advance the durable publication generation before publishing so
+            // repair can recover even when the backend still remembers the
+            // previous hint's finite-window dedupe key (for example after a
+            // hint expired or was dead-lettered).
+            record.hint_generation = record.hint_generation.saturating_add(1);
+            if replace_record(config, &value, &record)? {
+                enqueue_hint(config, &record)?;
+                count += 1;
+            }
+        }
+    }
+    Ok(count)
+}
+
+pub(crate) async fn repair_pending_hints_async(config: &MemoryConfig) -> Result<usize> {
+    let records = versioned::list_state_async(config, JOBS).await?;
+    let mut count = 0;
+    let now_ms = Utc::now().timestamp_millis();
+    for (key, value) in records {
+        if !key.starts_with(JOB_PREFIX) {
+            continue;
+        }
+        let mut record = decode_job(&value)?;
+        if !is_retired_kind(&record.kind)
+            && record.status()? == JobStatus::Ready
+            && record.available_at_ms <= now_ms
+        {
+            record.hint_generation = record.hint_generation.saturating_add(1);
+            if versioned::commit_if_state_matches_async(
+                config,
+                &[StateChange {
+                    collection: JOBS.to_owned(),
+                    key: key.clone(),
+                    value: Some(value),
+                }],
+                &[],
+                &[state_change(&record)?],
+            )
+            .await?
+            {
+                enqueue_hint_async(config, &record).await?;
+                count += 1;
+            }
+        }
+    }
+    Ok(count)
+}
+
+/// Count rows with a given durable lifecycle status.
+pub fn count_by_status(config: &MemoryConfig, status: JobStatus) -> Result<u64> {
+    Ok(versioned::list_state(config, JOBS)?
+        .into_iter()
+        .filter(|(key, _)| key.starts_with(JOB_PREFIX))
+        .map(|(_, value)| decode_job(&value))
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .filter(|record| record.status == status.as_str())
+        .count() as u64)
+}
+
 #[cfg(test)]
-pub(crate) fn backoff_ms(attempts_so_far: u32) -> i64 {
-    backoff_ms_with_policy(attempts_so_far, RETRY_BASE_MS, RETRY_CAP_MS)
+pub(crate) async fn count_by_status_async(config: &MemoryConfig, status: JobStatus) -> Result<u64> {
+    Ok(versioned::list_state_async(config, JOBS)
+        .await?
+        .into_iter()
+        .filter(|(key, _)| key.starts_with(JOB_PREFIX))
+        .map(|(_, value)| decode_job(&value))
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .filter(|record| record.status == status.as_str())
+        .count() as u64)
 }
 
-pub(crate) fn backoff_ms_with_policy(
-    attempts_so_far: u32,
-    retry_base_ms: i64,
-    retry_cap_ms: i64,
-) -> i64 {
-    // `attempts_so_far` is the count BEFORE the next retry's attempt — so the
-    // first retry uses `attempts_so_far == 1`, giving base * 2^0 = 60s.
-    let exp = attempts_so_far.saturating_sub(1).min(20);
-    let mult = 1i64 << exp;
-    let raw = retry_base_ms.saturating_mul(mult);
-    raw.min(retry_cap_ms)
+#[cfg(test)]
+pub(crate) async fn count_total_async(config: &MemoryConfig) -> Result<u64> {
+    Ok(versioned::list_state_async(config, JOBS)
+        .await?
+        .into_iter()
+        .filter(|(key, _)| key.starts_with(JOB_PREFIX))
+        .count() as u64)
 }
 
-/// True if `kind` is a retired wire string (used by tests / callers that want
-/// to recognise a raw row's kind without parsing it into [`JobKind`]).
+pub fn count_failed_unrecoverable(config: &MemoryConfig) -> Result<u64> {
+    Ok(versioned::list_state(config, JOBS)?
+        .into_iter()
+        .filter(|(key, _)| key.starts_with(JOB_PREFIX))
+        .map(|(_, value)| decode_job(&value))
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .filter(|record| {
+            record.status == JobStatus::Failed.as_str()
+                && record.failure_class.as_deref() == Some("unrecoverable")
+        })
+        .count() as u64)
+}
+
+pub fn count_total(config: &MemoryConfig) -> Result<u64> {
+    Ok(versioned::list_state(config, JOBS)?
+        .into_iter()
+        .filter(|(key, _)| key.starts_with(JOB_PREFIX))
+        .count() as u64)
+}
+
+pub fn get_job(config: &MemoryConfig, id: &str) -> Result<Option<Job>> {
+    read_record(config, id)?
+        .map(|(_, record)| record.public(None))
+        .transpose()
+}
+
+pub(crate) async fn get_job_async(config: &MemoryConfig, id: &str) -> Result<Option<Job>> {
+    read_record_async(config, id)
+        .await?
+        .map(|(_, record)| record.public(None))
+        .transpose()
+}
+
 pub fn is_retired_kind(kind: &str) -> bool {
     RETIRED_JOB_KINDS.contains(&kind)
+}
+
+#[cfg(test)]
+pub(crate) fn insert_test_record(config: &MemoryConfig, record: &JobRecord) -> Result<()> {
+    versioned::write_state_changes(config, &[state_change(record)?])
+}
+
+#[cfg(test)]
+pub(crate) async fn insert_test_record_async(
+    config: &MemoryConfig,
+    record: &JobRecord,
+) -> Result<()> {
+    versioned::commit_if_state_matches_async(config, &[], &[], &[state_change(record)?]).await?;
+    Ok(())
+}
+
+#[cfg(test)]
+pub(crate) fn update_test_record(
+    config: &MemoryConfig,
+    id: &str,
+    update: impl FnOnce(&mut JobRecord),
+) -> Result<()> {
+    let Some((old_value, mut record)) = read_record(config, id)? else {
+        anyhow::bail!("test queue record {id} does not exist")
+    };
+    update(&mut record);
+    if !replace_record(config, &old_value, &record)? {
+        anyhow::bail!("test queue record changed during update")
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+pub(crate) fn expire_test_lease(config: &MemoryConfig, id: &str) -> Result<()> {
+    update_test_record(config, id, |record| {
+        record.locked_until_ms = Some(0);
+    })
+}
+
+#[cfg(test)]
+pub(crate) async fn update_test_record_async(
+    config: &MemoryConfig,
+    id: &str,
+    update: impl FnOnce(&mut JobRecord),
+) -> Result<()> {
+    let Some((old_value, mut record)) = read_record_async(config, id).await? else {
+        anyhow::bail!("test queue record {id} does not exist")
+    };
+    update(&mut record);
+    if !versioned::commit_if_state_matches_async(
+        config,
+        &[StateChange {
+            collection: JOBS.to_owned(),
+            key: job_key(id),
+            value: Some(old_value),
+        }],
+        &[],
+        &[state_change(&record)?],
+    )
+    .await?
+    {
+        anyhow::bail!("test queue record changed during update")
+    }
+    Ok(())
+}
+
+/// Backoff math shared by settlement and its deterministic unit tests.
+#[cfg(test)]
+pub(crate) fn backoff_ms(attempts: u32) -> i64 {
+    backoff_ms_with_policy(attempts, RETRY_BASE_MS, RETRY_CAP_MS)
+}
+
+pub(crate) fn backoff_ms_with_policy(attempts: u32, base_ms: i64, cap_ms: i64) -> i64 {
+    let exponent = attempts.saturating_sub(1).min(62);
+    let multiplier = 1_i64.checked_shl(exponent).unwrap_or(i64::MAX);
+    base_ms.saturating_mul(multiplier).min(cap_ms)
 }
 
 #[cfg(test)]

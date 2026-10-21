@@ -29,10 +29,14 @@ use std::collections::{HashMap, HashSet};
 
 use anyhow::Result;
 
-use crate::memory::chunks::{get_chunk, get_chunk_embeddings_batch, get_chunks_batch};
+use crate::memory::chunks::{
+    get_chunk_async, get_chunk_embeddings_batch_async, get_chunks_batch_async,
+};
 use crate::memory::config::MemoryConfig;
 use crate::memory::score::embed::Embedder;
-use crate::memory::tree::store::{get_summaries_batch, get_summary, get_tree, get_trees_batch};
+use crate::memory::tree::store::{
+    get_summaries_batch_async, get_summary_async, get_tree_async, get_trees_batch_async,
+};
 
 use super::rerank::rerank_by_semantic_similarity;
 use super::types::{hydrated_chunk_hit, hydrated_summary_hit, RetrievalHit};
@@ -64,7 +68,7 @@ pub async fn drill_down(
         return Ok(Vec::new());
     }
 
-    let (hits, embeddings) = walk_with_embeddings(config, node_id, max_depth)?;
+    let (hits, embeddings) = walk_with_embeddings(config, node_id, max_depth).await?;
 
     let hits = match query {
         Some(q) => rerank_by_semantic_similarity(embedder, q, hits, embeddings).await,
@@ -82,14 +86,17 @@ pub async fn drill_down(
 /// its stored embedding (if any) so the async rerank pass needs no second DB
 /// round-trip. Batched per BFS depth: at most four reads (summaries / trees /
 /// chunks / chunk-embeddings) per level.
-fn walk_with_embeddings(
+async fn walk_with_embeddings(
     config: &MemoryConfig,
     start_id: &str,
     max_depth: u32,
 ) -> Result<WalkOutput> {
-    let root_summary = get_summary(config, start_id)?;
+    let root_summary = get_summary_async(config, start_id).await?;
     let root_tree_scope = match root_summary.as_ref().map(|s| s.tree_id.clone()) {
-        Some(tid) => get_tree(config, &tid)?.map(|t| t.scope).unwrap_or_default(),
+        Some(tid) => get_tree_async(config, &tid)
+            .await?
+            .map(|t| t.scope)
+            .unwrap_or_default(),
         None => String::new(),
     };
 
@@ -100,7 +107,7 @@ fn walk_with_embeddings(
         Some(s) => s.child_ids,
         None => {
             // A leaf has no children; an unknown id yields nothing either way.
-            let _ = get_chunk(config, start_id)?;
+            let _ = get_chunk_async(config, start_id).await?;
             return Ok((out, embeddings));
         }
     };
@@ -115,7 +122,7 @@ fn walk_with_embeddings(
     let mut emitted_docs: HashSet<String> = HashSet::new();
 
     while !current_level.is_empty() && depth <= max_depth {
-        let mut summary_by_id = get_summaries_batch(config, &current_level)?;
+        let mut summary_by_id = get_summaries_batch_async(config, &current_level).await?;
 
         // Update per-document latest version with any doc-roots on THIS level
         // before walking, so two side-by-side revisions resolve to the newer.
@@ -148,7 +155,7 @@ fn walk_with_embeddings(
             }
             ids
         };
-        let tree_by_id = get_trees_batch(config, &distinct_tree_ids)?;
+        let tree_by_id = get_trees_batch_async(config, &distinct_tree_ids).await?;
 
         // Ids on this level that aren't summaries are candidate chunk leaves.
         let chunk_ids: Vec<String> = current_level
@@ -156,8 +163,8 @@ fn walk_with_embeddings(
             .filter(|id| !summary_by_id.contains_key(*id))
             .cloned()
             .collect();
-        let mut chunk_by_id = get_chunks_batch(config, &chunk_ids)?;
-        let emb_by_id = get_chunk_embeddings_batch(config, &chunk_ids)?;
+        let mut chunk_by_id = get_chunks_batch_async(config, &chunk_ids).await?;
+        let emb_by_id = get_chunk_embeddings_batch_async(config, &chunk_ids).await?;
 
         let mut next_level: Vec<String> = if depth < max_depth {
             Vec::with_capacity(current_level.len() * EXPECTED_CHILD_FANOUT)

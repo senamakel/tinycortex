@@ -1,279 +1,462 @@
-//! Persistence for the scoring layer:
+//! Persistence for score rationale and entity occurrence state.
 //!
-//! - `mem_tree_score` — per-chunk score rationale (which signals fired, why
-//!   dropped/kept).
-//! - `mem_tree_entity_index` — inverted index `entity_id → node_id` so
-//!   retrieval can resolve entity-scoped queries in O(lookup).
-//!
-//! The schema is declared centrally in `memory::chunks` (`schema.rs::SCHEMA`);
-//! this file only owns the CRUD operations against those tables.
-//!
-//! ## Atomicity
-//!
-//! Every write function comes in two forms: a `with_connection`-scoped
-//! variant (`upsert_score`, `index_entities`, `clear_entity_index_for_node`,
-//! …) that opens its own implicit transaction, and a `_tx` variant that takes
-//! a caller-owned [`Transaction`] so the write commits atomically with
-//! surrounding ingest writes (e.g. the chunk insert). Callers persisting a
-//! score alongside its chunk should use the `_tx` variants via
-//! [`crate::memory::score::persist_score_tx`] rather than the standalone
-//! ones, to avoid a chunk being visible with no matching score row (or vice
-//! versa) if the process crashes mid-ingest. All upserts are
-//! `INSERT OR REPLACE`, so retrying a write after a crash is safe (idempotent
-//! on the row's primary key) — except that `INSERT OR REPLACE` never
-//! *deletes* rows, which is why re-indexing a chunk's entities always calls
-//! [`crate::memory::score::store::clear_entity_index_for_node`] first (see
-//! that function's docs).
-//!
-//! ## Divergence from OpenHuman
-//!
-//! The `mem_tree_score` table in TinyCortex does not carry `llm_importance` /
-//! `llm_importance_reason` columns, so those fields are admission-time signals
-//! only: the persisted row records the resulting `total`. They are kept on
-//! `ScoreRow` / [`ScoreSignals`] for API compatibility and read back as their
-//! defaults (`0.0` / `None`). TinyCortex also has no identity registry, so the
-//! `is_user` column is always written as `0`.
+//! Score rows, node-scoped occurrence sets, and co-occurrence edges are stored
+//! in TinyCortex's host-owned versioned collections. `stage_*` helpers return
+//! owner-head preconditions and mutations so ingest and tree sealing can
+//! commit them atomically with their chunk, tree, and queue state.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use anyhow::{Context, Result};
-use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use serde::{Deserialize, Serialize};
 
-use crate::memory::chunks::with_connection;
+use crate::memory::chunks::collections::{CHUNK_LIFECYCLE, ENTITY_INDEX, SCORES};
+use crate::memory::chunks::versioned::{self, StateChange};
 use crate::memory::config::MemoryConfig;
-use crate::memory::graph::{pairs_from_entities, upsert_edges_tx};
+use crate::memory::queue::{JobMutation, JobStateCollection};
 use crate::memory::score::extract::EntityKind;
 use crate::memory::score::resolver::CanonicalEntity;
 use crate::memory::score::signals::ScoreSignals;
-
-pub use super::store_query::{
-    count_entity_index, count_scores, list_entity_ids_for_node, lookup_entity,
-    lookup_entity_in_window,
+use crate::memory::store::entity_index::transaction::{
+    stage_delete_tree_occurrences_async, stage_node_entities, stage_node_entities_async,
+    stage_node_occurrences, stage_upsert_node_entities, EntityOccurrence, StagedEntityChanges,
 };
 
-/// Resolve `is_user` for one canonical entity.
-///
-/// TinyCortex has no Composio-style identity registry, so this is always
-/// `false`. The column exists in the schema for forward compatibility with an
-/// identity-matching layer; until one is wired in, no row is flagged as the
-/// user's own.
-fn entity_is_user(_entity: &CanonicalEntity) -> bool {
-    false
-}
+pub use super::store_query::{
+    count_entity_index, count_scores, list_entity_ids_for_node, list_entity_ids_for_node_async,
+    lookup_entity, lookup_entity_async, lookup_entity_in_window, lookup_entity_in_window_async,
+};
 
-/// Same as [`entity_is_user`] but for the summary-index path where only the
-/// canonical id is in scope. Always `false` for the same reason.
-fn canonical_id_is_user(_canonical_id: &str) -> bool {
-    false
-}
-
-/// Serialized per-chunk score rationale. Mirrors the `mem_tree_score` row.
+/// Serialized per-chunk score rationale.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ScoreRow {
-    /// Chunk this rationale belongs to; primary key of `mem_tree_score`.
+    /// Chunk this rationale belongs to.
     pub chunk_id: String,
-    /// Aggregate admission score. The single persisted scalar; recomputed from
-    /// [`signals`](Self::signals) at admission time.
+    /// Aggregate admission score recomputed from `signals` at admission time.
     pub total: f32,
-    /// Per-signal breakdown that fed `total` (see [`ScoreSignals`]). Note
-    /// `llm_importance` is admission-time only and reads back as `0.0`.
+    /// Per-signal breakdown that fed `total`.
     pub signals: ScoreSignals,
-    /// Whether the chunk was dropped (failed the admission threshold) rather
-    /// than kept. Persisted as the `dropped` integer column (`0`/`1`).
+    /// Whether the chunk was dropped rather than kept.
     pub dropped: bool,
-    /// Human-readable rationale for the drop/keep decision, when one was
-    /// recorded; `None` otherwise.
+    /// Human-readable rationale for the decision, when recorded.
     pub reason: Option<String>,
-    /// Wall-clock time the score was computed, in milliseconds since the Unix
-    /// epoch.
+    /// Time the score was computed, in epoch milliseconds.
     pub computed_at_ms: i64,
-    /// One-line LLM-supplied explanation for the importance rating. Diagnostic
-    /// only and **not persisted** (the schema has no column for it) — read back
-    /// as `None`.
+    /// Diagnostic only; not stored by the current schema.
     #[serde(default)]
     pub llm_importance_reason: Option<String>,
 }
 
-/// Upsert one score rationale row, replacing any existing entry for `chunk_id`.
+/// Result row from [`lookup_entity`].
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct EntityHit {
+    /// Canonical entity id (`"<kind>:<value>"`).
+    pub entity_id: String,
+    /// Tree node (chunk or summary) containing the entity.
+    pub node_id: String,
+    /// `"leaf"` or `"summary"`.
+    pub node_kind: String,
+    /// Parsed entity kind.
+    pub entity_kind: EntityKind,
+    /// Observed surface form, or the canonical id for summary rows.
+    pub surface: String,
+    /// Occurrence score carried from the entity or node.
+    pub score: f32,
+    /// Node timestamp, in epoch milliseconds.
+    pub timestamp_ms: i64,
+    /// Owning tree, when known.
+    pub tree_id: Option<String>,
+    /// Whether the host identity resolver marked this as the user's entity.
+    #[serde(default)]
+    pub is_user: bool,
+}
+
+/// Conditional score-row update for inclusion in a larger owner-head commit.
+pub(crate) fn stage_score_row(
+    config: &MemoryConfig,
+    row: &ScoreRow,
+) -> Result<StagedEntityChanges> {
+    let current = versioned::read_state(config, SCORES, &row.chunk_id)?;
+    Ok(StagedEntityChanges {
+        expected: vec![StateChange {
+            collection: SCORES.to_owned(),
+            key: row.chunk_id.clone(),
+            value: current,
+        }],
+        changes: vec![StateChange {
+            collection: SCORES.to_owned(),
+            key: row.chunk_id.clone(),
+            value: Some(serde_json::to_value(row)?),
+        }],
+    })
+}
+
+pub(crate) async fn stage_score_row_async(
+    config: &MemoryConfig,
+    row: &ScoreRow,
+) -> Result<StagedEntityChanges> {
+    let current = versioned::read_state_async(config, SCORES, &row.chunk_id).await?;
+    Ok(StagedEntityChanges {
+        expected: vec![StateChange {
+            collection: SCORES.to_owned(),
+            key: row.chunk_id.clone(),
+            value: current,
+        }],
+        changes: vec![StateChange {
+            collection: SCORES.to_owned(),
+            key: row.chunk_id.clone(),
+            value: Some(serde_json::to_value(row)?),
+        }],
+    })
+}
+
+/// Stage a score result and its replacement entity occurrence set.
+pub(crate) fn stage_score_and_entities(
+    config: &MemoryConfig,
+    row: &ScoreRow,
+    entities: &[CanonicalEntity],
+    kept: bool,
+    timestamp_ms: i64,
+    tree_id: Option<&str>,
+) -> Result<StagedEntityChanges> {
+    let mut staged = stage_score_row(config, row)?;
+    let occurrences = if kept {
+        entities
+            .iter()
+            .map(|entity| EntityOccurrence {
+                entity_id: entity.canonical_id.clone(),
+                node_id: row.chunk_id.clone(),
+                node_kind: "leaf".to_owned(),
+                entity_kind: entity.kind.as_str().to_owned(),
+                surface: entity.surface.clone(),
+                score: entity.score,
+                timestamp_ms,
+                tree_id: tree_id.map(str::to_owned),
+                is_user: false,
+            })
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    let entity_changes = stage_node_entities(config, &row.chunk_id, occurrences, timestamp_ms)?;
+    staged.expected.extend(entity_changes.expected);
+    staged.changes.extend(entity_changes.changes);
+    Ok(staged)
+}
+
+pub(crate) async fn stage_score_and_entities_async(
+    config: &MemoryConfig,
+    row: &ScoreRow,
+    entities: &[CanonicalEntity],
+    kept: bool,
+    timestamp_ms: i64,
+    tree_id: Option<&str>,
+) -> Result<StagedEntityChanges> {
+    let mut staged = stage_score_row_async(config, row).await?;
+    let occurrences = if kept {
+        entities
+            .iter()
+            .map(|entity| EntityOccurrence {
+                entity_id: entity.canonical_id.clone(),
+                node_id: row.chunk_id.clone(),
+                node_kind: "leaf".to_owned(),
+                entity_kind: entity.kind.as_str().to_owned(),
+                surface: entity.surface.clone(),
+                score: entity.score,
+                timestamp_ms,
+                tree_id: tree_id.map(str::to_owned),
+                is_user: false,
+            })
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    let entity_changes =
+        stage_node_entities_async(config, &row.chunk_id, occurrences, timestamp_ms).await?;
+    staged.expected.extend(entity_changes.expected);
+    staged.changes.extend(entity_changes.changes);
+    Ok(staged)
+}
+
+/// Stage a score result and its replacement entity occurrences for one queue
+/// settlement. The returned mutations are not persisted; the queue worker
+/// commits them with the job receipt and any follow-up intents under one owner
+/// head. A dropped result still returns tombstones for prior occurrences.
+pub async fn plan_score_persistence_for_queue(
+    config: &MemoryConfig,
+    result: &super::ScoreResult,
+    timestamp_ms: i64,
+    tree_id: Option<&str>,
+) -> Result<Vec<JobMutation>> {
+    let chunks =
+        versioned::get_chunks_batch_async(config, std::slice::from_ref(&result.chunk_id)).await?;
+    anyhow::ensure!(
+        chunks.contains_key(&result.chunk_id),
+        "cannot plan score persistence for missing chunk {}",
+        result.chunk_id
+    );
+    let lifecycle = versioned::read_state_async(config, CHUNK_LIFECYCLE, &result.chunk_id).await?;
+    anyhow::ensure!(
+        lifecycle
+            .as_ref()
+            .and_then(|value| value.get("status"))
+            .and_then(serde_json::Value::as_str)
+            != Some("deleted"),
+        "cannot plan score persistence for deleted chunk {}",
+        result.chunk_id
+    );
+    let row = super::score_row(result);
+    let staged = stage_score_and_entities_async(
+        config,
+        &row,
+        &result.canonical_entities,
+        result.kept,
+        timestamp_ms,
+        tree_id,
+    )
+    .await?;
+    anyhow::ensure!(
+        staged.expected.len() == staged.changes.len(),
+        "score planner produced mismatched preconditions and changes"
+    );
+    let mut expected_by_key = HashMap::with_capacity(staged.expected.len());
+    for expected in staged.expected {
+        let identity = (expected.collection.clone(), expected.key.clone());
+        anyhow::ensure!(
+            expected_by_key.insert(identity, expected.value).is_none(),
+            "score planner produced duplicate precondition identity"
+        );
+    }
+    let mut mutations = staged
+        .changes
+        .into_iter()
+        .map(|change| {
+            let identity = (change.collection.clone(), change.key.clone());
+            let expected = expected_by_key
+                .remove(&identity)
+                .context("score planner produced a change without a matching precondition")?;
+            let collection = match change.collection.as_str() {
+                SCORES => JobStateCollection::ChunkScores,
+                ENTITY_INDEX => JobStateCollection::EntityIndex,
+                other => anyhow::bail!("unsupported score mutation collection {other}"),
+            };
+            Ok(JobMutation {
+                collection,
+                key: change.key,
+                expected,
+                value: change.value,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    anyhow::ensure!(
+        expected_by_key.is_empty(),
+        "score planner produced a precondition without a matching change"
+    );
+    // Persisting the unchanged lifecycle value is a same-head existence guard:
+    // a concurrent deletion cannot let a stale extraction publish score or
+    // entity state after the chunk has been tombstoned.
+    mutations.push(JobMutation {
+        collection: JobStateCollection::ChunkLifecycle,
+        key: result.chunk_id.clone(),
+        expected: lifecycle.clone(),
+        value: lifecycle,
+    });
+    Ok(mutations)
+}
+
+/// Stage summary entities for an owner commit. Summary surfaces are stored as
+/// their canonical ids, matching the historical summary index representation.
+pub(crate) fn stage_summary_entity_ids(
+    config: &MemoryConfig,
+    entity_ids: &[String],
+    node_id: &str,
+    score: f32,
+    timestamp_ms: i64,
+    tree_id: Option<&str>,
+) -> Result<StagedEntityChanges> {
+    let occurrences = entity_ids
+        .iter()
+        .map(|canonical_id| EntityOccurrence {
+            entity_id: canonical_id.clone(),
+            node_id: node_id.to_owned(),
+            node_kind: "summary".to_owned(),
+            entity_kind: canonical_id
+                .split_once(':')
+                .map_or(canonical_id.as_str(), |(kind, _)| kind)
+                .to_owned(),
+            surface: canonical_id.clone(),
+            score,
+            timestamp_ms,
+            tree_id: tree_id.map(str::to_owned),
+            is_user: false,
+        })
+        .collect::<Vec<_>>();
+    stage_node_entities(config, node_id, occurrences, timestamp_ms)
+}
+
+pub(crate) async fn stage_summary_entity_ids_async(
+    config: &MemoryConfig,
+    entity_ids: &[String],
+    node_id: &str,
+    score: f32,
+    timestamp_ms: i64,
+    tree_id: Option<&str>,
+) -> Result<StagedEntityChanges> {
+    let occurrences = entity_ids
+        .iter()
+        .map(|canonical_id| EntityOccurrence {
+            entity_id: canonical_id.clone(),
+            node_id: node_id.to_owned(),
+            node_kind: "summary".to_owned(),
+            entity_kind: canonical_id
+                .split_once(':')
+                .map_or(canonical_id.as_str(), |(kind, _)| kind)
+                .to_owned(),
+            surface: canonical_id.clone(),
+            score,
+            timestamp_ms,
+            tree_id: tree_id.map(str::to_owned),
+            is_user: false,
+        })
+        .collect::<Vec<_>>();
+    stage_node_entities_async(config, node_id, occurrences, timestamp_ms).await
+}
+
+/// Stage deletion of entity occurrences owned by a tree for an atomic cascade.
+/// Historical aggregate edge weights remain untouched, matching tree deletion
+/// behavior before the owner-store migration.
+pub(crate) async fn stage_delete_tree_entities_async(
+    config: &MemoryConfig,
+    tree_id: &str,
+) -> Result<StagedEntityChanges> {
+    stage_delete_tree_occurrences_async(config, tree_id).await
+}
+
+/// Upsert one score row. The conditional update is retried if another writer
+/// commits the same score key first.
 pub fn upsert_score(config: &MemoryConfig, row: &ScoreRow) -> Result<()> {
-    with_connection(config, |conn| {
-        upsert_score_on_connection(conn, row)?;
-        Ok(())
-    })
+    for _ in 0..8 {
+        let staged = stage_score_row(config, row)?;
+        if versioned::commit_if_state_matches(config, &staged.expected, &[], &staged.changes)? {
+            return Ok(());
+        }
+    }
+    anyhow::bail!(
+        "score row update conflicted repeatedly for chunk {}",
+        row.chunk_id
+    )
 }
 
-/// Transaction-scoped variant of [`upsert_score`] for batching a score write
-/// into a caller-owned transaction.
-pub fn upsert_score_tx(tx: &Transaction<'_>, row: &ScoreRow) -> Result<()> {
-    tx.execute(
-        SCORE_UPSERT_SQL,
-        params![
-            row.chunk_id,
-            row.total,
-            row.signals.token_count,
-            row.signals.unique_words,
-            row.signals.metadata_weight,
-            row.signals.source_weight,
-            row.signals.interaction,
-            row.signals.entity_density,
-            i32::from(row.dropped),
-            row.reason,
-            row.computed_at_ms,
-        ],
-    )?;
-    Ok(())
+/// Persist the score row and its entity index as one versioned owner commit.
+pub fn persist_score(
+    config: &MemoryConfig,
+    result: &super::ScoreResult,
+    timestamp_ms: i64,
+    tree_id: Option<&str>,
+) -> Result<()> {
+    let row = super::score_row(result);
+    for _ in 0..8 {
+        let staged = stage_score_and_entities(
+            config,
+            &row,
+            &result.canonical_entities,
+            result.kept,
+            timestamp_ms,
+            tree_id,
+        )?;
+        if versioned::commit_if_state_matches(config, &staged.expected, &[], &staged.changes)? {
+            return Ok(());
+        }
+    }
+    anyhow::bail!(
+        "score persistence conflicted repeatedly for chunk {}",
+        row.chunk_id
+    )
 }
 
-const SCORE_UPSERT_SQL: &str = "INSERT OR REPLACE INTO mem_tree_score (
-    chunk_id, total,
-    token_count_signal, unique_words_signal,
-    metadata_weight, source_weight, interaction_weight, entity_density,
-    dropped, reason, computed_at_ms
- ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)";
-
-fn upsert_score_on_connection(conn: &Connection, row: &ScoreRow) -> Result<()> {
-    conn.execute(
-        SCORE_UPSERT_SQL,
-        params![
-            row.chunk_id,
-            row.total,
-            row.signals.token_count,
-            row.signals.unique_words,
-            row.signals.metadata_weight,
-            row.signals.source_weight,
-            row.signals.interaction,
-            row.signals.entity_density,
-            i32::from(row.dropped),
-            row.reason,
-            row.computed_at_ms,
-        ],
-    )?;
-    Ok(())
-}
-
-/// Fetch one chunk's score rationale.
+/// Fetch one score row.
 pub fn get_score(config: &MemoryConfig, chunk_id: &str) -> Result<Option<ScoreRow>> {
-    with_connection(config, |conn| {
-        conn.query_row(
-            "SELECT chunk_id, total,
-                    token_count_signal, unique_words_signal,
-                    metadata_weight, source_weight, interaction_weight, entity_density,
-                    dropped, reason, computed_at_ms
-             FROM mem_tree_score WHERE chunk_id = ?1",
-            params![chunk_id],
-            |row| {
-                Ok(ScoreRow {
-                    chunk_id: row.get(0)?,
-                    total: row.get(1)?,
-                    signals: ScoreSignals {
-                        token_count: row.get(2)?,
-                        unique_words: row.get(3)?,
-                        metadata_weight: row.get(4)?,
-                        source_weight: row.get(5)?,
-                        interaction: row.get(6)?,
-                        entity_density: row.get(7)?,
-                        // Not a persisted column — admission-time only.
-                        llm_importance: 0.0,
-                    },
-                    dropped: row.get::<_, i32>(8)? != 0,
-                    reason: row.get(9)?,
-                    computed_at_ms: row.get(10)?,
-                    // Not a persisted column — diagnostic only.
-                    llm_importance_reason: None,
-                })
-            },
-        )
-        .optional()
-        .map_err(anyhow::Error::from)
-    })
+    versioned::read_state(config, SCORES, chunk_id)?
+        .map(serde_json::from_value)
+        .transpose()
+        .map_err(Into::into)
 }
 
-/// Defensive cap for batched `IN (?,?,…)` reads. SQLite's
-/// `SQLITE_MAX_VARIABLE_NUMBER` has been 32 766 since 3.32, so 500 leaves a
-/// large safety margin against hosts with a lower compile-time cap.
-const MAX_FETCH_BATCH: usize = 500;
+/// Async score lookup for callers running on current-thread runtimes.
+pub async fn get_score_async(config: &MemoryConfig, chunk_id: &str) -> Result<Option<ScoreRow>> {
+    versioned::read_state_async(config, SCORES, chunk_id)
+        .await?
+        .map(serde_json::from_value)
+        .transpose()
+        .map_err(Into::into)
+}
 
-/// Batched read of just the `total` field for many chunk ids.
-///
-/// Narrow on purpose. The returned map contains only `chunk_id`s that have a
-/// score row; missing ids are silently absent, matching the per-row
-/// [`get_score`] contract (callers then fall back to the documented `0.0`).
+/// Narrow batched read of score totals. Missing ids are absent from the map.
 pub fn get_scores_batch(
     config: &MemoryConfig,
     chunk_ids: &[String],
 ) -> Result<HashMap<String, f32>> {
-    if chunk_ids.is_empty() {
-        return Ok(HashMap::new());
-    }
-    with_connection(config, |conn| {
-        let mut out: HashMap<String, f32> = HashMap::with_capacity(chunk_ids.len());
-        for window in chunk_ids.chunks(MAX_FETCH_BATCH) {
-            let placeholders = (1..=window.len())
-                .map(|i| format!("?{i}"))
-                .collect::<Vec<_>>()
-                .join(",");
-            let sql = format!(
-                "SELECT chunk_id, total FROM mem_tree_score
-                  WHERE chunk_id IN ({placeholders})"
-            );
-            let mut stmt = conn.prepare(&sql).context("prepare get_scores_batch")?;
-            let params: Vec<&dyn rusqlite::ToSql> =
-                window.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
-            let rows = stmt
-                .query_map(params.as_slice(), |row| {
-                    Ok((row.get::<_, String>(0)?, row.get::<_, f32>(1)?))
-                })
-                .context("query get_scores_batch")?;
-            for row in rows {
-                let (chunk_id, total) = row.context("decode get_scores_batch row")?;
-                out.insert(chunk_id, total);
-            }
-        }
-        Ok(out)
-    })
+    let rows = versioned::read_states(config, SCORES, chunk_ids)?;
+    rows.into_iter()
+        .map(|(id, value)| {
+            let row: ScoreRow = serde_json::from_value(value)?;
+            Ok((id, row.total))
+        })
+        .collect()
 }
 
-/// Return the subset of `chunk_ids` whose latest persisted admission result is
-/// dropped. Missing score rows are not considered dropped.
+/// Async batched score read for callers running on current-thread runtimes.
+pub async fn get_scores_batch_async(
+    config: &MemoryConfig,
+    chunk_ids: &[String],
+) -> Result<HashMap<String, f32>> {
+    let rows = versioned::read_states_async(config, SCORES, chunk_ids).await?;
+    rows.into_iter()
+        .map(|(id, value)| {
+            let row: ScoreRow = serde_json::from_value(value)?;
+            Ok((id, row.total))
+        })
+        .collect()
+}
+
+/// Return ids whose latest persisted score marked them dropped.
 pub fn get_dropped_chunk_ids_batch(
     config: &MemoryConfig,
     chunk_ids: &[String],
-) -> Result<std::collections::HashSet<String>> {
-    if chunk_ids.is_empty() {
-        return Ok(std::collections::HashSet::new());
-    }
-    with_connection(config, |conn| {
-        let mut out = std::collections::HashSet::new();
-        for window in chunk_ids.chunks(MAX_FETCH_BATCH) {
-            let placeholders = (1..=window.len())
-                .map(|index| format!("?{index}"))
-                .collect::<Vec<_>>()
-                .join(",");
-            let sql = format!(
-                "SELECT chunk_id FROM mem_tree_score
-                  WHERE dropped != 0 AND chunk_id IN ({placeholders})"
-            );
-            let mut stmt = conn.prepare(&sql)?;
-            let params: Vec<&dyn rusqlite::ToSql> =
-                window.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
-            for row in stmt.query_map(params.as_slice(), |row| row.get::<_, String>(0))? {
-                out.insert(row?);
-            }
-        }
-        Ok(out)
-    })
+) -> Result<HashSet<String>> {
+    let rows = versioned::read_states(config, SCORES, chunk_ids)?;
+    rows.into_iter()
+        .map(|(id, value)| {
+            let row: ScoreRow = serde_json::from_value(value)?;
+            Ok((id, row.dropped))
+        })
+        .filter_map(|row| match row {
+            Ok((id, true)) => Some(Ok(id)),
+            Ok((_, false)) => None,
+            Err(error) => Some(Err(error)),
+        })
+        .collect()
 }
 
-const ENTITY_INDEX_UPSERT_SQL: &str = "INSERT OR REPLACE INTO mem_tree_entity_index (
-    entity_id, node_id, node_kind, entity_kind, surface,
-    score, timestamp_ms, tree_id, is_user
- ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)";
+pub async fn get_dropped_chunk_ids_batch_async(
+    config: &MemoryConfig,
+    chunk_ids: &[String],
+) -> Result<HashSet<String>> {
+    let rows = versioned::read_states_async(config, SCORES, chunk_ids).await?;
+    rows.into_iter()
+        .map(|(id, value)| {
+            let row: ScoreRow = serde_json::from_value(value)?;
+            Ok((id, row.dropped))
+        })
+        .filter_map(|row| match row {
+            Ok((id, true)) => Some(Ok(id)),
+            Ok((_, false)) => None,
+            Err(error) => Some(Err(error)),
+        })
+        .collect()
+}
 
-/// Index one (entity, chunk) association.
-///
-/// Idempotent on the composite primary key `(entity_id, node_id)` so
-/// re-indexing the same association is a no-op update.
+/// Persist one entity occurrence and its co-occurrence edges.
 pub fn index_entity(
     config: &MemoryConfig,
     entity: &CanonicalEntity,
@@ -282,27 +465,20 @@ pub fn index_entity(
     timestamp_ms: i64,
     tree_id: Option<&str>,
 ) -> Result<()> {
-    let is_user = entity_is_user(entity);
-    with_connection(config, |conn| {
-        conn.execute(
-            ENTITY_INDEX_UPSERT_SQL,
-            params![
-                entity.canonical_id,
-                node_id,
-                node_kind,
-                entity.kind.as_str(),
-                entity.surface,
-                entity.score,
-                timestamp_ms,
-                tree_id,
-                is_user as i32,
-            ],
-        )?;
-        Ok(())
-    })
+    index_entities(
+        config,
+        std::slice::from_ref(entity),
+        node_id,
+        node_kind,
+        timestamp_ms,
+        tree_id,
+    )
+    .map(|_| ())
 }
 
-/// Batch index all entities extracted from a chunk.
+/// Replace a node's entity occurrences and increment edges in the same owner
+/// commit. Re-indexing an entity pair updates its occurrence but edge weight
+/// preserves the historical per-index-call accumulation.
 pub fn index_entities(
     config: &MemoryConfig,
     entities: &[CanonicalEntity],
@@ -311,170 +487,80 @@ pub fn index_entities(
     timestamp_ms: i64,
     tree_id: Option<&str>,
 ) -> Result<usize> {
-    if entities.is_empty() {
-        return Ok(0);
-    }
-    with_connection(config, |conn| {
-        let tx = conn.unchecked_transaction()?;
-        {
-            let mut stmt = tx.prepare(ENTITY_INDEX_UPSERT_SQL)?;
-            for e in entities {
-                stmt.execute(params![
-                    e.canonical_id,
-                    node_id,
-                    node_kind,
-                    e.kind.as_str(),
-                    e.surface,
-                    e.score,
-                    timestamp_ms,
-                    tree_id,
-                    entity_is_user(e) as i32,
-                ])?;
-            }
+    let occurrences = entities
+        .iter()
+        .map(|entity| {
+            occurrence_from_entity(entity, node_id, node_kind, timestamp_ms, tree_id, false)
+        })
+        .collect::<Vec<_>>();
+    for _ in 0..8 {
+        let staged =
+            stage_upsert_node_entities(config, node_id, occurrences.clone(), timestamp_ms)?;
+        if versioned::commit_if_state_matches(config, &staged.expected, &[], &staged.changes)? {
+            return Ok(entities.len());
         }
-        let entity_ids: Vec<_> = entities
-            .iter()
-            .map(|entity| entity.canonical_id.clone())
-            .collect();
-        upsert_edges_tx(&tx, &pairs_from_entities(&entity_ids), timestamp_ms)?;
-        tx.commit()?;
-        Ok(entities.len())
-    })
+    }
+    anyhow::bail!("entity indexing conflicted repeatedly for node {node_id}")
 }
 
-/// Remove all entity-index rows for a given node. Used before re-indexing a
-/// re-scored chunk so entities dropped from the new extraction don't leak
-/// through (`INSERT OR REPLACE` never deletes).
+fn occurrence_from_entity(
+    entity: &CanonicalEntity,
+    node_id: &str,
+    node_kind: &str,
+    timestamp_ms: i64,
+    tree_id: Option<&str>,
+    is_user: bool,
+) -> EntityOccurrence {
+    EntityOccurrence {
+        entity_id: entity.canonical_id.clone(),
+        node_id: node_id.to_owned(),
+        node_kind: node_kind.to_owned(),
+        entity_kind: entity.kind.as_str().to_owned(),
+        surface: entity.surface.clone(),
+        score: entity.score,
+        timestamp_ms,
+        tree_id: tree_id.map(str::to_owned),
+        is_user,
+    }
+}
+
+/// Remove every occurrence for a node, retaining the empty manifest so later
+/// writers remain fenced against stale index snapshots.
 pub fn clear_entity_index_for_node(config: &MemoryConfig, node_id: &str) -> Result<usize> {
-    with_connection(config, |conn| {
-        let n = conn.execute(
-            "DELETE FROM mem_tree_entity_index WHERE node_id = ?1",
-            params![node_id],
-        )?;
-        Ok(n)
-    })
+    for _ in 0..8 {
+        let staged = stage_node_occurrences(config, node_id, std::iter::empty())?;
+        let removed = staged
+            .changes
+            .iter()
+            .filter(|change| {
+                change.collection == crate::memory::chunks::collections::ENTITY_INDEX
+                    && change.value.is_none()
+            })
+            .count();
+        if versioned::commit_if_state_matches(config, &staged.expected, &[], &staged.changes)? {
+            return Ok(removed);
+        }
+    }
+    anyhow::bail!("entity-index clear conflicted repeatedly for node {node_id}")
 }
 
-/// Transaction-scoped variant of [`clear_entity_index_for_node`]. Returns the
-/// number of rows deleted.
-pub fn clear_entity_index_for_node_tx(tx: &Transaction<'_>, node_id: &str) -> Result<usize> {
-    let n = tx.execute(
-        "DELETE FROM mem_tree_entity_index WHERE node_id = ?1",
-        params![node_id],
-    )?;
-    Ok(n)
-}
-
-/// Index summary-node entities by canonical id only. Summary-level entity
-/// metadata is LLM-derived — the summariser emits a curated list of canonical
-/// ids without per-occurrence span/surface data.
-///
-/// Writes the kind prefix (everything before the first `:`) into the
-/// `entity_kind` column so [`lookup_entity`]'s `EntityKind::parse()` keeps
-/// round-tripping on summary rows. `surface` stores the full canonical id as a
-/// stable placeholder. The summary's score is reused for each of its entities.
-pub fn index_summary_entity_ids_tx(
-    tx: &Transaction<'_>,
+/// Replace summary node occurrences and increment their co-occurrence edges.
+pub fn index_summary_entity_ids(
+    config: &MemoryConfig,
     entity_ids: &[String],
     node_id: &str,
     score: f32,
     timestamp_ms: i64,
     tree_id: Option<&str>,
 ) -> Result<usize> {
-    if entity_ids.is_empty() {
-        return Ok(0);
+    for _ in 0..8 {
+        let staged =
+            stage_summary_entity_ids(config, entity_ids, node_id, score, timestamp_ms, tree_id)?;
+        if versioned::commit_if_state_matches(config, &staged.expected, &[], &staged.changes)? {
+            return Ok(entity_ids.len());
+        }
     }
-    let mut stmt = tx.prepare(ENTITY_INDEX_UPSERT_SQL)?;
-    for canonical_id in entity_ids {
-        // Canonical ids follow the "<kind>:<value>" convention. Without this
-        // split, `entity_kind` would hold the full id and `lookup_entity`'s
-        // `EntityKind::parse()` would fail at read time, poisoning any mixed
-        // leaf/summary lookup.
-        let entity_kind = match canonical_id.split_once(':') {
-            Some((kind, _)) => kind,
-            None => canonical_id.as_str(),
-        };
-        stmt.execute(params![
-            canonical_id,
-            node_id,
-            "summary",
-            entity_kind,
-            canonical_id,
-            score,
-            timestamp_ms,
-            tree_id,
-            canonical_id_is_user(canonical_id) as i32,
-        ])?;
-    }
-    drop(stmt);
-    upsert_edges_tx(tx, &pairs_from_entities(entity_ids), timestamp_ms)?;
-    Ok(entity_ids.len())
-}
-
-/// Transaction-scoped variant of [`index_entities`] for batching the
-/// (entity, chunk) writes into a caller-owned transaction. Returns the number
-/// of entities indexed.
-pub fn index_entities_tx(
-    tx: &Transaction<'_>,
-    entities: &[CanonicalEntity],
-    node_id: &str,
-    node_kind: &str,
-    timestamp_ms: i64,
-    tree_id: Option<&str>,
-) -> Result<usize> {
-    if entities.is_empty() {
-        return Ok(0);
-    }
-    let mut stmt = tx.prepare(ENTITY_INDEX_UPSERT_SQL)?;
-    for e in entities {
-        stmt.execute(params![
-            e.canonical_id,
-            node_id,
-            node_kind,
-            e.kind.as_str(),
-            e.surface,
-            e.score,
-            timestamp_ms,
-            tree_id,
-            entity_is_user(e) as i32,
-        ])?;
-    }
-    drop(stmt);
-    let entity_ids: Vec<_> = entities
-        .iter()
-        .map(|entity| entity.canonical_id.clone())
-        .collect();
-    upsert_edges_tx(tx, &pairs_from_entities(&entity_ids), timestamp_ms)?;
-    Ok(entities.len())
-}
-
-/// Result row from [`lookup_entity`].
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct EntityHit {
-    /// Canonical entity id (`"<kind>:<value>"`) this row was indexed under.
-    pub entity_id: String,
-    /// Id of the node (chunk or summary) the entity occurs in.
-    pub node_id: String,
-    /// Node-kind wire string, e.g. `leaf`/`summary`, identifying which layer
-    /// `node_id` lives in.
-    pub node_kind: String,
-    /// Parsed entity kind from the `entity_kind` column; round-trips the kind
-    /// prefix of [`entity_id`](Self::entity_id).
-    pub entity_kind: EntityKind,
-    /// Observed surface form of the entity. For summary rows this holds the
-    /// full canonical id as a placeholder (no per-occurrence span).
-    pub surface: String,
-    /// Relevance score carried from the source chunk/summary at index time.
-    pub score: f32,
-    /// Occurrence time in milliseconds since the Unix epoch; the sort key for
-    /// newest-first lookups.
-    pub timestamp_ms: i64,
-    /// Topic tree the node belongs to, when fanned into one; `None` otherwise.
-    pub tree_id: Option<String>,
-    /// True when the canonical id matched an identity registry at index time.
-    /// Always `false` in TinyCortex (no identity registry yet).
-    #[serde(default)]
-    pub is_user: bool,
+    anyhow::bail!("summary entity indexing conflicted repeatedly for node {node_id}")
 }
 
 #[cfg(test)]

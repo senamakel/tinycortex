@@ -6,6 +6,7 @@ use async_trait::async_trait;
 use std::io::Write;
 use tempfile::TempDir;
 
+use crate::memory::chunks::test_support::host_config;
 use crate::memory::config::MemoryConfig;
 use crate::memory::persona::config::PersonaConfig;
 use crate::memory::persona::state::FileStateStore;
@@ -134,7 +135,7 @@ fn setup() -> (TempDir, TempDir, MemoryConfig, PersonaConfig) {
     )
     .unwrap();
 
-    let cfg = MemoryConfig::new(ws.path());
+    let cfg = host_config(ws.path());
     let mut persona = PersonaConfig::with_home(src.path(), "me@example.com");
     persona.claude_code_root = Some(src.path().join("claude/projects"));
     persona.codex_root = None;
@@ -272,23 +273,43 @@ async fn call_budget_exhaustion_checkpoints_and_resumes() {
     );
 }
 
-#[tokio::test]
-async fn compile_only_reassembles_without_llm() {
+#[test]
+fn compile_only_reassembles_without_llm() {
     let (ws, _src, cfg, persona) = setup();
-    let provider = MockChat;
-    let summariser = ConcatSummariser::new();
-    let store = FileStateStore::open_in_workspace(ws.path()).unwrap();
-    let pipeline = Pipeline {
-        config: &cfg,
-        persona: &persona,
-        provider: &provider,
-        summariser: &summariser,
-        store: &store,
-    };
-    pipeline.run(RunMode::Backfill).await.unwrap();
+    let workspace = ws.path().to_path_buf();
+    let path = std::thread::spawn(move || {
+        let provider = MockChat;
+        let summariser = ConcatSummariser::new();
+        let store = FileStateStore::open_in_workspace(&workspace).unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        {
+            let pipeline = Pipeline {
+                config: &cfg,
+                persona: &persona,
+                provider: &provider,
+                summariser: &summariser,
+                store: &store,
+            };
+            runtime.block_on(pipeline.run(RunMode::Backfill)).unwrap();
+        }
+        drop(runtime);
 
-    // compile_only reads the existing facet-tree roots and rewrites the pack.
-    let path = pipeline.compile_only().unwrap();
+        // compile_only is intentionally synchronous, so exercise it outside
+        // Tokio after the async backfill has completed.
+        let pipeline = Pipeline {
+            config: &cfg,
+            persona: &persona,
+            provider: &provider,
+            summariser: &summariser,
+            store: &store,
+        };
+        pipeline.compile_only().unwrap()
+    })
+    .join()
+    .unwrap();
     let pack = std::fs::read_to_string(path).unwrap();
     assert!(pack.contains("# Persona: me@example.com"));
     assert!(pack.contains("## Directives"));
@@ -433,7 +454,7 @@ async fn fully_lost_session_commits_when_the_run_yields_observations() {
     )
     .unwrap();
 
-    let cfg = MemoryConfig::new(ws.path());
+    let cfg = host_config(ws.path());
     let mut persona = PersonaConfig::with_home(src.path(), "me@example.com");
     persona.claude_code_root = Some(src.path().join("claude/projects"));
     persona.codex_root = None;

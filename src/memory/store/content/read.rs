@@ -1,6 +1,6 @@
 //! Read and verify chunk and summary `.md` files from the content store.
 //!
-//! Includes high-level id-based readers that resolve SQLite pointers, hydrate
+//! Includes high-level id-based readers that resolve host-owned pointers, hydrate
 //! raw-backed chunks, and repair stale checksum tokens after external edits.
 
 use std::path::{Component, Path, PathBuf};
@@ -9,10 +9,17 @@ use super::atomic::sha256_hex;
 use super::compose::split_front_matter;
 use crate::memory::chunks::{
     content_root, get_chunk, get_chunk_content_pointers, get_chunk_raw_refs,
-    get_summary_content_pointers, update_chunk_content_sha256, update_summary_content_sha256,
-    RawRef,
+    get_summary_content_pointers, update_chunk_content_sha256, update_chunk_content_sha256_async,
+    update_summary_content_sha256, update_summary_content_sha256_async, RawRef,
 };
 use crate::memory::config::MemoryConfig;
+
+#[derive(serde::Deserialize)]
+struct SnapshotChunkContentPointer {
+    chunk_id: String,
+    content_path: String,
+    content_sha256: String,
+}
 
 /// Prefix for retryable legacy rows that were written before staged content
 /// files/raw references existed. `has_uncovered_reembed_work` matches this text
@@ -171,6 +178,94 @@ pub fn read_chunk_body(config: &MemoryConfig, chunk_id: &str) -> anyhow::Result<
     Ok(result.body)
 }
 
+/// Read a chunk using sidecar values captured with its list snapshot.
+///
+/// This avoids one owner-state read per result while retaining the same raw
+/// reference, staged-file, and inline-preview precedence as [`read_chunk_body`].
+pub(crate) fn read_chunk_body_from_snapshot(
+    config: &MemoryConfig,
+    chunk_id: &str,
+    inline_content: &str,
+    raw_refs: Option<&serde_json::Value>,
+    content_pointer: Option<&serde_json::Value>,
+) -> anyhow::Result<String> {
+    if let Some(value) = raw_refs {
+        let refs: Vec<RawRef> = serde_json::from_value(value.clone())
+            .map_err(|error| anyhow::anyhow!("deserialize raw refs: {error}"))?;
+        if !refs.is_empty() {
+            return read_chunk_body_from_raw(config, &refs);
+        }
+    }
+
+    if let Some(value) = content_pointer {
+        let pointer: SnapshotChunkContentPointer = serde_json::from_value(value.clone())?;
+        if pointer.chunk_id == chunk_id && !pointer.content_path.is_empty() {
+            let abs_path =
+                resolve_within_content_root(&content_root(config), &pointer.content_path)?;
+            let result = read_chunk_file(&abs_path)?;
+            if result.sha256 != pointer.content_sha256 {
+                log::warn!(
+                    "[memory:content] repairing stale chunk checksum token chunk_id={chunk_id}"
+                );
+                if let Err(error) = update_chunk_content_sha256(config, chunk_id, &result.sha256) {
+                    log::warn!(
+                        "[memory:content] chunk checksum repair failed chunk_id={chunk_id}: {error}"
+                    );
+                }
+            }
+            return Ok(result.body);
+        }
+    }
+
+    if inline_content.is_empty() {
+        anyhow::bail!("{LEGACY_EMPTY_CHUNK_CONTENT_REASON_PREFIX}{chunk_id}");
+    }
+    Ok(inline_content.to_owned())
+}
+
+pub(crate) async fn read_chunk_body_from_snapshot_async(
+    config: &MemoryConfig,
+    chunk_id: &str,
+    inline_content: &str,
+    raw_refs: Option<&serde_json::Value>,
+    content_pointer: Option<&serde_json::Value>,
+) -> anyhow::Result<String> {
+    if let Some(value) = raw_refs {
+        let refs: Vec<RawRef> = serde_json::from_value(value.clone())
+            .map_err(|error| anyhow::anyhow!("deserialize raw refs: {error}"))?;
+        if !refs.is_empty() {
+            return read_chunk_body_from_raw(config, &refs);
+        }
+    }
+
+    if let Some(value) = content_pointer {
+        let pointer: SnapshotChunkContentPointer = serde_json::from_value(value.clone())?;
+        if pointer.chunk_id == chunk_id && !pointer.content_path.is_empty() {
+            let abs_path =
+                resolve_within_content_root(&content_root(config), &pointer.content_path)?;
+            let result = read_chunk_file(&abs_path)?;
+            if result.sha256 != pointer.content_sha256 {
+                log::warn!(
+                    "[memory:content] repairing stale chunk checksum token chunk_id={chunk_id}"
+                );
+                if let Err(error) =
+                    update_chunk_content_sha256_async(config, chunk_id, &result.sha256).await
+                {
+                    log::warn!(
+                        "[memory:content] chunk checksum repair failed chunk_id={chunk_id}: {error}"
+                    );
+                }
+            }
+            return Ok(result.body);
+        }
+    }
+
+    if inline_content.is_empty() {
+        anyhow::bail!("{LEGACY_EMPTY_CHUNK_CONTENT_REASON_PREFIX}{chunk_id}");
+    }
+    Ok(inline_content.to_owned())
+}
+
 /// Fallback reader for pre-content-store chunk rows.
 ///
 /// Its error text prefixes are part of the reembed-backfill contract:
@@ -222,8 +317,12 @@ fn read_chunk_body_from_raw(config: &MemoryConfig, refs: &[RawRef]) -> anyhow::R
 /// Read a full summary body by id and repair a stale checksum token
 /// best-effort when an external editor changed the staged file.
 pub fn read_summary_body(config: &MemoryConfig, summary_id: &str) -> anyhow::Result<String> {
-    let (rel_path, expected_sha256) = get_summary_content_pointers(config, summary_id)?
-        .ok_or_else(|| anyhow::anyhow!("no content pointer for summary {summary_id}"))?;
+    let Some((rel_path, expected_sha256)) = get_summary_content_pointers(config, summary_id)?
+    else {
+        return crate::memory::tree::store::get_summary(config, summary_id)?
+            .map(|summary| summary.content)
+            .ok_or_else(|| anyhow::anyhow!("summary {summary_id} does not exist"));
+    };
     let abs_path = resolve_within_content_root(&content_root(config), &rel_path)?;
     let result = read_summary_file(&abs_path)?;
     if result.sha256 != expected_sha256 {
@@ -231,6 +330,34 @@ pub fn read_summary_body(config: &MemoryConfig, summary_id: &str) -> anyhow::Res
             "[memory:content] repairing stale summary checksum token summary_id={summary_id}"
         );
         if let Err(error) = update_summary_content_sha256(config, summary_id, &result.sha256) {
+            log::warn!(
+                "[memory:content] summary checksum repair failed summary_id={summary_id}: {error}"
+            );
+        }
+    }
+    Ok(result.body)
+}
+
+/// Async counterpart to [`read_summary_body`] for current-thread host tasks.
+pub async fn read_summary_body_async(
+    config: &MemoryConfig,
+    summary_id: &str,
+) -> anyhow::Result<String> {
+    let Some((rel_path, expected_sha256)) =
+        crate::memory::chunks::get_summary_content_pointers_async(config, summary_id).await?
+    else {
+        return crate::memory::tree::store::get_summary_async(config, summary_id)
+            .await?
+            .map(|summary| summary.content)
+            .ok_or_else(|| anyhow::anyhow!("summary {summary_id} does not exist"));
+    };
+    let abs_path = resolve_within_content_root(&content_root(config), &rel_path)?;
+    let result = read_summary_file(&abs_path)?;
+    if result.sha256 != expected_sha256 {
+        log::warn!("[memory:content] stale summary checksum token summary_id={summary_id}");
+        if let Err(error) =
+            update_summary_content_sha256_async(config, summary_id, &result.sha256).await
+        {
             log::warn!(
                 "[memory:content] summary checksum repair failed summary_id={summary_id}: {error}"
             );

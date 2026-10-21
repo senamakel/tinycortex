@@ -3,10 +3,11 @@
 //!
 //! Two engines live here:
 //!
-//! - **Bucket-seal SQLite trees** ([`store`], [`bucket_seal`], [`flush`],
+//! - **Bucket-seal owner-state trees** ([`store`], [`bucket_seal`], [`flush`],
 //!   [`registry`], [`factory`], [`io`], [`read`], [`summarise`], and internal
 //!   hydration helpers).
-//!   Source/topic/global trees keyed by `(kind, scope)` in `mem_tree_trees`.
+//!   Source/topic/global trees keyed by `(kind, scope)` in the bound document
+//!   owner.
 //!   Leaves accumulate in per-`(tree, level)` buffers; when a buffer crosses its
 //!   token (L0) or fan-in (L≥1) gate it seals into an immutable
 //!   [`store::SummaryNode`], cascading upward. The LLM is abstracted behind
@@ -44,12 +45,17 @@ pub mod types;
 
 pub use bucket_seal::{
     append_leaf, append_leaf_deferred, append_to_buffer, cascade_all_from,
-    cascade_all_from_with_services, seal_document_subtree_with_services,
-    seal_one_level_with_services, should_seal, MERGE_LEVEL_BASE,
+    cascade_all_from_with_services, plan_append_node_for_queue, plan_seal_one_level_for_queue,
+    plan_tree_level_seal_for_queue, seal_document_subtree_with_services,
+    seal_one_level_with_services, should_seal, SealLevelResult, MERGE_LEVEL_BASE,
 };
 pub use direct_ingest::{ingest_summary, SummaryIngestInput, SummaryIngestOutcome};
+pub use document_seal::{plan_document_subtree_for_queue, DocumentSealPlanResult};
 pub use factory::{TreeFactory, TreeProfile, GLOBAL_SCOPE};
-pub use flavoured::{compile_flavoured_root, flavoured_root_abs_path, flavoured_root_rel_path};
+pub use flavoured::{
+    compile_flavoured_root, compile_flavoured_root_async, flavoured_root_abs_path,
+    flavoured_root_rel_path,
+};
 pub use flush::{
     flush_stale_buffers, flush_stale_buffers_default, flush_stale_buffers_with_services,
     force_flush_tree,
@@ -61,8 +67,8 @@ pub use io::{
 };
 pub use read::read_tree;
 pub use registry::{
-    get_or_create_tree, get_or_create_tree_with_ask, is_unique_violation, new_summary_id,
-    new_tree_id,
+    get_or_create_tree, get_or_create_tree_async, get_or_create_tree_with_ask,
+    get_or_create_tree_with_ask_async, is_tree_insert_conflict, new_summary_id, new_tree_id,
 };
 pub use store::{
     Buffer, SummaryNode, Tree, TreeKind, TreeStatus, INPUT_TOKEN_BUDGET, OUTPUT_TOKEN_BUDGET,

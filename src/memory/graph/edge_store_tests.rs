@@ -3,7 +3,7 @@ use super::*;
 #[test]
 fn persisted_edges_are_canonical_weighted_and_symmetric() {
     let temp = tempfile::tempdir().unwrap();
-    let config = MemoryConfig::new(temp.path());
+    let config = crate::memory::chunks::test_support::host_config(temp.path());
     let pairs = pairs_from_entities(&[
         "person:bob".into(),
         "person:alice".into(),

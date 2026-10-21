@@ -2,42 +2,47 @@
 //!
 //! At L0 a buffer holds chunk ids; at L≥1 it holds summary ids. These helpers
 //! resolve those ids into [`SummaryInput`]s the summariser folds. Unlike
-//! OpenHuman (which staged bodies to disk), TinyCortex reads chunk/summary
-//! content inline from SQLite.
+//! Tree inputs are resolved through the host-owned chunk/summary stores. A
+//! summary's durable body is held in its versioned owner record; optional
+//! markdown projection belongs to a host after commit.
 
 use anyhow::Result;
 
-use crate::memory::chunks::{get_chunk, get_chunks_batch, Chunk};
+use crate::memory::chunks::{get_chunks_batch, get_chunks_batch_async, Chunk};
 use crate::memory::config::MemoryConfig;
-use crate::memory::score::store::{get_score, list_entity_ids_for_node};
-use crate::memory::tree::store::get_summaries_batch;
+use crate::memory::score::store::{get_score_async, list_entity_ids_for_node_async};
+use crate::memory::tree::store::get_summaries_batch_async;
 use crate::memory::tree::summarise::SummaryInput;
 
-/// Hydrate inputs for a seal. At level 0 pulls from `mem_tree_chunks` +
-/// `mem_tree_score` + the entity index; at ≥1 pulls from `mem_tree_summaries`.
-pub(crate) fn hydrate_inputs(
+/// Hydrate inputs for a seal. Level 0 pulls from chunk, score, and entity
+/// owner state; levels ≥1 pull from versioned summary records.
+pub(crate) async fn hydrate_inputs(
     config: &MemoryConfig,
     level: u32,
     item_ids: &[String],
 ) -> Result<Vec<SummaryInput>> {
     if level == 0 {
-        hydrate_leaf_inputs(config, item_ids)
+        hydrate_leaf_inputs_async(config, item_ids).await
     } else {
-        hydrate_summary_inputs(config, item_ids)
+        hydrate_summary_inputs_async(config, item_ids).await
     }
 }
 
-fn hydrate_leaf_inputs(config: &MemoryConfig, chunk_ids: &[String]) -> Result<Vec<SummaryInput>> {
-    let mut out: Vec<SummaryInput> = Vec::with_capacity(chunk_ids.len());
+async fn hydrate_leaf_inputs_async(
+    config: &MemoryConfig,
+    chunk_ids: &[String],
+) -> Result<Vec<SummaryInput>> {
+    let chunks = get_chunks_batch_async(config, chunk_ids).await?;
+    let mut out = Vec::with_capacity(chunk_ids.len());
     for id in chunk_ids {
-        let chunk = match get_chunk(config, id)? {
-            Some(c) => c,
-            None => continue, // missing leaf — skip, mirrors OpenHuman warn+skip
+        let Some(chunk) = chunks.get(id) else {
+            continue;
         };
-        let score_value = get_score(config, id)?.map(|row| row.total).unwrap_or(0.0);
-        // Canonical entity ids come from the inverted index; topics live on the
-        // chunk's metadata tags. `UnionFromChildren` rolls these up the tree.
-        let entities = list_entity_ids_for_node(config, id).unwrap_or_default();
+        let score = get_score_async(config, id)
+            .await?
+            .map(|row| row.total)
+            .unwrap_or(0.0);
+        let entities = list_entity_ids_for_node_async(config, id).await?;
         out.push(SummaryInput {
             id: chunk.id.clone(),
             content: chunk.content.clone(),
@@ -46,28 +51,29 @@ fn hydrate_leaf_inputs(config: &MemoryConfig, chunk_ids: &[String]) -> Result<Ve
             topics: chunk.metadata.tags.clone(),
             time_range_start: chunk.metadata.time_range.0,
             time_range_end: chunk.metadata.time_range.1,
-            score: score_value,
+            score,
         });
     }
     Ok(out)
 }
 
-pub(crate) fn hydrate_summary_inputs(
+pub(crate) async fn hydrate_summary_inputs_async(
     config: &MemoryConfig,
     summary_ids: &[String],
 ) -> Result<Vec<SummaryInput>> {
     // One batched `SELECT … WHERE id IN (?,…)`. Walk the caller's slice (not the
     // map) so input order is preserved; missing ids are silently skipped.
-    let node_by_id = get_summaries_batch(config, summary_ids)?;
+    let node_by_id = get_summaries_batch_async(config, summary_ids).await?;
     let mut out: Vec<SummaryInput> = Vec::with_capacity(summary_ids.len());
     for id in summary_ids {
         let Some(node) = node_by_id.get(id) else {
             continue;
         };
-        let content = crate::memory::store::content::read_summary_body(config, &node.id)
+        let content = crate::memory::store::content::read_summary_body_async(config, &node.id)
+            .await
             .unwrap_or_else(|error| {
                 log::warn!(
-                    "[memory_tree:hydrate] staged summary read failed id={}: {error}; using SQL content",
+                    "[memory_tree:hydrate] staged summary read failed id={}: {error}; using owner-state content",
                     node.id
                 );
                 node.content.clone()

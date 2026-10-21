@@ -1,31 +1,32 @@
-//! Entity-hotness counter persistence (`mem_tree_entity_hotness`).
+//! Versioned entity-hotness counters.
 //!
-//! Hotness is a read-only subconscious signal: it gates materialisation of a
-//! topic tree for an entity but is itself a side-table, not a tree row.
+//! Hotness is a read-only subconscious signal used to gate topic-tree
+//! materialisation. Rows are stored in the host-owned memory state collection
+//! so they share the same scoped commit history as the entity index.
 
 use anyhow::{Context, Result};
 use chrono::Utc;
-use rusqlite::{params, OptionalExtension};
 
 use super::types::HotnessCounters;
-use crate::memory::chunks::with_connection;
+use crate::memory::chunks::collections::{ENTITY_HOTNESS, ENTITY_INDEX};
+use crate::memory::chunks::versioned::{self, StateChange};
 use crate::memory::config::MemoryConfig;
+
+const CAS_RETRIES: usize = 8;
 
 /// Fetch the hotness row for `entity_id`, or `None` if never seen.
 pub fn get(config: &MemoryConfig, entity_id: &str) -> Result<Option<HotnessCounters>> {
-    with_connection(config, |conn| {
-        let mut stmt = conn.prepare(
-            "SELECT entity_id, mention_count_30d, distinct_sources, last_seen_ms,
-                    query_hits_30d, graph_centrality, ingests_since_check,
-                    last_hotness, last_updated_ms
-               FROM mem_tree_entity_hotness WHERE entity_id = ?1",
-        )?;
-        let row = stmt
-            .query_row(params![entity_id], row_to_counters)
-            .optional()
-            .context("failed to query mem_tree_entity_hotness")?;
-        Ok(row)
-    })
+    versioned::read_state(config, ENTITY_HOTNESS, entity_id)?
+        .map(decode_counters)
+        .transpose()
+}
+
+/// Async counterpart to [`get`] for current-thread Tokio callers.
+pub async fn get_async(config: &MemoryConfig, entity_id: &str) -> Result<Option<HotnessCounters>> {
+    versioned::read_state_async(config, ENTITY_HOTNESS, entity_id)
+        .await?
+        .map(decode_counters)
+        .transpose()
 }
 
 /// Fetch the hotness row, or a fresh (all-zero) row if the entity has never
@@ -40,86 +41,116 @@ pub fn get_or_fresh(config: &MemoryConfig, entity_id: &str) -> Result<HotnessCou
     }
 }
 
-/// Upsert the full counter row. Idempotent on `entity_id`.
-pub fn upsert(config: &MemoryConfig, counters: &HotnessCounters) -> Result<()> {
-    with_connection(config, |conn| {
-        conn.execute(
-            "INSERT INTO mem_tree_entity_hotness (
-                entity_id, mention_count_30d, distinct_sources, last_seen_ms,
-                query_hits_30d, graph_centrality, ingests_since_check,
-                last_hotness, last_updated_ms
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
-             ON CONFLICT(entity_id) DO UPDATE SET
-                mention_count_30d = excluded.mention_count_30d,
-                distinct_sources  = excluded.distinct_sources,
-                last_seen_ms      = excluded.last_seen_ms,
-                query_hits_30d    = excluded.query_hits_30d,
-                graph_centrality  = excluded.graph_centrality,
-                ingests_since_check = excluded.ingests_since_check,
-                last_hotness      = excluded.last_hotness,
-                last_updated_ms   = excluded.last_updated_ms",
-            params![
-                counters.entity_id,
-                counters.mention_count_30d,
-                counters.distinct_sources,
-                counters.last_seen_ms,
-                counters.query_hits_30d,
-                counters.graph_centrality,
-                counters.ingests_since_check,
-                counters.last_hotness,
-                counters.last_updated_ms,
-            ],
-        )
-        .with_context(|| {
-            format!(
-                "failed to upsert mem_tree_entity_hotness for {}",
-                counters.entity_id
-            )
-        })?;
-        Ok(())
-    })
+/// Async counterpart to [`get_or_fresh`].
+pub async fn get_or_fresh_async(config: &MemoryConfig, entity_id: &str) -> Result<HotnessCounters> {
+    match get_async(config, entity_id).await? {
+        Some(c) => Ok(c),
+        None => Ok(HotnessCounters::fresh(
+            entity_id,
+            Utc::now().timestamp_millis(),
+        )),
+    }
 }
 
-/// Count `(node_id) → DISTINCT tree_id` in the entity index for `entity_id`.
+/// Upsert the full counter row. Idempotent on `entity_id`.
+pub fn upsert(config: &MemoryConfig, counters: &HotnessCounters) -> Result<()> {
+    upsert_inner(config, counters)
+}
+
+/// Async counterpart to [`upsert`] for current-thread Tokio callers.
+pub async fn upsert_async(config: &MemoryConfig, counters: &HotnessCounters) -> Result<()> {
+    upsert_inner_async(config, counters).await
+}
+
+/// Count distinct non-null tree ids in the entity index for `entity_id`.
 pub fn distinct_sources_for(config: &MemoryConfig, entity_id: &str) -> Result<u32> {
-    with_connection(config, |conn| {
-        let n: i64 = conn
-            .query_row(
-                "SELECT COUNT(DISTINCT tree_id)
-                   FROM mem_tree_entity_index
-                  WHERE entity_id = ?1 AND tree_id IS NOT NULL",
-                params![entity_id],
-                |r| r.get(0),
-            )
-            .context("failed to count distinct sources")?;
-        Ok(n.max(0) as u32)
-    })
+    let entries = versioned::list_state(config, ENTITY_INDEX)?;
+    distinct_sources(entries, entity_id)
+}
+
+/// Async counterpart to [`distinct_sources_for`].
+pub async fn distinct_sources_for_async(config: &MemoryConfig, entity_id: &str) -> Result<u32> {
+    let entries = versioned::list_state_async(config, ENTITY_INDEX).await?;
+    distinct_sources(entries, entity_id)
 }
 
 /// Test / diagnostic helper.
 pub fn count(config: &MemoryConfig) -> Result<u64> {
-    with_connection(config, |conn| {
-        let n: i64 = conn
-            .query_row("SELECT COUNT(*) FROM mem_tree_entity_hotness", [], |r| {
-                r.get(0)
-            })
-            .context("failed to count mem_tree_entity_hotness")?;
-        Ok(n.max(0) as u64)
-    })
+    Ok(versioned::list_state(config, ENTITY_HOTNESS)?.len() as u64)
 }
 
-fn row_to_counters(row: &rusqlite::Row<'_>) -> rusqlite::Result<HotnessCounters> {
-    Ok(HotnessCounters {
-        entity_id: row.get(0)?,
-        mention_count_30d: row.get::<_, i64>(1)?.max(0) as u32,
-        distinct_sources: row.get::<_, i64>(2)?.max(0) as u32,
-        last_seen_ms: row.get(3)?,
-        query_hits_30d: row.get::<_, i64>(4)?.max(0) as u32,
-        graph_centrality: row.get(5)?,
-        ingests_since_check: row.get::<_, i64>(6)?.max(0) as u32,
-        last_hotness: row.get(7)?,
-        last_updated_ms: row.get(8)?,
-    })
+fn upsert_inner(config: &MemoryConfig, counters: &HotnessCounters) -> Result<()> {
+    let value = serde_json::to_value(counters)?;
+    for _ in 0..CAS_RETRIES {
+        let current = versioned::read_state(config, ENTITY_HOTNESS, &counters.entity_id)?;
+        let expected = StateChange {
+            collection: ENTITY_HOTNESS.to_owned(),
+            key: counters.entity_id.clone(),
+            value: current,
+        };
+        let change = StateChange {
+            collection: ENTITY_HOTNESS.to_owned(),
+            key: counters.entity_id.clone(),
+            value: Some(value.clone()),
+        };
+        if versioned::commit_if_state_matches(config, &[expected], &[], &[change])? {
+            return Ok(());
+        }
+    }
+    anyhow::bail!("entity hotness changed too frequently to upsert")
+}
+
+async fn upsert_inner_async(config: &MemoryConfig, counters: &HotnessCounters) -> Result<()> {
+    let value = serde_json::to_value(counters)?;
+    for _ in 0..CAS_RETRIES {
+        let current =
+            versioned::read_state_async(config, ENTITY_HOTNESS, &counters.entity_id).await?;
+        let expected = StateChange {
+            collection: ENTITY_HOTNESS.to_owned(),
+            key: counters.entity_id.clone(),
+            value: current,
+        };
+        let change = StateChange {
+            collection: ENTITY_HOTNESS.to_owned(),
+            key: counters.entity_id.clone(),
+            value: Some(value.clone()),
+        };
+        if versioned::commit_if_state_matches_async(config, &[expected], &[], &[change]).await? {
+            return Ok(());
+        }
+    }
+    anyhow::bail!("entity hotness changed too frequently to upsert")
+}
+
+fn distinct_sources(entries: Vec<(String, serde_json::Value)>, entity_id: &str) -> Result<u32> {
+    let mut trees = std::collections::HashSet::new();
+    for (key, value) in entries
+        .into_iter()
+        .filter(|(key, _)| key.starts_with("occ:"))
+    {
+        let occurrence: crate::memory::store::entity_index::transaction::EntityOccurrence =
+            serde_json::from_value(value).context("decode entity-index occurrence")?;
+        anyhow::ensure!(
+            crate::memory::store::entity_index::transaction::occurrence_key(
+                &occurrence.entity_id,
+                &occurrence.node_id
+            ) == key,
+            "entity-index occurrence key does not match its record"
+        );
+        if occurrence.entity_id == entity_id {
+            if let Some(tree_id) = occurrence.tree_id {
+                trees.insert(tree_id);
+            }
+        }
+    }
+    Ok(trees.len().min(u32::MAX as usize) as u32)
+}
+
+fn decode_counters(value: serde_json::Value) -> Result<HotnessCounters> {
+    let counters: HotnessCounters =
+        serde_json::from_value(value).context("decode entity hotness counters")?;
+    anyhow::ensure!(!counters.entity_id.is_empty(), "empty entity hotness key");
+    Ok(counters)
 }
 
 #[cfg(test)]

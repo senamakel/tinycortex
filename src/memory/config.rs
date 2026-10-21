@@ -6,6 +6,8 @@
 //! `docs/openhuman-memory-engine-spec.md`.
 
 use std::path::PathBuf;
+use tinystoragedrivers_api::Storage;
+use tinystoragedrivers_types::QueueSpec;
 
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
@@ -41,11 +43,24 @@ pub const FOLDER_FILE_SIZE_CAP_BYTES: u64 = 10 * 1024 * 1024;
 /// are consumed (see `memory::sources::validation`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MemoryConfig {
-    /// Workspace root. Markdown content, SQLite indexes, and ledgers live under
-    /// this directory and are authoritative (local-first). Not required to
+    /// Workspace root. Markdown content and filesystem ledgers live under
+    /// this directory and are authoritative (local-first). Structured records
+    /// use the attached, host-owned storage bundle. Not required to
     /// exist yet at construction time — callers create it (or fail informatively)
     /// when they first open the workspace.
     pub workspace: PathBuf,
+    /// Host-supplied, already scope-bound storage ports.
+    ///
+    /// This is intentionally absent from serialized configuration. Hosts own
+    /// backend selection and must attach a bundle before opening memory
+    /// stores; TinyCortex never constructs a production engine or fallback.
+    #[serde(skip)]
+    storage: Option<Storage>,
+    /// Set only after the host-supplied bundle has all owned collections.
+    #[serde(skip)]
+    storage_prepared: bool,
+    #[serde(skip)]
+    storage_blocking: Option<super::storage::Blocking>,
     /// Optional override for the chunk/summary content vault. `None` uses
     /// `<workspace>/memory_tree/content`.
     #[serde(default)]
@@ -93,6 +108,9 @@ impl MemoryConfig {
     pub fn new(workspace: impl Into<PathBuf>) -> Self {
         Self {
             workspace: workspace.into(),
+            storage: None,
+            storage_prepared: false,
+            storage_blocking: None,
             content_root: None,
             embedding: EmbeddingConfig::default(),
             tree: TreeConfig::default(),
@@ -103,6 +121,95 @@ impl MemoryConfig {
             sync_budget: SyncBudgetConfig::default(),
             sync: SyncConfig::default(),
         }
+    }
+
+    /// Attach the host's scope-bound storage handles to this configuration.
+    #[must_use]
+    pub fn with_storage(mut self, storage: Storage) -> Self {
+        self.storage = Some(storage);
+        self.storage_prepared = false;
+        self.storage_blocking = None;
+        self
+    }
+
+    /// Open a memory configuration over the host's scoped storage bundle.
+    ///
+    /// This is the preferred host entry point: every owner collection is
+    /// prepared successfully before the ready configuration is returned.
+    ///
+    /// # Errors
+    /// Returns an error when a storage declaration cannot be installed.
+    pub async fn open_with_storage(
+        workspace: impl Into<PathBuf>,
+        storage: Storage,
+    ) -> anyhow::Result<Self> {
+        let mut config = Self::new(workspace).with_storage(storage);
+        config.prepare_storage().await?;
+        Ok(config)
+    }
+
+    /// Prepare every collection owned by this memory engine instance.
+    ///
+    /// Hosts call this after binding a storage scope and before exposing the
+    /// configured stores. Declarations are idempotent and are always applied
+    /// through the supplied document port.
+    ///
+    /// # Errors
+    /// Returns an error if the host did not provide storage or a declaration
+    /// cannot be installed by the selected driver.
+    pub async fn prepare_storage(&mut self) -> anyhow::Result<()> {
+        let blocking = super::storage::Blocking::new().map_err(anyhow::Error::from)?;
+        let storage = self
+            .storage
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("TinyCortex requires host-supplied storage"))?;
+        for spec in crate::memory::chunks::collections() {
+            storage
+                .documents()
+                .ensure_collection(&spec)
+                .await
+                .map_err(anyhow::Error::from)?;
+        }
+        storage
+            .queues()
+            .ensure_queue(
+                crate::memory::queue::QUEUE_NAME,
+                &QueueSpec {
+                    max_attempts: self.queue.max_attempts.max(1),
+                    dedupe_window_ms: 0,
+                },
+            )
+            .await
+            .map_err(anyhow::Error::from)?;
+        self.storage_prepared = true;
+        self.storage_blocking = Some(blocking);
+        Ok(())
+    }
+
+    /// Return the host bundle only after owner schema preparation completed.
+    ///
+    /// # Errors
+    /// Returns an error when storage is missing or has not been prepared.
+    pub fn storage(&self) -> anyhow::Result<&Storage> {
+        if !self.storage_prepared {
+            anyhow::bail!("TinyCortex storage must be opened and prepared first");
+        }
+        self.storage
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("TinyCortex requires host-supplied storage"))
+    }
+
+    /// Return the synchronous bridge associated with prepared host storage.
+    ///
+    /// # Errors
+    /// Returns an error when host storage has not been opened and prepared.
+    pub(crate) fn storage_blocking(&self) -> anyhow::Result<&super::storage::Blocking> {
+        if !self.storage_prepared {
+            anyhow::bail!("TinyCortex storage must be opened and prepared first");
+        }
+        self.storage_blocking
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("TinyCortex storage runtime is unavailable"))
     }
 
     /// Load a TOML configuration file and validate its runtime invariants.

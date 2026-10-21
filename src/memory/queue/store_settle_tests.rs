@@ -1,5 +1,4 @@
 use super::*;
-use crate::memory::chunks::with_connection;
 use crate::memory::config::MemoryConfig;
 use crate::memory::queue::store::{
     claim_next, count_by_status, count_failed_unrecoverable, count_total, enqueue, get_job,
@@ -12,7 +11,7 @@ use tempfile::TempDir;
 
 fn test_config() -> (TempDir, MemoryConfig) {
     let tmp = TempDir::new().unwrap();
-    let cfg = MemoryConfig::new(tmp.path());
+    let cfg = crate::memory::chunks::test_support::host_config(tmp.path());
     (tmp, cfg)
 }
 
@@ -145,12 +144,9 @@ fn mark_failed_retries_then_terminates() {
     assert_eq!(row.last_error.as_deref(), Some("boom"));
 
     // Force the row available again so the test doesn't hinge on sleep.
-    with_connection(&cfg, |c| {
-        c.execute(
-            "UPDATE mem_tree_jobs SET available_at_ms = 0 WHERE id = ?1",
-            params![id],
-        )?;
-        Ok(())
+    crate::memory::queue::store::update_test_record(&cfg, &id, |record| {
+        record.available_at_ms = 0;
+        record.lease_epoch = record.lease_epoch.saturating_add(1);
     })
     .unwrap();
 
@@ -271,7 +267,7 @@ fn two_failed_rows_sharing_a_dedupe_key(cfg: &MemoryConfig, chunk: &str) -> (Str
 
 /// The production defect: a single blanket `UPDATE … SET status='ready'` over
 /// two failed rows sharing a `dedupe_key` puts both into the partial unique
-/// index at once, SQLite aborts the whole statement, and NOTHING is requeued —
+/// index at once, the owner batch rejects the whole write, and NOTHING is requeued —
 /// forever, on every boot and every 3h self-heal tick.
 ///
 /// The requeue must succeed and requeue the newest row for the key.
@@ -382,14 +378,12 @@ fn requeue_failed_is_deterministic_on_equal_millisecond_completions() {
 
     // Force identical completion timestamps so ordering falls to the tiebreaker.
     let same_ms = 1_800_000_000_000_i64;
-    with_connection(&cfg, |conn| {
-        conn.execute(
-            "UPDATE mem_tree_jobs SET completed_at_ms = ?1 WHERE id IN (?2, ?3)",
-            params![same_ms, a, b],
-        )?;
-        Ok(())
-    })
-    .unwrap();
+    for id in [&a, &b] {
+        crate::memory::queue::store::update_test_record(&cfg, id, |record| {
+            record.completed_at_ms = Some(same_ms);
+        })
+        .unwrap();
+    }
 
     let requeued = requeue_failed(&cfg).expect("requeue must not abort on a millisecond tie");
 
@@ -417,7 +411,8 @@ fn recover_stale_locks_resets_running_rows() {
     let (_tmp, cfg) = test_config();
     let id = enqueue(&cfg, &extract_job("c1", 5)).unwrap().unwrap();
     // Claim with a lock window already in the past so recovery sees it expired.
-    let _ = claim_next(&cfg, -1).unwrap().unwrap();
+    let _claimed = claim_next(&cfg, DEFAULT_LOCK_DURATION_MS).unwrap().unwrap();
+    crate::memory::queue::store::expire_test_lease(&cfg, &id).unwrap();
     let recovered = recover_stale_locks(&cfg).unwrap();
     assert_eq!(recovered, 1);
     assert_eq!(
@@ -451,7 +446,8 @@ fn stale_worker_settlement_is_noop() {
         .expect("inserted");
 
     // Worker A claims with an already-expired lock.
-    let worker_a_job = claim_next(&cfg, -1).unwrap().unwrap();
+    let worker_a_job = claim_next(&cfg, DEFAULT_LOCK_DURATION_MS).unwrap().unwrap();
+    crate::memory::queue::store::expire_test_lease(&cfg, &id).unwrap();
     assert_eq!(worker_a_job.attempts, 1);
     // Lease expires; recover; Worker B re-claims (attempts=2).
     assert_eq!(recover_stale_locks(&cfg).unwrap(), 1);
@@ -471,7 +467,8 @@ fn stale_worker_mark_failed_is_noop() {
     let id = enqueue(&cfg, &extract_job("c-stale-fail", 5))
         .unwrap()
         .expect("inserted");
-    let worker_a_job = claim_next(&cfg, -1).unwrap().unwrap();
+    let worker_a_job = claim_next(&cfg, DEFAULT_LOCK_DURATION_MS).unwrap().unwrap();
+    crate::memory::queue::store::expire_test_lease(&cfg, &id).unwrap();
     assert_eq!(recover_stale_locks(&cfg).unwrap(), 1);
     let worker_b_job = claim_next(&cfg, DEFAULT_LOCK_DURATION_MS).unwrap().unwrap();
     assert_eq!(worker_b_job.attempts, 2);
@@ -514,20 +511,13 @@ fn mark_deferred_parks_jobs_that_exceed_the_defer_age_bound() {
     let id = enqueue(&cfg, &extract_job("c-defer-expired", 5))
         .unwrap()
         .expect("inserted");
-    let claimed = claim_next(&cfg, DEFAULT_LOCK_DURATION_MS).unwrap().unwrap();
-    with_connection(&cfg, |conn| {
-        conn.execute(
-            "UPDATE mem_tree_jobs SET created_at_ms = ?1 WHERE id = ?2",
-            rusqlite::params![
-                Utc::now()
-                    .timestamp_millis()
-                    .saturating_sub(max_defer_age_ms + 1),
-                id,
-            ],
-        )?;
-        Ok(())
+    crate::memory::queue::store::update_test_record(&cfg, &id, |record| {
+        record.created_at_ms = Utc::now()
+            .timestamp_millis()
+            .saturating_sub(max_defer_age_ms + 1);
     })
     .unwrap();
+    let claimed = claim_next(&cfg, DEFAULT_LOCK_DURATION_MS).unwrap().unwrap();
 
     mark_deferred(&cfg, &claimed, i64::MAX, "still blocked").unwrap();
 
@@ -555,12 +545,9 @@ fn deferred_row_not_claimable_until_until_ms() {
         "deferred row must not be claimable before until_ms"
     );
 
-    with_connection(&cfg, |c| {
-        c.execute(
-            "UPDATE mem_tree_jobs SET available_at_ms = 0 WHERE id = ?1",
-            params![id],
-        )?;
-        Ok(())
+    crate::memory::queue::store::update_test_record(&cfg, &id, |record| {
+        record.available_at_ms = 0;
+        record.lease_epoch = record.lease_epoch.saturating_add(1);
     })
     .unwrap();
     let claim2 = claim_next(&cfg, DEFAULT_LOCK_DURATION_MS).unwrap().unwrap();
@@ -611,7 +598,8 @@ fn mark_deferred_stale_lease_is_noop() {
     let id = enqueue(&cfg, &extract_job("c-defer-stale", 5))
         .unwrap()
         .expect("inserted");
-    let worker_a_job = claim_next(&cfg, -1).unwrap().unwrap();
+    let worker_a_job = claim_next(&cfg, DEFAULT_LOCK_DURATION_MS).unwrap().unwrap();
+    crate::memory::queue::store::expire_test_lease(&cfg, &id).unwrap();
     assert_eq!(recover_stale_locks(&cfg).unwrap(), 1);
     let worker_b_job = claim_next(&cfg, DEFAULT_LOCK_DURATION_MS).unwrap().unwrap();
     assert_eq!(worker_b_job.attempts, 2);

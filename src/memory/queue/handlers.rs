@@ -7,28 +7,31 @@
 //! handlers called directly into `memory_tree` / `memory_score` /
 //! `memory_store`, but those operations are exposed only `pub(crate)` to their
 //! own modules (and some — the write-path embedder, the re-embed worklist
-//! probe, the on-disk body reader — are not part of this crate's ported
-//! surface at all). The trait is that seam: a host that owns visibility into
-//! those modules supplies a real implementation; tests supply a deterministic
-//! one (see `handlers_tests.rs`).
+//! probe, the on-disk body reader — remain host-owned computations). The trait
+//! is that seam: a host that owns visibility into those modules supplies a
+//! real implementation; tests supply a deterministic one (see
+//! `handlers_tests.rs`).
 //!
 //! What stays in-crate (faithful to OpenHuman's pipeline shape):
-//! - `extract_chunk` admits → enqueues `append_buffer`, then arms the re-embed
+//! - `extract_chunk` admits → plans `append_buffer`, then arms the re-embed
 //!   backfill once anything was admitted.
-//! - `append_buffer` pushes a leaf → enqueues `seal` when the gate is met.
-//! - `seal` seals one level → enqueues the parent `seal` when cascading.
-//! - `flush_stale` enqueues a force-`seal` per stale buffer.
+//! - `append_buffer` plans a leaf push → plans `seal` when the gate is met.
+//! - `seal` seals one level → plans the parent `seal` when cascading.
+//! - `flush_stale` plans a force-`seal` per stale buffer.
 //! - `reembed_backfill` maps a bounded batch to `Defer` (more pending) or
-//!   `Done` (covered / no provider / stale signature), toggling the
-//!   process-global backfill flag.
+//!   `Done` (covered / no provider / stale signature); the worker updates the
+//!   process-global backfill hint after lease-fenced settlement.
 
 use anyhow::Result;
 use async_trait::async_trait;
 use serde::de::DeserializeOwned;
 
+use crate::memory::chunks::collections::{
+    BUFFERS, CHUNK_EMBEDDINGS, CHUNK_LIFECYCLE, CHUNK_REEMBED_SKIPS, ENTITY_EDGES, ENTITY_HOTNESS,
+    ENTITY_INDEX, SCORES, SUMMARIES, SUMMARY_CONTENT_POINTERS, TREES,
+};
+use crate::memory::chunks::versioned::StateChange;
 use crate::memory::config::MemoryConfig;
-use crate::memory::queue::ops::set_backfill_in_progress;
-use crate::memory::queue::store;
 use crate::memory::queue::types::{
     AppendBufferPayload, AppendTarget, ExtractChunkPayload, FlushStalePayload, Job, JobFailure,
     JobKind, JobOutcome, NewJob, NodeRef, ReembedBackfillPayload, SealDocumentPayload, SealPayload,
@@ -61,8 +64,8 @@ pub const L0_DEFAULT_FLUSH_AGE_SECS: i64 = 60 * 60;
 /// Delay before a deferred re-embed chain revisits its own row.
 pub const REEMBED_BACKFILL_REVISIT_MS: i64 = 750;
 
-/// Outcome of the external `extract_chunk` step (LLM scoring + admission +
-/// score/lifecycle persistence). The queue uses it to decide the follow-up.
+/// Outcome of the external `extract_chunk` computation (LLM scoring +
+/// admission). The queue uses it to decide the follow-up.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ExtractDecision {
     /// Whether the chunk was admitted into the tree pipeline.
@@ -109,51 +112,132 @@ pub enum ReembedProgress {
     StaleSignature,
 }
 
+/// A supported memory collection that a queue delegate may change as the
+/// result of one job.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JobStateCollection {
+    /// Per-chunk lifecycle status.
+    ChunkLifecycle,
+    /// Chunk admission and extraction scores.
+    ChunkScores,
+    /// Tree roots and scope bindings.
+    Trees,
+    /// Sealed tree summaries.
+    Summaries,
+    /// Per-signature summary vectors.
+    SummaryEmbeddings,
+    /// Summary re-embedding retry-skip records.
+    SummaryReembedSkips,
+    /// Content-addressed summary body pointers.
+    SummaryContentPointers,
+    /// Mutable tree buffers.
+    TreeBuffers,
+    /// Per-model chunk vectors.
+    ChunkEmbeddings,
+    /// Chunk re-embedding skip records.
+    ChunkReembedSkips,
+    /// Entity-to-node occurrences.
+    EntityIndex,
+    /// Entity co-occurrence edges.
+    EntityEdges,
+    /// Entity hotness summaries.
+    EntityHotness,
+}
+
+impl JobStateCollection {
+    fn name(self) -> &'static str {
+        match self {
+            Self::ChunkLifecycle => CHUNK_LIFECYCLE,
+            Self::ChunkScores => SCORES,
+            Self::Trees => TREES,
+            Self::Summaries => SUMMARIES,
+            Self::SummaryEmbeddings => crate::memory::chunks::collections::SUMMARY_EMBEDDINGS,
+            Self::SummaryReembedSkips => crate::memory::chunks::collections::SUMMARY_REEMBED_SKIPS,
+            Self::SummaryContentPointers => SUMMARY_CONTENT_POINTERS,
+            Self::TreeBuffers => BUFFERS,
+            Self::ChunkEmbeddings => CHUNK_EMBEDDINGS,
+            Self::ChunkReembedSkips => CHUNK_REEMBED_SKIPS,
+            Self::EntityIndex => ENTITY_INDEX,
+            Self::EntityEdges => ENTITY_EDGES,
+            Self::EntityHotness => ENTITY_HOTNESS,
+        }
+    }
+}
+
+/// One domain mutation returned by a compute-only queue delegate.
+#[derive(Clone, Debug, PartialEq)]
+pub struct JobMutation {
+    /// The owner collection changed by the job.
+    pub collection: JobStateCollection,
+    /// Stable logical record key in that collection.
+    pub key: String,
+    /// Value observed by the planner. The worker rechecks it at the commit
+    /// head so a slow delegate cannot overwrite a newer owner's update.
+    pub expected: Option<serde_json::Value>,
+    /// The replacement record, or `None` to tombstone it.
+    pub value: Option<serde_json::Value>,
+}
+
+impl JobMutation {
+    pub(crate) fn into_state_changes(self) -> (StateChange, StateChange) {
+        let collection = self.collection.name().to_owned();
+        (
+            StateChange {
+                collection: collection.clone(),
+                key: self.key.clone(),
+                value: self.expected,
+            },
+            StateChange {
+                collection,
+                key: self.key,
+                value: self.value,
+            },
+        )
+    }
+}
+
+/// A delegate's computed result and the records it wants committed with the
+/// job receipt and follow-up intents.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DelegateOutput<T> {
+    /// Computed decision returned to the handler.
+    pub result: T,
+    /// Domain changes that the queue owner commits under the same head CAS.
+    pub mutations: Vec<JobMutation>,
+}
+
 /// The external, heavy-work seam for the queue handlers. Every method is the
-/// part the queue cannot do itself (it needs `memory_tree` / `memory_score` /
-/// `memory_store` internals). Implementations must be deterministic enough for
-/// tests; production impls wire the real subsystems.
-///
-/// ## Idempotency contract
-///
-/// The queue is at-least-once: a crash or `SQLITE_BUSY` after a delegate
-/// method has run its side effect but before parent settlement commits leaves
-/// the row `running` past its lease, so
-/// [`recover_stale_locks`](crate::memory::queue::store_settle::recover_stale_locks)
-/// puts it back to `ready` and the whole handler — including this delegate
-/// call — runs again. Follow-up jobs are committed atomically with settlement,
-/// but external/LLM delegate work cannot share that SQLite transaction.
-/// Implementations MUST therefore make their side effects safe to repeat:
-/// upsert rather than insert, treat
-/// "already applied" as success, and avoid effects that are observably wrong
-/// the second time (e.g. re-running a paid LLM call is wasteful but not
-/// incorrect; double-appending a chunk into a tree would be).
+/// part the queue cannot do itself (it needs host-owned inference and domain
+/// computation). Methods returning [`DelegateOutput`] are compute-only: their
+/// mutations are committed together with the job receipt and follow-up
+/// intents. Expensive inference may be repeated after a crash, so it should be
+/// deterministic where possible, but delegates must not persist domain state.
 #[async_trait]
 pub trait QueueDelegates: Send + Sync {
-    /// Score + admit one chunk and persist its score/lifecycle. `Ok(None)` when
-    /// the chunk row is missing (a no-op `Done`).
+    /// Score + admit one chunk and return score/lifecycle mutations without
+    /// persisting them. `Ok(None)` when the chunk row is missing.
     async fn extract_chunk(
         &self,
         config: &MemoryConfig,
         chunk_id: &str,
-    ) -> Result<Option<ExtractDecision>>;
+    ) -> Result<Option<DelegateOutput<ExtractDecision>>>;
 
-    /// Push a node into its target buffer. `Ok(None)` when the node or target
-    /// tree is missing (a no-op `Done`).
+    /// Compute a node's buffer append and return its mutations without
+    /// persisting them. `Ok(None)` when the node or target tree is missing.
     async fn append_node(
         &self,
         config: &MemoryConfig,
         node: &NodeRef,
         target: &AppendTarget,
-    ) -> Result<Option<AppendDecision>>;
+    ) -> Result<Option<DelegateOutput<AppendDecision>>>;
 
-    /// Seal one buffer level. Returns the parent-level `SealPayload` to enqueue
-    /// when the seal cascades, else `None`.
+    /// Compute one buffer-level seal and return its state mutations plus a
+    /// parent-level `SealPayload` when the seal cascades.
     async fn seal_level(
         &self,
         config: &MemoryConfig,
         payload: &SealPayload,
-    ) -> Result<Option<SealPayload>>;
+    ) -> Result<DelegateOutput<Option<SealPayload>>>;
 
     /// List buffers older than `max_age_secs` that should be force-sealed.
     async fn list_stale_buffers(
@@ -162,32 +246,57 @@ pub trait QueueDelegates: Send + Sync {
         max_age_secs: i64,
     ) -> Result<Vec<StaleBuffer>>;
 
-    /// Build + merge one document version's subtree.
+    /// Build + merge one document version's subtree and return its mutations.
     async fn seal_document(
         &self,
         config: &MemoryConfig,
         payload: &SealDocumentPayload,
-    ) -> Result<()>;
+    ) -> Result<DelegateOutput<crate::memory::tree::DocumentSealPlanResult>>;
 
-    /// Embed one bounded re-embed batch at `signature`.
+    /// Project committed document summaries into a host-owned mirror. Called
+    /// only after queue receipt and domain state commit successfully together.
+    /// A projection error is logged separately and never retries committed
+    /// inference or owner mutations.
+    async fn document_summaries_committed(
+        &self,
+        _config: &MemoryConfig,
+        _tree_id: &str,
+        _summaries: &[crate::memory::tree::SummaryNode],
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    /// Embed one bounded re-embed batch at `signature` and return its mutations.
     async fn reembed_batch(
         &self,
         config: &MemoryConfig,
         signature: &str,
-    ) -> Result<ReembedProgress>;
+    ) -> Result<DelegateOutput<ReembedProgress>>;
 
     /// The active embedding signature (for the re-embed switch-path trigger).
     fn active_signature(&self, config: &MemoryConfig) -> String;
 
     /// Whether any chunk/summary lacks a vector at `signature`.
-    fn has_uncovered_reembed_work(&self, config: &MemoryConfig, signature: &str) -> Result<bool>;
+    async fn has_uncovered_reembed_work(
+        &self,
+        config: &MemoryConfig,
+        signature: &str,
+    ) -> Result<bool>;
 }
 
-/// Handler outcome plus durable follow-up jobs. The worker commits all
-/// follow-ups in the same transaction that marks the parent job done.
+/// Handler outcome, expected state, compute-only mutations, and durable
+/// follow-up jobs. The worker commits them with the lease-fenced job receipt.
 pub(crate) struct JobPlan {
     pub outcome: JobOutcome,
     pub follow_ups: Vec<NewJob>,
+    pub expected: Vec<StateChange>,
+    pub mutations: Vec<StateChange>,
+    pub document_projection: Option<DocumentProjection>,
+}
+
+pub(crate) struct DocumentProjection {
+    pub tree_id: String,
+    pub summaries: Vec<crate::memory::tree::SummaryNode>,
 }
 
 impl JobPlan {
@@ -195,30 +304,31 @@ impl JobPlan {
         Self {
             outcome: JobOutcome::Done,
             follow_ups,
-        }
-    }
-
-    fn outcome(outcome: JobOutcome) -> Self {
-        Self {
-            outcome,
-            follow_ups: Vec::new(),
+            expected: Vec::new(),
+            mutations: Vec::new(),
+            document_projection: None,
         }
     }
 }
 
-/// Dispatch a claimed job to the matching per-kind handler.
+/// Run a claimed job only when its plan has no persisted effects.
+///
+/// A plan with domain mutations or follow-up jobs must be settled by the
+/// lease-fenced worker; this compatibility entrypoint returns an error for
+/// those plans so it cannot publish state outside the owner commit.
 pub async fn handle_job(
     config: &MemoryConfig,
     job: &Job,
     delegates: &dyn QueueDelegates,
 ) -> Result<JobOutcome> {
     let plan = plan_job(config, job, delegates).await?;
-    for follow_up in &plan.follow_ups {
-        if store::enqueue(config, follow_up)?.is_some()
-            && follow_up.kind == JobKind::ReembedBackfill
-        {
-            set_backfill_in_progress(true);
-        }
+    if !plan.expected.is_empty()
+        || !plan.mutations.is_empty()
+        || !plan.follow_ups.is_empty()
+        || plan.document_projection.is_some()
+        || matches!(plan.outcome, JobOutcome::Defer { .. })
+    {
+        anyhow::bail!("job effects require lease-fenced worker settlement; use run_once");
     }
     Ok(plan.outcome)
 }
@@ -260,10 +370,16 @@ async fn handle_extract(
     delegates: &dyn QueueDelegates,
 ) -> Result<JobPlan> {
     let payload: ExtractChunkPayload = parse_payload(job, "ExtractChunk")?;
-    let Some(decision) = delegates.extract_chunk(config, &payload.chunk_id).await? else {
+    let Some(output) = delegates.extract_chunk(config, &payload.chunk_id).await? else {
         // Chunk row vanished between enqueue and claim — nothing to do.
         return Ok(JobPlan::done(Vec::new()));
     };
+    let decision = output.result;
+    let (expected, mutations): (Vec<_>, Vec<_>) = output
+        .mutations
+        .into_iter()
+        .map(JobMutation::into_state_changes)
+        .unzip();
 
     let mut follow_ups = Vec::new();
 
@@ -285,12 +401,20 @@ async fn handle_extract(
     // Anything admitted arms the re-embed backfill so the embedding pass starts
     // promptly (extract no longer embeds inline).
     if decision.kept {
-        if let Some(job) = crate::memory::queue::ops::planned_reembed_backfill(config, delegates)? {
+        if let Some(job) =
+            crate::memory::queue::ops::planned_reembed_backfill(config, delegates).await?
+        {
             follow_ups.push(job);
         }
     }
 
-    Ok(JobPlan::done(follow_ups))
+    Ok(JobPlan {
+        outcome: JobOutcome::Done,
+        follow_ups,
+        expected,
+        mutations,
+        document_projection: None,
+    })
 }
 
 async fn handle_append_buffer(
@@ -299,13 +423,19 @@ async fn handle_append_buffer(
     delegates: &dyn QueueDelegates,
 ) -> Result<JobPlan> {
     let payload: AppendBufferPayload = parse_payload(job, "AppendBuffer")?;
-    let Some(decision) = delegates
+    let Some(output) = delegates
         .append_node(config, &payload.node, &payload.target)
         .await?
     else {
         // Missing chunk/summary, or the target topic tree was archived — drop.
         return Ok(JobPlan::done(Vec::new()));
     };
+    let decision = output.result;
+    let (expected, mutations): (Vec<_>, Vec<_>) = output
+        .mutations
+        .into_iter()
+        .map(JobMutation::into_state_changes)
+        .unzip();
 
     let mut follow_ups = Vec::new();
     if decision.should_seal {
@@ -316,7 +446,13 @@ async fn handle_append_buffer(
         };
         follow_ups.push(NewJob::seal(&seal)?);
     }
-    Ok(JobPlan::done(follow_ups))
+    Ok(JobPlan {
+        outcome: JobOutcome::Done,
+        follow_ups,
+        expected,
+        mutations,
+        document_projection: None,
+    })
 }
 
 /// Run the `Seal` handler for exactly one buffer level.
@@ -335,14 +471,25 @@ async fn handle_seal(
     let payload: SealPayload = parse_payload(job, "Seal")?;
     // Seal exactly one level. A cascading seal returns the parent payload so
     // each level stays its own crash-recovery checkpoint.
-    let follow_ups = delegates
-        .seal_level(config, &payload)
-        .await?
+    let output = delegates.seal_level(config, &payload).await?;
+    let (expected, mutations): (Vec<_>, Vec<_>) = output
+        .mutations
+        .into_iter()
+        .map(JobMutation::into_state_changes)
+        .unzip();
+    let follow_ups = output
+        .result
         .map(|parent| NewJob::seal(&parent))
         .transpose()?
         .into_iter()
         .collect();
-    Ok(JobPlan::done(follow_ups))
+    Ok(JobPlan {
+        outcome: JobOutcome::Done,
+        follow_ups,
+        expected,
+        mutations,
+        document_projection: None,
+    })
 }
 
 async fn handle_flush_stale(
@@ -375,21 +522,30 @@ async fn handle_seal_document(
         // Empty version set — nothing to seal.
         return Ok(JobPlan::done(Vec::new()));
     }
-    delegates.seal_document(config, &payload).await?;
-    Ok(JobPlan::done(Vec::new()))
+    let output = delegates.seal_document(config, &payload).await?;
+    let result = output.result;
+    let (expected, mutations): (Vec<_>, Vec<_>) = output
+        .mutations
+        .into_iter()
+        .map(JobMutation::into_state_changes)
+        .unzip();
+    Ok(JobPlan {
+        outcome: JobOutcome::Done,
+        follow_ups: result.follow_ups.clone(),
+        expected,
+        mutations,
+        document_projection: Some(DocumentProjection {
+            tree_id: result.tree_id,
+            summaries: result.summaries,
+        }),
+    })
 }
 
 /// Run one step of the `ReembedBackfill` chain.
 ///
-/// Only the success paths (`Wrote`, `Covered`, `NoProvider`,
-/// `StaleSignature`) clear [`set_backfill_in_progress`]; if
-/// `delegates.reembed_batch` returns `Err` the job instead flows through
-/// `settle_job` (in [`super::worker`]) and is marked `failed` — terminally so
-/// once its attempt budget is exhausted — without this function ever running
-/// again to clear the flag. [`crate::memory::queue::ops::backfill_in_progress`]
-/// then stays `true` until the process restarts, and retrieval keeps treating
-/// every empty vector-search result as "not searched yet" rather than "no
-/// such memory" for the remainder of the process's life.
+/// Computed embedding updates are returned with the job plan for atomic
+/// settlement. The worker updates the process-wide backfill hint only after it
+/// commits the receipt, so planning cannot expose an uncommitted completion.
 async fn handle_reembed_backfill(
     config: &MemoryConfig,
     job: &Job,
@@ -397,14 +553,26 @@ async fn handle_reembed_backfill(
 ) -> Result<JobPlan> {
     let payload: ReembedBackfillPayload = parse_payload(job, "ReembedBackfill")?;
 
-    match delegates.reembed_batch(config, &payload.signature).await? {
+    let output = delegates.reembed_batch(config, &payload.signature).await?;
+    let (expected, mutations): (Vec<_>, Vec<_>) = output
+        .mutations
+        .into_iter()
+        .map(JobMutation::into_state_changes)
+        .unzip();
+    let plan = |outcome| JobPlan {
+        outcome,
+        follow_ups: Vec::new(),
+        expected,
+        mutations,
+        document_projection: None,
+    };
+    match output.result {
         ReembedProgress::Wrote {
             more_pending: true, ..
         } => {
-            set_backfill_in_progress(true);
             // More rows may remain — reschedule THIS row (no re-enqueue, so the
             // per-signature dedupe key stays valid).
-            Ok(JobPlan::outcome(JobOutcome::Defer {
+            Ok(plan(JobOutcome::Defer {
                 until_ms: chrono::Utc::now().timestamp_millis() + REEMBED_BACKFILL_REVISIT_MS,
                 reason: "re-embed backfill: batch done, more pending".to_string(),
             }))
@@ -414,10 +582,7 @@ async fn handle_reembed_backfill(
         }
         | ReembedProgress::Covered
         | ReembedProgress::NoProvider
-        | ReembedProgress::StaleSignature => {
-            set_backfill_in_progress(false);
-            Ok(JobPlan::done(Vec::new()))
-        }
+        | ReembedProgress::StaleSignature => Ok(plan(JobOutcome::Done)),
     }
 }
 

@@ -4,8 +4,10 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use crate::memory::chunks::{
-    count_raw_paths_ingested_with_prefix, filter_raw_paths_not_ingested,
-    list_chunk_raw_ref_paths_with_prefix, mark_raw_paths_ingested,
+    count_raw_paths_ingested_with_prefix, count_raw_paths_ingested_with_prefix_async,
+    filter_raw_paths_not_ingested, filter_raw_paths_not_ingested_async,
+    list_chunk_raw_ref_paths_with_prefix, list_chunk_raw_ref_paths_with_prefix_async,
+    mark_raw_paths_ingested, mark_raw_paths_ingested_async,
 };
 use crate::memory::config::MemoryConfig;
 use crate::memory::store::content::{raw_source_dir, sanitize_uid, slugify_source_id};
@@ -112,6 +114,70 @@ pub fn needs_rebuild(config: &MemoryConfig, tree_scope: &str, archive_source_id:
     }
 }
 
+async fn raw_coverage_async(
+    config: &MemoryConfig,
+    tree_scope: &str,
+    archive_source_id: &str,
+) -> anyhow::Result<RawCoverage> {
+    let content_root = crate::memory::chunks::content_root(config);
+    let source_directory = raw_source_dir(&content_root, archive_source_id);
+    if !source_directory.exists() {
+        return Ok(RawCoverage::default());
+    }
+
+    let mut files = Vec::new();
+    collect_raw_files(&source_directory, &mut files)?;
+    files.sort();
+    let references: Vec<_> = files
+        .into_iter()
+        .filter_map(|abs| {
+            let rel = abs
+                .strip_prefix(&content_root)
+                .ok()?
+                .to_str()?
+                .replace(std::path::MAIN_SEPARATOR, "/");
+            Some(RawFileRef { abs, rel })
+        })
+        .collect();
+    let total = references.len();
+    if total == 0 {
+        return Ok(RawCoverage::default());
+    }
+
+    let relative_prefix = format!("raw/{}/", slugify_source_id(archive_source_id));
+    if count_raw_paths_ingested_with_prefix_async(config, &relative_prefix).await? == 0 {
+        backfill_coverage_from_summaries_async(config, tree_scope, &references).await?;
+    }
+    let relative_paths: Vec<_> = references
+        .iter()
+        .map(|reference| reference.rel.clone())
+        .collect();
+    let mut pending_paths: HashSet<_> =
+        filter_raw_paths_not_ingested_async(config, &relative_paths)
+            .await?
+            .into_iter()
+            .collect();
+    let chunk_covered =
+        list_chunk_raw_ref_paths_with_prefix_async(config, &relative_prefix).await?;
+    pending_paths.retain(|path| !chunk_covered.contains(path));
+    let pending: Vec<_> = references
+        .into_iter()
+        .filter(|reference| pending_paths.contains(&reference.rel))
+        .collect();
+    tracing::debug!(
+        tree_scope,
+        archive_source_id,
+        total,
+        pending = pending.len(),
+        "[memory_sync:rebuild] raw coverage computed"
+    );
+    Ok(RawCoverage {
+        total,
+        covered: total.saturating_sub(pending.len()),
+        pending,
+    })
+}
+
 pub async fn rebuild_tree_from_raw(
     config: &MemoryConfig,
     tree_scope: &str,
@@ -138,7 +204,7 @@ pub async fn rebuild_tree_from_raw_with_audit(
     audit_source_kind: &str,
 ) -> anyhow::Result<RebuildOutcome> {
     let started = std::time::Instant::now();
-    let coverage = raw_coverage(config, tree_scope, archive_source_id)?;
+    let coverage = raw_coverage_async(config, tree_scope, archive_source_id).await?;
     if coverage.pending.is_empty() {
         return Ok(RebuildOutcome::default());
     }
@@ -187,7 +253,9 @@ pub async fn rebuild_tree_from_raw_with_audit(
         });
     }
 
-    let tree = TreeFactory::source(tree_scope).get_or_create(config)?;
+    let tree = TreeFactory::source(tree_scope)
+        .get_or_create_async(config)
+        .await?;
     let batches = batch_inputs(inputs, config.tree.input_token_budget);
     let batch_count = batches.len();
     let files_read = batches.iter().map(Vec::len).sum();
@@ -270,7 +338,7 @@ pub async fn rebuild_tree_from_raw_with_audit(
             .iter()
             .map(|input| input.relative_path.clone())
             .collect();
-        mark_raw_paths_ingested(config, &covered)?;
+        mark_raw_paths_ingested_async(config, &covered).await?;
         tracing::info!(
             tree_scope,
             batch_index,
@@ -405,6 +473,63 @@ fn backfill_coverage_from_summaries(
         Ok(0)
     } else {
         mark_raw_paths_ingested(config, &covered)
+    }
+}
+
+async fn backfill_coverage_from_summaries_async(
+    config: &MemoryConfig,
+    tree_scope: &str,
+    files: &[RawFileRef],
+) -> anyhow::Result<u64> {
+    let tree = TreeFactory::source(tree_scope)
+        .get_or_create_async(config)
+        .await?;
+    if tree.max_level == 0 {
+        return Ok(0);
+    }
+    let summaries =
+        crate::memory::tree::store::list_summaries_at_level_async(config, &tree.id, 1).await?;
+    let mut kind_uids: HashSet<(&'static str, String)> = HashSet::new();
+    let mut stems = HashSet::new();
+    for summary in summaries {
+        for label in summary.child_ids {
+            if let Some(uid) = label.strip_prefix("commit:") {
+                kind_uids.insert(("commits", sanitize_uid(uid)));
+            } else if let Some(uid) = label.strip_prefix("issue:") {
+                kind_uids.insert(("issues", sanitize_uid(uid)));
+            } else if let Some(uid) = label.strip_prefix("pr:") {
+                kind_uids.insert(("prs", sanitize_uid(uid)));
+            } else {
+                stems.insert(label);
+            }
+        }
+    }
+    let covered: Vec<_> = files
+        .iter()
+        .filter(|reference| {
+            let path = Path::new(&reference.rel);
+            let kind = path
+                .parent()
+                .and_then(Path::file_name)
+                .and_then(|name| name.to_str());
+            let stem = path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .unwrap_or_default();
+            stems.contains(stem)
+                || kind_uids.iter().any(|(expected_kind, uid)| {
+                    kind == Some(*expected_kind)
+                        && stem
+                            .split_once('_')
+                            .is_some_and(|(_, file_uid)| file_uid == uid)
+                })
+        })
+        .map(|reference| reference.rel.clone())
+        .collect();
+    if covered.is_empty() {
+        Ok(0)
+    } else {
+        mark_raw_paths_ingested_async(config, &covered).await
     }
 }
 

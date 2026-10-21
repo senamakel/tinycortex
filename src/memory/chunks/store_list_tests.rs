@@ -2,20 +2,23 @@
 //! predicates every read shares, the detail view over a page, and the
 //! per-source rollup.
 
-use super::types::{chunk_id, Chunk, Metadata, SourceKind, SourceRef};
+use super::types::{chunk_id, Chunk, Metadata, SourceKind, SourceRef, StagedChunk};
 use super::{
-    count_chunks_matching, list_chunk_details, list_chunks, source_totals, upsert_chunks,
-    with_connection, ListChunksQuery,
+    count_chunks_matching, list_chunk_details, list_chunks, set_chunk_embedding_for_signature,
+    set_chunk_lifecycle_status, source_totals, upsert_chunks, upsert_staged_chunks,
+    ListChunksQuery,
 };
+use crate::memory::chunks::collections::CHUNK_LIFECYCLE;
+use crate::memory::chunks::versioned::{self, StateChange};
 use crate::memory::config::MemoryConfig;
+use crate::memory::store::entity_index::{CanonicalEntity, EntityIndex, EntityKind};
 use chrono::{TimeZone, Utc};
-use rusqlite::params;
 use std::collections::HashSet;
 use tempfile::TempDir;
 
 fn test_config() -> (TempDir, MemoryConfig) {
     let tmp = TempDir::new().expect("tempdir");
-    let cfg = MemoryConfig::new(tmp.path());
+    let cfg = super::test_support::host_config(tmp.path());
     (tmp, cfg)
 }
 
@@ -47,19 +50,25 @@ fn chunk_with(
     }
 }
 
-/// Write one `mem_tree_entity_index` row directly. The scorer owns this table
-/// and is not in the chunk-store test path, so the tests seed it themselves.
-fn index_entity(cfg: &MemoryConfig, node_id: &str, entity_id: &str, entity_kind: &str) {
-    with_connection(cfg, |conn| {
-        conn.execute(
-            "INSERT INTO mem_tree_entity_index (
-                entity_id, node_id, node_kind, entity_kind, surface, score, timestamp_ms
-             ) VALUES (?1, ?2, 'leaf', ?3, 'surface', 0.9, 1700000000000)",
-            params![entity_id, node_id, entity_kind],
-        )?;
-        Ok(())
-    })
-    .unwrap();
+/// Seed entity predicates through the same host-owned index used by listing.
+fn index_entity(cfg: &MemoryConfig, node_id: &str, entity_id: &str, entity_kind: EntityKind) {
+    let entity_index = EntityIndex::for_memory_config(cfg).unwrap();
+    entity_index
+        .index_entity(
+            &CanonicalEntity {
+                canonical_id: entity_id.to_owned(),
+                kind: entity_kind,
+                surface: entity_id.to_owned(),
+                span_start: 0,
+                span_end: entity_id.len() as u32,
+                score: 0.9,
+            },
+            node_id,
+            "leaf",
+            1_700_000_000_000,
+            None,
+        )
+        .unwrap();
 }
 
 fn ids_of(chunks: &[Chunk]) -> Vec<String> {
@@ -103,13 +112,23 @@ fn every_list_predicate_composes_with_and() {
         &other_content,
         &unlisted_id,
     ] {
-        index_entity(&cfg, &chunk.id, "entity:acme", "org");
+        index_entity(&cfg, &chunk.id, "entity:acme", EntityKind::Organization);
     }
     // The wanted entity, of the wrong kind: `entity_ids` accepts this chunk and
     // `entity_kinds` is the only predicate that may reject it.
-    index_entity(&cfg, &other_entity_kind.id, "entity:acme", "person");
+    index_entity(
+        &cfg,
+        &other_entity_kind.id,
+        "entity:acme",
+        EntityKind::Person,
+    );
     // The wanted kind, under the wrong entity: the mirror image.
-    index_entity(&cfg, &other_entity.id, "entity:other", "org");
+    index_entity(
+        &cfg,
+        &other_entity.id,
+        "entity:other",
+        EntityKind::Organization,
+    );
 
     let full = ListChunksQuery {
         ids: ids_of(&[
@@ -123,7 +142,7 @@ fn every_list_predicate_composes_with_and() {
         source_kinds: vec![SourceKind::Chat],
         source_ids: vec!["slack:#eng".to_string()],
         entity_ids: vec!["entity:acme".to_string()],
-        entity_kinds: vec!["org".to_string()],
+        entity_kinds: vec![EntityKind::Organization.as_str().to_string()],
         content_contains: Some("quarterly".to_string()),
         ..Default::default()
     };
@@ -210,13 +229,13 @@ fn entity_predicates_never_multiply_a_chunk() {
     let single = chunk_with(SourceKind::Chat, "slack:#eng", 1, 2_000, "one entity");
     upsert_chunks(&cfg, &[chunk.clone(), single.clone()]).unwrap();
     for entity in ["entity:a", "entity:b", "entity:c"] {
-        index_entity(&cfg, &chunk.id, entity, "org");
+        index_entity(&cfg, &chunk.id, entity, EntityKind::Organization);
     }
-    index_entity(&cfg, &single.id, "entity:a", "org");
+    index_entity(&cfg, &single.id, "entity:a", EntityKind::Organization);
 
     let query = ListChunksQuery {
         entity_ids: vec!["entity:a".into(), "entity:b".into(), "entity:c".into()],
-        entity_kinds: vec!["org".into()],
+        entity_kinds: vec![EntityKind::Organization.as_str().into()],
         ..Default::default()
     };
     let rows = list_chunks(&cfg, &query).unwrap();
@@ -281,31 +300,20 @@ fn chunk_details_report_stored_facts_without_reading_the_vault() {
     let (_tmp, cfg) = test_config();
     let staged = chunk_with(SourceKind::Chat, "slack:#eng", 0, 2_000, "staged body");
     let inline = chunk_with(SourceKind::Chat, "slack:#eng", 1, 1_000, "inline body");
-    upsert_chunks(&cfg, &[staged.clone(), inline.clone()]).unwrap();
-
-    with_connection(&cfg, |conn| {
-        // A path that does not exist on disk: the detail row must still carry
-        // it, which is what proves nothing here opens the vault file.
-        conn.execute(
-            "UPDATE mem_tree_chunks
-                SET content_path = 'chat/never-written.md', lifecycle_status = 'sealed'
-              WHERE id = ?1",
-            params![staged.id],
-        )?;
-        // An empty string is neither NULL nor a path, and reads back as neither.
-        conn.execute(
-            "UPDATE mem_tree_chunks SET content_path = '' WHERE id = ?1",
-            params![inline.id],
-        )?;
-        conn.execute(
-            "INSERT INTO mem_tree_chunk_embeddings (
-                chunk_id, model_signature, vector, dim, created_at
-             ) VALUES (?1, 'test/model@3', ?2, 3, 1700000000.0)",
-            params![staged.id, vec![1_u8, 2, 3]],
-        )?;
-        Ok(())
-    })
+    upsert_staged_chunks(
+        &cfg,
+        &[StagedChunk {
+            chunk: staged.clone(),
+            // Deliberately do not create this vault file. Listing details must
+            // report the durable pointer without opening the file.
+            content_path: "chat/never-written.md".into(),
+            content_sha256: "test-sha".into(),
+        }],
+    )
     .unwrap();
+    upsert_chunks(&cfg, std::slice::from_ref(&inline)).unwrap();
+    set_chunk_lifecycle_status(&cfg, &staged.id, "sealed").unwrap();
+    set_chunk_embedding_for_signature(&cfg, &staged.id, "test/model@3", &[1.0, 2.0, 3.0]).unwrap();
 
     let details = list_chunk_details(&cfg, &ListChunksQuery::default()).unwrap();
     assert_eq!(details.len(), 2);
@@ -358,58 +366,27 @@ fn source_totals_group_by_source_and_honour_the_scope() {
     assert_eq!(source_totals(&cfg, Some(1), None).unwrap().len(), 1);
 }
 
-/// `exclude_dropped` filters with `lifecycle_status != 'dropped'`, and under
-/// SQLite a NULL in that column would compare NULL — the row would vanish from
-/// the page *and* from the count, silently, for a chunk that was never dropped.
-///
-/// It cannot happen, and this pins why rather than trusting it: the column is
-/// declared `TEXT NOT NULL DEFAULT 'admitted'` as an additive `ALTER TABLE`, so
-/// an insert that names every other column still lands with a value. The test
-/// writes a row through raw SQL that deliberately omits `lifecycle_status` —
-/// the "writer that bypassed it" case — and asserts the row is stored
-/// `admitted` and survives the filter.
+/// A legacy/imported chunk without a lifecycle record is not implicitly
+/// dropped. `exclude_dropped` filters only an explicit dropped marker.
 #[test]
 fn exclude_dropped_keeps_a_row_whose_lifecycle_was_never_written() {
     let (_tmp, cfg) = test_config();
     let seed = chunk_with(SourceKind::Chat, "slack:#eng", 0, 1_000, "seed");
     upsert_chunks(&cfg, std::slice::from_ref(&seed)).expect("seed");
-
-    let bypassed = chunk_id(SourceKind::Chat, "slack:#eng", 1, "bypassed");
-    with_connection(&cfg, |conn| {
-        // The stored encoding of `source_kind` is read back off the seeded row
-        // rather than spelled out, so this test cannot drift if that encoding
-        // ever changes.
-        let kind: String = conn.query_row(
-            "SELECT source_kind FROM mem_tree_chunks WHERE id = ?1",
-            params![seed.id],
-            |row| row.get(0),
-        )?;
-        conn.execute(
-            "INSERT INTO mem_tree_chunks (
-                 id, source_kind, source_id, owner,
-                 timestamp_ms, time_range_start_ms, time_range_end_ms,
-                 tags_json, content, token_count, seq_in_source, created_at_ms
-             ) VALUES (?1, ?2, 'slack:#eng', 'alice@example.com', 2000, 2000, 2000,
-                       '[]', 'bypassed', 1, 1, 2000)",
-            params![bypassed, kind],
-        )?;
-        Ok(())
-    })
-    .expect("insert without a lifecycle_status");
-
-    let stored: Option<String> = with_connection(&cfg, |conn| {
-        Ok(conn.query_row(
-            "SELECT lifecycle_status FROM mem_tree_chunks WHERE id = ?1",
-            params![bypassed],
-            |row| row.get(0),
-        )?)
-    })
-    .expect("read the stored lifecycle");
-    assert_eq!(
-        stored.as_deref(),
-        Some("admitted"),
-        "the NOT NULL default is what makes the filter safe"
-    );
+    let bypassed = chunk_with(SourceKind::Chat, "slack:#eng", 1, 2_000, "bypassed");
+    upsert_chunks(&cfg, std::slice::from_ref(&bypassed)).expect("persist chunk");
+    versioned::write_state_changes(
+        &cfg,
+        &[StateChange {
+            collection: CHUNK_LIFECYCLE.into(),
+            key: bypassed.id.clone(),
+            value: None,
+        }],
+    )
+    .unwrap();
+    assert!(versioned::read_state(&cfg, CHUNK_LIFECYCLE, &bypassed.id)
+        .unwrap()
+        .is_none());
 
     let query = ListChunksQuery {
         exclude_dropped: true,
@@ -421,8 +398,8 @@ fn exclude_dropped_keeps_a_row_whose_lifecycle_was_never_written() {
         .map(|chunk| chunk.id)
         .collect();
     assert!(
-        ids.contains(&bypassed),
-        "a row that was never dropped must survive exclude_dropped"
+        ids.contains(&bypassed.id),
+        "missing lifecycle is not dropped"
     );
     assert_eq!(
         count_chunks_matching(&cfg, &query).expect("count"),

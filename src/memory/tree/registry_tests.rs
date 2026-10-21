@@ -5,7 +5,7 @@ use tempfile::TempDir;
 
 fn test_config() -> (TempDir, MemoryConfig) {
     let tmp = TempDir::new().unwrap();
-    let cfg = MemoryConfig::new(tmp.path());
+    let cfg = crate::memory::chunks::test_support::host_config(tmp.path());
     (tmp, cfg)
 }
 
@@ -86,7 +86,24 @@ fn get_or_create_recovers_from_unique_race() {
     };
     let err = store::insert_tree(&cfg, &dup).unwrap_err();
     assert!(
-        is_unique_violation(&err),
-        "expected UNIQUE violation: {err:#}"
+        is_tree_insert_conflict(&err),
+        "expected typed conflict: {err:#}"
     );
+}
+
+#[tokio::test]
+async fn concurrent_get_or_create_returns_one_owner_tree() {
+    let (_tmp, cfg) = test_config();
+    let (left, right) = tokio::join!(
+        get_or_create_tree_async(&cfg, TreeKind::Source, "concurrent:scope"),
+        get_or_create_tree_async(&cfg, TreeKind::Source, "concurrent:scope"),
+    );
+    let left = left.unwrap();
+    let right = right.unwrap();
+    assert_eq!(left.id, right.id);
+    let trees = store::list_trees_by_kind_async(&cfg, TreeKind::Source)
+        .await
+        .unwrap();
+    assert_eq!(trees.len(), 1);
+    assert_eq!(trees[0].scope, "concurrent:scope");
 }

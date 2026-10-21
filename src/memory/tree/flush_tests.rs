@@ -9,8 +9,8 @@ use tempfile::TempDir;
 use crate::memory::chunks::upsert_chunks;
 use crate::memory::chunks::{chunk_id, Chunk, Metadata, SourceKind, SourceRef};
 use crate::memory::tree::bucket_seal::{append_leaf, LeafRef};
-use crate::memory::tree::registry::get_or_create_tree;
-use crate::memory::tree::store::{upsert_buffer_tx, Buffer, TreeKind};
+use crate::memory::tree::registry::get_or_create_tree_async;
+use crate::memory::tree::store::{Buffer, TreeKind};
 use crate::memory::tree::summarise::ConcatSummariser;
 
 struct RejectTreeObserver {
@@ -22,7 +22,7 @@ impl crate::memory::tree::bucket_seal::SealObserver for RejectTreeObserver {
         &self,
         tree: &crate::memory::tree::store::Tree,
         _node: &crate::memory::tree::store::SummaryNode,
-        _content_path: &str,
+        _content_path: Option<&str>,
         _reason: &str,
     ) -> anyhow::Result<()> {
         if tree.id == self.tree_id {
@@ -34,8 +34,50 @@ impl crate::memory::tree::bucket_seal::SealObserver for RejectTreeObserver {
 
 fn test_config() -> (TempDir, MemoryConfig) {
     let tmp = TempDir::new().unwrap();
-    let cfg = MemoryConfig::new(tmp.path());
+    let cfg = crate::memory::chunks::test_support::host_config(tmp.path());
     (tmp, cfg)
+}
+
+fn count_summaries_outside_runtime(config: &MemoryConfig, tree_id: &str) -> u64 {
+    let config = config.clone();
+    let tree_id = tree_id.to_owned();
+    std::thread::spawn(move || store::count_summaries(&config, &tree_id))
+        .join()
+        .unwrap()
+        .unwrap()
+}
+
+fn buffer_outside_runtime(config: &MemoryConfig, tree_id: &str, level: u32) -> Buffer {
+    let config = config.clone();
+    let tree_id = tree_id.to_owned();
+    std::thread::spawn(move || store::get_buffer(&config, &tree_id, level))
+        .join()
+        .unwrap()
+        .unwrap()
+}
+
+async fn seed_buffer(config: &MemoryConfig, buffer: &Buffer) {
+    let key = format!("buffer:{}:{}", buffer.tree_id, buffer.level);
+    let expected = [crate::memory::chunks::versioned::StateChange {
+        collection: crate::memory::chunks::collections::BUFFERS.to_owned(),
+        key: key.clone(),
+        value: None,
+    }];
+    let changes = [crate::memory::chunks::versioned::StateChange {
+        collection: crate::memory::chunks::collections::BUFFERS.to_owned(),
+        key,
+        value: Some(serde_json::to_value(buffer).unwrap()),
+    }];
+    assert!(
+        crate::memory::chunks::versioned::commit_if_state_matches_async(
+            config,
+            &expected,
+            &[],
+            &changes
+        )
+        .await
+        .unwrap()
+    );
 }
 
 fn seed_chunk(cfg: &MemoryConfig, src: &str, seq: u32, content: &str, ts: DateTime<Utc>) -> Chunk {
@@ -57,14 +99,22 @@ fn seed_chunk(cfg: &MemoryConfig, src: &str, seq: u32, content: &str, ts: DateTi
         created_at: ts,
         partial_message: false,
     };
-    upsert_chunks(cfg, std::slice::from_ref(&c)).unwrap();
+    let config = cfg.clone();
+    let chunk_for_write = c.clone();
+    std::thread::spawn(move || {
+        upsert_chunks(&config, std::slice::from_ref(&chunk_for_write)).unwrap();
+    })
+    .join()
+    .unwrap();
     c
 }
 
 #[tokio::test]
 async fn flush_seals_old_buffer_even_under_budget() {
     let (_tmp, cfg) = test_config();
-    let tree = get_or_create_tree(&cfg, TreeKind::Source, "slack:#eng").unwrap();
+    let tree = get_or_create_tree_async(&cfg, TreeKind::Source, "slack:#eng")
+        .await
+        .unwrap();
     let s = ConcatSummariser::new();
     let old_ts = Utc::now() - Duration::days(10);
     let c = seed_chunk(&cfg, "slack:#eng", 0, "old content to seal", old_ts);
@@ -81,47 +131,44 @@ async fn flush_seals_old_buffer_even_under_budget() {
     append_leaf(&cfg, &tree, &leaf, &s, &LabelStrategy::Empty)
         .await
         .unwrap();
-    assert_eq!(store::count_summaries(&cfg, &tree.id).unwrap(), 0);
+    assert_eq!(count_summaries_outside_runtime(&cfg, &tree.id), 0);
 
     let seals = flush_stale_buffers(&cfg, Duration::days(7), &s, &LabelStrategy::Empty)
         .await
         .unwrap();
     assert_eq!(seals, 1);
-    assert_eq!(store::count_summaries(&cfg, &tree.id).unwrap(), 1);
-    assert!(store::get_buffer(&cfg, &tree.id, 0).unwrap().is_empty());
+    assert_eq!(count_summaries_outside_runtime(&cfg, &tree.id), 1);
+    assert!(buffer_outside_runtime(&cfg, &tree.id, 0).is_empty());
 }
 
 #[tokio::test]
 async fn flush_does_not_force_seal_under_fanout_upper_buffer() {
     let (_tmp, cfg) = test_config();
-    let tree = get_or_create_tree(&cfg, TreeKind::Source, "slack:#eng").unwrap();
+    let tree = get_or_create_tree_async(&cfg, TreeKind::Source, "slack:#eng")
+        .await
+        .unwrap();
     let s = ConcatSummariser::new();
 
     let old_ts = Utc::now() - Duration::days(10);
-    crate::memory::chunks::with_connection(&cfg, |conn| {
-        let tx = conn.unchecked_transaction()?;
-        upsert_buffer_tx(
-            &tx,
-            &Buffer {
-                tree_id: tree.id.clone(),
-                level: 1,
-                item_ids: vec!["fake-l1-child".into()],
-                token_sum: 100,
-                oldest_at: Some(old_ts),
-            },
-        )?;
-        tx.commit()?;
-        Ok(())
-    })
-    .unwrap();
+    seed_buffer(
+        &cfg,
+        &Buffer {
+            tree_id: tree.id.clone(),
+            level: 1,
+            item_ids: vec!["fake-l1-child".into()],
+            token_sum: 100,
+            oldest_at: Some(old_ts),
+        },
+    )
+    .await;
 
     let seals = flush_stale_buffers(&cfg, Duration::days(7), &s, &LabelStrategy::Empty)
         .await
         .unwrap();
     assert_eq!(seals, 0, "L1 stale buffer must not be force-sealed");
-    assert_eq!(store::count_summaries(&cfg, &tree.id).unwrap(), 0);
+    assert_eq!(count_summaries_outside_runtime(&cfg, &tree.id), 0);
     assert_eq!(
-        store::get_buffer(&cfg, &tree.id, 1).unwrap().item_ids,
+        buffer_outside_runtime(&cfg, &tree.id, 1).item_ids,
         vec!["fake-l1-child".to_string()]
     );
 }
@@ -129,7 +176,9 @@ async fn flush_does_not_force_seal_under_fanout_upper_buffer() {
 #[tokio::test]
 async fn flush_noop_when_buffer_is_recent() {
     let (_tmp, cfg) = test_config();
-    let tree = get_or_create_tree(&cfg, TreeKind::Source, "slack:#eng").unwrap();
+    let tree = get_or_create_tree_async(&cfg, TreeKind::Source, "slack:#eng")
+        .await
+        .unwrap();
     let s = ConcatSummariser::new();
     let now = Utc::now();
     let c = seed_chunk(&cfg, "slack:#eng", 0, "fresh", now);
@@ -150,14 +199,18 @@ async fn flush_noop_when_buffer_is_recent() {
         .await
         .unwrap();
     assert_eq!(seals, 0);
-    assert_eq!(store::count_summaries(&cfg, &tree.id).unwrap(), 0);
+    assert_eq!(count_summaries_outside_runtime(&cfg, &tree.id), 0);
 }
 
 #[tokio::test]
 async fn flush_seals_multiple_distinct_trees_via_batched_lookup() {
     let (_tmp, cfg) = test_config();
-    let tree_a = get_or_create_tree(&cfg, TreeKind::Source, "slack:#eng").unwrap();
-    let tree_b = get_or_create_tree(&cfg, TreeKind::Source, "slack:#design").unwrap();
+    let tree_a = get_or_create_tree_async(&cfg, TreeKind::Source, "slack:#eng")
+        .await
+        .unwrap();
+    let tree_b = get_or_create_tree_async(&cfg, TreeKind::Source, "slack:#design")
+        .await
+        .unwrap();
     assert_ne!(tree_a.id, tree_b.id);
     let s = ConcatSummariser::new();
     let old_ts = Utc::now() - Duration::days(10);
@@ -185,15 +238,19 @@ async fn flush_seals_multiple_distinct_trees_via_batched_lookup() {
         .await
         .unwrap();
     assert_eq!(seals, 2);
-    assert_eq!(store::count_summaries(&cfg, &tree_a.id).unwrap(), 1);
-    assert_eq!(store::count_summaries(&cfg, &tree_b.id).unwrap(), 1);
+    assert_eq!(count_summaries_outside_runtime(&cfg, &tree_a.id), 1);
+    assert_eq!(count_summaries_outside_runtime(&cfg, &tree_b.id), 1);
 }
 
 #[tokio::test]
 async fn flush_continues_after_one_tree_fails() {
     let (_tmp, cfg) = test_config();
-    let tree_a = get_or_create_tree(&cfg, TreeKind::Source, "slack:#poison").unwrap();
-    let tree_b = get_or_create_tree(&cfg, TreeKind::Source, "slack:#healthy").unwrap();
+    let tree_a = get_or_create_tree_async(&cfg, TreeKind::Source, "slack:#poison")
+        .await
+        .unwrap();
+    let tree_b = get_or_create_tree_async(&cfg, TreeKind::Source, "slack:#healthy")
+        .await
+        .unwrap();
     let summariser = ConcatSummariser::new();
     let old_ts = Utc::now() - Duration::days(10);
 
@@ -236,7 +293,7 @@ async fn flush_continues_after_one_tree_fails() {
     .expect_err("one tree should report the injected failure");
 
     assert!(format!("{err:#}").contains("injected observer failure"));
-    assert_eq!(store::count_summaries(&cfg, &tree_b.id).unwrap(), 1);
+    assert_eq!(count_summaries_outside_runtime(&cfg, &tree_b.id), 1);
 }
 
 #[tokio::test]
@@ -273,7 +330,9 @@ async fn force_flush_tree_with_none_seals_under_budget_l0() {
     // L0 buffer. Before the fix the force flag was derived from `now.is_some()`,
     // so passing `None` silently made the documented force-seal a no-op.
     let (_tmp, cfg) = test_config();
-    let tree = get_or_create_tree(&cfg, TreeKind::Source, "slack:#eng").unwrap();
+    let tree = get_or_create_tree_async(&cfg, TreeKind::Source, "slack:#eng")
+        .await
+        .unwrap();
     let s = ConcatSummariser::new();
     let now = Utc::now();
     let c = seed_chunk(&cfg, "slack:#eng", 0, "disconnect flush content", now);
@@ -289,21 +348,23 @@ async fn force_flush_tree_with_none_seals_under_budget_l0() {
     append_leaf(&cfg, &tree, &leaf, &s, &LabelStrategy::Empty)
         .await
         .unwrap();
-    assert_eq!(store::count_summaries(&cfg, &tree.id).unwrap(), 0);
+    assert_eq!(count_summaries_outside_runtime(&cfg, &tree.id), 0);
 
     let sealed = force_flush_tree(&cfg, &tree.id, None, &s, &LabelStrategy::Empty)
         .await
         .unwrap();
 
     assert_eq!(sealed.len(), 1, "force_flush with None must seal");
-    assert!(store::get_buffer(&cfg, &tree.id, 0).unwrap().is_empty());
-    assert_eq!(store::count_summaries(&cfg, &tree.id).unwrap(), 1);
+    assert!(buffer_outside_runtime(&cfg, &tree.id, 0).is_empty());
+    assert_eq!(count_summaries_outside_runtime(&cfg, &tree.id), 1);
 }
 
 #[tokio::test]
 async fn force_flush_tree_seals_current_l0_buffer() {
     let (_tmp, cfg) = test_config();
-    let tree = get_or_create_tree(&cfg, TreeKind::Source, "slack:#eng").unwrap();
+    let tree = get_or_create_tree_async(&cfg, TreeKind::Source, "slack:#eng")
+        .await
+        .unwrap();
     let s = ConcatSummariser::new();
     let now = Utc::now();
     let c = seed_chunk(&cfg, "slack:#eng", 0, "manual flush content", now);
@@ -325,6 +386,6 @@ async fn force_flush_tree_seals_current_l0_buffer() {
         .unwrap();
 
     assert_eq!(sealed.len(), 1);
-    assert!(store::get_buffer(&cfg, &tree.id, 0).unwrap().is_empty());
-    assert_eq!(store::count_summaries(&cfg, &tree.id).unwrap(), 1);
+    assert!(buffer_outside_runtime(&cfg, &tree.id, 0).is_empty());
+    assert_eq!(count_summaries_outside_runtime(&cfg, &tree.id), 1);
 }

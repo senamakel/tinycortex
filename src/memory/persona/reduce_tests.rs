@@ -6,6 +6,7 @@ use async_trait::async_trait;
 use chrono::Utc;
 use tempfile::TempDir;
 
+use crate::memory::chunks::test_support::host_config;
 use crate::memory::config::MemoryConfig;
 use crate::memory::persona::compile::{compile_pack, PackInputs};
 use crate::memory::persona::distill::{digest_session, CallBudget};
@@ -30,7 +31,7 @@ impl ChatProvider for MockChat {
 
 fn cfg() -> (TempDir, MemoryConfig) {
     let tmp = TempDir::new().unwrap();
-    let cfg = MemoryConfig::new(tmp.path());
+    let cfg = host_config(tmp.path());
     (tmp, cfg)
 }
 

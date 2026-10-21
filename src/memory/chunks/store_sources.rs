@@ -4,10 +4,14 @@
 
 use anyhow::Result;
 use chrono::Utc;
-use rusqlite::{params, Connection, OptionalExtension, Transaction};
 
-use super::connection::with_connection;
+use super::collections::{CHUNK_LIFECYCLE, INGESTED_SOURCES};
 use super::types::SourceKind;
+use super::versioned::{
+    commit_if_state_matches_async, insert_state_changes_if_absent, list_chunk_snapshot, list_state,
+    list_state_async, read_chunk_lifecycle_status as read_implicit_lifecycle_status, read_state,
+    read_states_async, write_state, StateChange,
+};
 use crate::memory::config::MemoryConfig;
 
 // ── Lifecycle status ─────────────────────────────────────────────────────────
@@ -24,42 +28,17 @@ pub fn set_chunk_lifecycle_status(
     chunk_id: &str,
     status: &str,
 ) -> Result<()> {
-    with_connection(config, |conn| {
-        set_chunk_lifecycle_status_conn(conn, chunk_id, status)
-    })
-}
-
-/// Set the lifecycle status column inside a caller-owned transaction. The
-/// caller commits/rolls back `tx`.
-///
-/// # Errors
-/// See [`set_chunk_lifecycle_status`].
-#[allow(dead_code)]
-pub fn set_chunk_lifecycle_status_tx(
-    tx: &Transaction<'_>,
-    chunk_id: &str,
-    status: &str,
-) -> Result<()> {
-    set_chunk_lifecycle_status_conn(tx, chunk_id, status)
-}
-
-/// Core `UPDATE ... SET lifecycle_status` over an arbitrary `&Connection`.
-///
-/// # Errors
-/// Returns `Err` if the statement fails or no chunk row matches.
-fn set_chunk_lifecycle_status_conn(conn: &Connection, chunk_id: &str, status: &str) -> Result<()> {
-    let changed = conn.execute(
-        "UPDATE mem_tree_chunks SET lifecycle_status = ?1 WHERE id = ?2",
-        params![status, chunk_id],
-    )?;
-    // A lifecycle transition targeting a chunk that does not exist is always a
-    // caller bug (the chunk must be upserted before its status is advanced).
-    // Silently reporting success here would mask a lost/absent chunk and let the
-    // pipeline believe it scheduled work it never did, so surface it instead.
-    if changed == 0 {
+    if super::versioned::get_chunk(config, chunk_id)?.is_none() {
         anyhow::bail!("set_chunk_lifecycle_status: no chunk row for id={chunk_id}");
     }
-    Ok(())
+    write_state(
+        config,
+        StateChange {
+            collection: CHUNK_LIFECYCLE.into(),
+            key: chunk_id.into(),
+            value: Some(serde_json::json!({"status": status})),
+        },
+    )
 }
 
 /// Read the lifecycle status column for `chunk_id`, or `None` if the row is absent.
@@ -67,29 +46,7 @@ fn set_chunk_lifecycle_status_conn(conn: &Connection, chunk_id: &str, status: &s
 /// # Errors
 /// Returns `Err` only if the underlying query fails.
 pub fn get_chunk_lifecycle_status(config: &MemoryConfig, chunk_id: &str) -> Result<Option<String>> {
-    with_connection(config, |conn| {
-        let row = conn
-            .query_row(
-                "SELECT lifecycle_status FROM mem_tree_chunks WHERE id = ?1",
-                params![chunk_id],
-                |r| r.get::<_, String>(0),
-            )
-            .optional()?;
-        Ok(row)
-    })
-}
-
-pub fn get_chunk_lifecycle_status_tx(
-    tx: &Transaction<'_>,
-    chunk_id: &str,
-) -> Result<Option<String>> {
-    Ok(tx
-        .query_row(
-            "SELECT lifecycle_status FROM mem_tree_chunks WHERE id = ?1",
-            params![chunk_id],
-            |row| row.get(0),
-        )
-        .optional()?)
+    read_implicit_lifecycle_status(config, chunk_id)
 }
 
 /// Count chunks currently sitting at a given lifecycle status. Matches
@@ -99,27 +56,19 @@ pub fn get_chunk_lifecycle_status_tx(
 /// # Errors
 /// Returns `Err` only if the underlying query fails.
 pub fn count_chunks_by_lifecycle_status(config: &MemoryConfig, status: &str) -> Result<u64> {
-    with_connection(config, |conn| {
-        let n: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM mem_tree_chunks WHERE lifecycle_status = ?1",
-            params![status],
-            |r| r.get(0),
-        )?;
-        Ok(n.max(0) as u64)
-    })
+    let (_, states) = list_chunk_snapshot(config, &[CHUNK_LIFECYCLE])?;
+    Ok(states
+        .get(CHUNK_LIFECYCLE)
+        .into_iter()
+        .flatten()
+        .filter(|(_, value)| value["status"] == status)
+        .count() as u64)
 }
 
 // ── Source ingest gate ───────────────────────────────────────────────────────
 
-/// Best-effort, non-transactional check used to skip canonicalisation when a
-/// source has already been ingested. The authoritative gate is
-/// [`claim_source_ingest_tx`].
-///
-/// Because this runs outside any transaction, a `true`/`false` answer here
-/// can be stale by the time the caller acts on it under concurrent ingest —
-/// callers that need a correctness guarantee (not just a fast-path skip)
-/// must still go through [`claim_source_ingest_tx`] inside their own persist
-/// transaction.
+/// Check whether a source has already been ingested. Call
+/// [`claim_source_ingest`] when a conditional claim is required.
 ///
 /// # Errors
 /// Returns `Err` only if the underlying query fails.
@@ -128,44 +77,45 @@ pub fn is_source_ingested(
     source_kind: SourceKind,
     source_id: &str,
 ) -> Result<bool> {
-    with_connection(config, |conn| {
-        let n: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM mem_tree_ingested_sources \
-             WHERE source_kind = ?1 AND source_id = ?2",
-            params![source_kind.as_str(), source_id],
-            |r| r.get(0),
-        )?;
-        Ok(n > 0)
-    })
+    Ok(read_state(
+        config,
+        INGESTED_SOURCES,
+        &source_gate_key(source_kind, source_id),
+    )?
+    .is_some())
 }
 
-/// Atomically claim `(source_kind, source_id)` for ingestion. Returns `true` if
-/// the row was newly inserted; `false` if a previous ingest already claimed it.
-/// Lives inside the persist transaction so two concurrent ingests of the same
-/// source can't both pass the gate.
-///
-/// Idempotent by design: repeated calls for an already-claimed
-/// `(source_kind, source_id)` keep returning `false` and never overwrite
-/// `ingested_at_ms` (the `INSERT OR IGNORE` is a no-op on conflict).
-///
-/// # Errors
-/// Returns `Err` only if the `INSERT OR IGNORE` statement fails. Does not
-/// commit `tx` — the caller owns the surrounding transaction.
-pub fn claim_source_ingest_tx(
-    tx: &Transaction<'_>,
+pub(crate) fn source_gate_key(source_kind: SourceKind, source_id: &str) -> String {
+    format!("{}\0{source_id}", source_kind.as_str())
+}
+
+pub fn claim_source_ingest(
+    config: &MemoryConfig,
     source_kind: SourceKind,
     source_id: &str,
     now_ms: i64,
 ) -> Result<bool> {
-    let inserted = tx.execute(
-        "INSERT OR IGNORE INTO mem_tree_ingested_sources \
-            (source_kind, source_id, ingested_at_ms) \
-         VALUES (?1, ?2, ?3)",
-        params![source_kind.as_str(), source_id, now_ms],
-    )?;
-    Ok(inserted > 0)
+    Ok(insert_state_changes_if_absent(
+        config,
+        &[StateChange {
+            collection: INGESTED_SOURCES.into(),
+            key: source_gate_key(source_kind, source_id),
+            value: Some(serde_json::json!({
+                "source_kind": source_kind.as_str(),
+                "source_id": source_id,
+                "ingested_at_ms": now_ms,
+            })),
+        }],
+    )? == 1)
 }
 
+/// Atomically claim `(source_kind, source_id)` for ingestion. Returns `true`
+/// if the row was newly inserted; `false` if a previous ingest already
+/// claimed it.
+///
+/// Idempotent: repeated calls keep returning `false` and never overwrite the
+/// original `ingested_at_ms`.
+///
 /// Release a previously-claimed source gate row so a later retry can re-claim it.
 ///
 /// Compensation for a document ingest that claimed the gate but then failed
@@ -178,14 +128,14 @@ pub fn delete_source_ingest(
     source_kind: SourceKind,
     source_id: &str,
 ) -> Result<()> {
-    with_connection(config, |conn| {
-        conn.execute(
-            "DELETE FROM mem_tree_ingested_sources \
-             WHERE source_kind = ?1 AND source_id = ?2",
-            params![source_kind.as_str(), source_id],
-        )?;
-        Ok(())
-    })
+    write_state(
+        config,
+        StateChange {
+            collection: INGESTED_SOURCES.into(),
+            key: source_gate_key(source_kind, source_id),
+            value: None,
+        },
+    )
 }
 
 // ── Raw-archive file coverage gate ───────────────────────────────────────────
@@ -209,22 +159,76 @@ pub fn mark_raw_paths_ingested(config: &MemoryConfig, rel_paths: &[String]) -> R
         return Ok(0);
     }
     let now_ms = Utc::now().timestamp_millis();
-    with_connection(config, |conn| {
-        let tx = conn.unchecked_transaction()?;
-        let mut inserted: u64 = 0;
-        {
-            let mut stmt = tx.prepare(
-                "INSERT OR IGNORE INTO mem_tree_ingested_sources \
-                    (source_kind, source_id, ingested_at_ms) \
-                 VALUES (?1, ?2, ?3)",
-            )?;
-            for path in rel_paths {
-                inserted += stmt.execute(params![RAW_FILE_GATE_KIND, path, now_ms])? as u64;
-            }
+    let changes = rel_paths
+        .iter()
+        .map(|path| StateChange {
+            collection: INGESTED_SOURCES.into(),
+            key: source_gate_key(
+                SourceKind::Document,
+                &format!("{RAW_FILE_GATE_KIND}:{path}"),
+            ),
+            value: Some(serde_json::json!({
+                "source_kind": RAW_FILE_GATE_KIND,
+                "source_id": path,
+                "ingested_at_ms": now_ms,
+            })),
+        })
+        .collect::<Vec<_>>();
+    Ok(insert_state_changes_if_absent(config, &changes)? as u64)
+}
+
+/// Async counterpart to [`mark_raw_paths_ingested`] for Tokio callers.
+pub async fn mark_raw_paths_ingested_async(
+    config: &MemoryConfig,
+    rel_paths: &[String],
+) -> Result<u64> {
+    if rel_paths.is_empty() {
+        return Ok(0);
+    }
+    let now_ms = Utc::now().timestamp_millis();
+    let mut unique = std::collections::HashSet::new();
+    let changes: Vec<_> = rel_paths
+        .iter()
+        .filter(|path| unique.insert(path.as_str()))
+        .map(|path| StateChange {
+            collection: INGESTED_SOURCES.into(),
+            key: source_gate_key(
+                SourceKind::Document,
+                &format!("{RAW_FILE_GATE_KIND}:{path}"),
+            ),
+            value: Some(serde_json::json!({
+                "source_kind": RAW_FILE_GATE_KIND,
+                "source_id": path,
+                "ingested_at_ms": now_ms,
+            })),
+        })
+        .collect();
+
+    for _ in 0..8 {
+        let keys: Vec<_> = changes.iter().map(|change| change.key.clone()).collect();
+        let current = read_states_async(config, INGESTED_SOURCES, &keys).await?;
+        let expected: Vec<_> = changes
+            .iter()
+            .filter(|change| !current.contains_key(&change.key))
+            .map(|change| StateChange {
+                collection: INGESTED_SOURCES.into(),
+                key: change.key.clone(),
+                value: None,
+            })
+            .collect();
+        let to_insert: Vec<_> = changes
+            .iter()
+            .filter(|change| !current.contains_key(&change.key))
+            .cloned()
+            .collect();
+        if to_insert.is_empty() {
+            return Ok(0);
         }
-        tx.commit()?;
-        Ok(inserted)
-    })
+        if commit_if_state_matches_async(config, &expected, &[], &to_insert).await? {
+            return Ok(to_insert.len() as u64);
+        }
+    }
+    anyhow::bail!("raw-file coverage changed repeatedly while marking paths ingested")
 }
 
 /// Filter `rel_paths` down to the ones NOT yet recorded as ingested raw files.
@@ -245,20 +249,49 @@ pub fn filter_raw_paths_not_ingested(
     if rel_paths.is_empty() {
         return Ok(Vec::new());
     }
-    with_connection(config, |conn| {
-        let mut stmt = conn.prepare(
-            "SELECT COUNT(*) FROM mem_tree_ingested_sources \
-             WHERE source_kind = ?1 AND source_id = ?2",
-        )?;
-        let mut out: Vec<String> = Vec::new();
-        for path in rel_paths {
-            let n: i64 = stmt.query_row(params![RAW_FILE_GATE_KIND, path], |r| r.get(0))?;
-            if n == 0 {
-                out.push(path.clone());
-            }
+    let mut out = Vec::new();
+    for path in rel_paths {
+        if read_state(
+            config,
+            INGESTED_SOURCES,
+            &source_gate_key(
+                SourceKind::Document,
+                &format!("{RAW_FILE_GATE_KIND}:{path}"),
+            ),
+        )?
+        .is_none()
+        {
+            out.push(path.clone());
         }
-        Ok(out)
-    })
+    }
+    Ok(out)
+}
+
+/// Async counterpart to [`filter_raw_paths_not_ingested`]. Reads every gate
+/// against one captured owner head and preserves input order.
+pub async fn filter_raw_paths_not_ingested_async(
+    config: &MemoryConfig,
+    rel_paths: &[String],
+) -> Result<Vec<String>> {
+    if rel_paths.is_empty() {
+        return Ok(Vec::new());
+    }
+    let keys: Vec<_> = rel_paths
+        .iter()
+        .map(|path| {
+            source_gate_key(
+                SourceKind::Document,
+                &format!("{RAW_FILE_GATE_KIND}:{path}"),
+            )
+        })
+        .collect();
+    let current = read_states_async(config, INGESTED_SOURCES, &keys).await?;
+    Ok(rel_paths
+        .iter()
+        .zip(keys)
+        .filter(|(_, key)| !current.contains_key(key))
+        .map(|(path, _)| path.clone())
+        .collect())
 }
 
 /// Count raw-file gate rows whose path starts with `rel_prefix`. Rust-side
@@ -273,16 +306,30 @@ pub fn count_raw_paths_ingested_with_prefix(
     config: &MemoryConfig,
     rel_prefix: &str,
 ) -> Result<u64> {
-    with_connection(config, |conn| {
-        let mut stmt =
-            conn.prepare("SELECT source_id FROM mem_tree_ingested_sources WHERE source_kind = ?1")?;
-        let rows = stmt.query_map(params![RAW_FILE_GATE_KIND], |r| r.get::<_, String>(0))?;
-        let mut n: u64 = 0;
-        for row in rows {
-            if row?.starts_with(rel_prefix) {
-                n += 1;
-            }
-        }
-        Ok(n)
-    })
+    Ok(list_state(config, INGESTED_SOURCES)?
+        .iter()
+        .filter(|(_, value)| value["source_kind"] == RAW_FILE_GATE_KIND)
+        .filter(|(_, value)| {
+            value["source_id"]
+                .as_str()
+                .is_some_and(|path| path.starts_with(rel_prefix))
+        })
+        .count() as u64)
+}
+
+/// Async counterpart to [`count_raw_paths_ingested_with_prefix`].
+pub async fn count_raw_paths_ingested_with_prefix_async(
+    config: &MemoryConfig,
+    rel_prefix: &str,
+) -> Result<u64> {
+    Ok(list_state_async(config, INGESTED_SOURCES)
+        .await?
+        .iter()
+        .filter(|(_, value)| value["source_kind"] == RAW_FILE_GATE_KIND)
+        .filter(|(_, value)| {
+            value["source_id"]
+                .as_str()
+                .is_some_and(|path| path.starts_with(rel_prefix))
+        })
+        .count() as u64)
 }

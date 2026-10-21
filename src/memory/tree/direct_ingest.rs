@@ -3,12 +3,8 @@
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 
-use crate::memory::chunks::{tree_active_signature, with_connection};
+use crate::memory::chunks::tree_active_signature;
 use crate::memory::config::MemoryConfig;
-use crate::memory::score::store::index_summary_entity_ids_tx;
-use crate::memory::store::content::{
-    slugify_source_id, stage_summary, SummaryComposeInput, SummaryTreeKind,
-};
 use crate::memory::tree::bucket_seal::cascade_all_from;
 use crate::memory::tree::registry::new_summary_id;
 use crate::memory::tree::store::{self, SummaryNode, Tree};
@@ -31,7 +27,9 @@ pub struct SummaryIngestInput {
 #[derive(Clone, Debug)]
 pub struct SummaryIngestOutcome {
     pub summary_id: String,
-    pub content_path: String,
+    /// Optional host-side projection path. The durable summary body lives in
+    /// owner storage and does not imply that a filesystem export exists.
+    pub content_path: Option<String>,
     pub sealed_ids: Vec<String>,
 }
 
@@ -64,73 +62,95 @@ pub async fn ingest_summary(
         doc_id: None,
         version_ms: None,
     };
-    let content_root = crate::memory::chunks::content_root(config);
-    let summary_tree_kind = match tree.kind {
-        crate::memory::tree::TreeKind::Source => SummaryTreeKind::Source,
-        crate::memory::tree::TreeKind::Topic => SummaryTreeKind::Topic,
-        crate::memory::tree::TreeKind::Global => SummaryTreeKind::Global,
-        crate::memory::tree::TreeKind::Flavoured => SummaryTreeKind::Flavoured,
-    };
-    let staged = stage_summary(
-        &content_root,
-        &SummaryComposeInput {
-            summary_id: &summary_id,
-            tree_kind: summary_tree_kind,
-            tree_id: &tree.id,
-            tree_scope: &tree.scope,
-            level: TARGET_LEVEL,
-            child_ids: &node.child_ids,
-            child_basenames: if input.child_basenames.is_empty() {
-                None
-            } else {
-                Some(&input.child_basenames)
-            },
-            child_count: node.child_ids.len(),
-            time_range_start: node.time_range_start,
-            time_range_end: node.time_range_end,
-            sealed_at,
-            body: &node.content,
-        },
-        &slugify_source_id(&tree.scope),
-    )?;
     let signature = tree_active_signature(config);
-    with_connection(config, |connection| {
-        let transaction = connection.unchecked_transaction()?;
-        let current_max: i64 = transaction.query_row(
-            "SELECT max_level FROM mem_tree_trees WHERE id = ?1",
-            [&tree.id],
-            |row| row.get(0),
-        )?;
-        store::insert_staged_summary_tx(&transaction, &node, Some(&staged), &signature)?;
-        index_summary_entity_ids_tx(
-            &transaction,
-            &node.entities,
-            &node.id,
-            node.score,
-            sealed_at.timestamp_millis(),
-            Some(&tree.id),
-        )?;
-        let mut buffer = store::get_buffer_conn(&transaction, &tree.id, TARGET_LEVEL)?;
-        if !buffer.item_ids.contains(&summary_id) {
-            buffer.item_ids.push(summary_id.clone());
-            buffer.token_sum = buffer.token_sum.saturating_add(node.token_count as i64);
-            buffer.oldest_at = Some(buffer.oldest_at.map_or(node.time_range_start, |existing| {
-                existing.min(node.time_range_start)
-            }));
-            store::upsert_buffer_tx(&transaction, &buffer)?;
-        }
-        if TARGET_LEVEL > current_max.max(0) as u32 {
-            store::update_tree_after_seal_tx(
-                &transaction,
-                &tree.id,
-                &summary_id,
-                TARGET_LEVEL,
-                sealed_at,
-            )?;
-        }
-        transaction.commit()?;
-        Ok(())
-    })?;
+    let tree_key = format!("tree:{}", tree.id);
+    let buffer_key = format!("buffer:{}:{TARGET_LEVEL}", tree.id);
+    let keys = [
+        crate::memory::chunks::versioned::StateKey {
+            collection: crate::memory::chunks::collections::TREES.to_owned(),
+            key: tree_key.clone(),
+        },
+        crate::memory::chunks::versioned::StateKey {
+            collection: crate::memory::chunks::collections::BUFFERS.to_owned(),
+            key: buffer_key.clone(),
+        },
+    ];
+    let values = crate::memory::chunks::versioned::read_state_keys_async(config, &keys).await?;
+    let Some(tree_value) = values[0].as_ref() else {
+        anyhow::bail!("tree '{}' does not exist", tree.id);
+    };
+    let mut current_tree: Tree = serde_json::from_value(tree_value.clone())?;
+    anyhow::ensure!(
+        current_tree.status == crate::memory::tree::TreeStatus::Active,
+        "tree '{}' is archived",
+        tree.id
+    );
+    let mut buffer = values[1]
+        .clone()
+        .map(serde_json::from_value)
+        .transpose()?
+        .unwrap_or_else(|| store::Buffer::empty(&tree.id, TARGET_LEVEL));
+    if !buffer.item_ids.contains(&summary_id) {
+        buffer.item_ids.push(summary_id.clone());
+        buffer.token_sum = buffer.token_sum.saturating_add(node.token_count as i64);
+        buffer.oldest_at = Some(buffer.oldest_at.map_or(node.time_range_start, |existing| {
+            existing.min(node.time_range_start)
+        }));
+    }
+    if TARGET_LEVEL > current_tree.max_level {
+        current_tree.root_id = Some(summary_id.clone());
+        current_tree.max_level = TARGET_LEVEL;
+        current_tree.last_sealed_at = Some(sealed_at);
+    }
+    let summary_changes = store::stage_summary_changes(&node, None, &signature)?;
+    let entity_changes = crate::memory::score::store::stage_summary_entity_ids_async(
+        config,
+        &node.entities,
+        &node.id,
+        node.score,
+        sealed_at.timestamp_millis(),
+        Some(&tree.id),
+    )
+    .await?;
+    let mut expected = vec![
+        crate::memory::chunks::versioned::StateChange {
+            collection: crate::memory::chunks::collections::TREES.to_owned(),
+            key: tree_key.clone(),
+            value: Some(tree_value.clone()),
+        },
+        crate::memory::chunks::versioned::StateChange {
+            collection: crate::memory::chunks::collections::BUFFERS.to_owned(),
+            key: buffer_key.clone(),
+            value: values[1].clone(),
+        },
+    ];
+    expected.extend(summary_changes.expected);
+    expected.extend(entity_changes.expected);
+    let mut changes = vec![
+        crate::memory::chunks::versioned::StateChange {
+            collection: crate::memory::chunks::collections::TREES.to_owned(),
+            key: tree_key,
+            value: Some(serde_json::to_value(current_tree)?),
+        },
+        crate::memory::chunks::versioned::StateChange {
+            collection: crate::memory::chunks::collections::BUFFERS.to_owned(),
+            key: buffer_key,
+            value: Some(serde_json::to_value(buffer)?),
+        },
+    ];
+    changes.extend(summary_changes.changes);
+    changes.extend(entity_changes.changes);
+    anyhow::ensure!(
+        crate::memory::chunks::versioned::commit_if_state_matches_async(
+            config,
+            &expected,
+            &[],
+            &changes,
+        )
+        .await?,
+        "tree state changed while directly ingesting summary {}",
+        node.id
+    );
 
     let strategy = TreeFactory::from_tree(tree).label_strategy();
     let sealed_ids =
@@ -139,7 +159,7 @@ pub async fn ingest_summary(
     tracing::info!(summary_id, tree_id = %tree.id, cascaded = sealed_ids.len(), "[memory_tree:direct_ingest] summary ingested");
     Ok(SummaryIngestOutcome {
         summary_id,
-        content_path: staged.content_path,
+        content_path: None,
         sealed_ids,
     })
 }

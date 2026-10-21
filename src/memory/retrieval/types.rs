@@ -24,15 +24,15 @@ use crate::memory::tree::{SummaryNode, Tree, TreeKind};
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NodeKind {
-    /// Leaf = one `mem_tree_chunks` row (level 0).
+    /// Leaf = one persisted chunk record (level 0).
     Leaf,
-    /// Summary = one `mem_tree_summaries` row (level ≥ 1).
+    /// Summary = one persisted summary record (level ≥ 1).
     Summary,
 }
 
 impl NodeKind {
     /// Stable lowercase string form (`"leaf"` / `"summary"`) — matches the
-    /// serde representation and is suitable for SQL discriminator columns.
+    /// serde representation and is suitable for persisted discriminators.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Leaf => "leaf",
@@ -213,6 +213,76 @@ pub(crate) fn hydrated_chunk_hit(
     hit
 }
 
+pub(crate) fn hydrated_chunk_hit_from_snapshot(
+    config: &crate::memory::MemoryConfig,
+    chunk: &Chunk,
+    tree_id: &str,
+    tree_scope: &str,
+    score: f32,
+    raw_refs: Option<&serde_json::Value>,
+    content_pointer: Option<&serde_json::Value>,
+) -> RetrievalHit {
+    let mut hit = hit_from_chunk(chunk, tree_id, tree_scope, score);
+    match crate::memory::store::content::read::read_chunk_body_from_snapshot(
+        config,
+        &chunk.id,
+        &chunk.content,
+        raw_refs,
+        content_pointer,
+    ) {
+        Ok(body) => hit.content = body,
+        Err(error) => log::warn!(
+            "[memory:retrieval] full chunk body unavailable; serving preview chunk_id={}: {error}",
+            chunk.id
+        ),
+    }
+    hit
+}
+
+pub(crate) async fn hydrated_chunk_hit_from_snapshot_async(
+    config: &crate::memory::MemoryConfig,
+    chunk: &Chunk,
+    tree_id: &str,
+    tree_scope: &str,
+    score: f32,
+    raw_refs: Option<&serde_json::Value>,
+    content_pointer: Option<&serde_json::Value>,
+) -> RetrievalHit {
+    let mut hit = hit_from_chunk(chunk, tree_id, tree_scope, score);
+    match crate::memory::store::content::read::read_chunk_body_from_snapshot_async(
+        config,
+        &chunk.id,
+        &chunk.content,
+        raw_refs,
+        content_pointer,
+    )
+    .await
+    {
+        Ok(body) => hit.content = body,
+        Err(error) => log::warn!(
+            "[memory:retrieval] full chunk body unavailable; serving preview chunk_id={}: {error}",
+            chunk.id
+        ),
+    }
+    hit
+}
+
+pub(crate) async fn hydrated_summary_hit_async(
+    config: &crate::memory::MemoryConfig,
+    node: &SummaryNode,
+    tree_scope: &str,
+) -> RetrievalHit {
+    let mut hit = hit_from_summary(node, tree_scope);
+    match crate::memory::store::content::read_summary_body_async(config, &node.id).await {
+        Ok(body) => hit.content = body,
+        Err(error) => log::warn!(
+            "[memory:retrieval] full summary body unavailable; serving preview node_id={}: {error}",
+            node.id
+        ),
+    }
+    hit
+}
+
 /// Decide the placeholder [`TreeKind`] to report on a leaf hit. Leaves live
 /// under source trees regardless of the underlying [`SourceKind`], so we always
 /// return [`TreeKind::Source`]. Accepting the `SourceKind` argument keeps the
@@ -231,7 +301,7 @@ pub struct EntityMatch {
     pub kind: EntityKind,
     /// Example surface form that matched — useful for UI display.
     pub surface: String,
-    /// Total rows in `mem_tree_entity_index` grouped under this canonical id.
+    /// Number of persisted occurrence rows grouped under this canonical id.
     pub mention_count: u64,
     /// Epoch-millis of the newest mention across all rows.
     pub last_seen_ms: i64,

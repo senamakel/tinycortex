@@ -130,8 +130,8 @@ async fn occurrence_fallback_prioritizes_hits_containing_query_entities() {
     assert!(response.truncated);
 }
 
-#[test]
-fn local_candidates_intersect_occurrences_and_keep_latest_timestamp() {
+#[tokio::test]
+async fn local_candidates_intersect_occurrences_and_keep_latest_timestamp() {
     let (_temp, config) = test_config();
     for (entity, kind, timestamp) in [
         ("person:alice", EntityKind::Person, 10),
@@ -154,15 +154,22 @@ fn local_candidates_intersect_occurrences_and_keep_latest_timestamp() {
         dist: 1,
     }];
 
-    let candidates = local_candidates(&config, &pairs).unwrap();
+    let candidates = local_candidates(&config, &pairs).await.unwrap();
 
     assert_eq!(candidates["shared-node"].matched.len(), 2);
     assert_eq!(candidates["shared-node"].latest_ts, 20);
 }
 
-#[test]
-fn resolve_local_hydrates_leaf_and_summary_and_skips_missing_or_out_of_scope() {
-    let (_temp, config) = test_config();
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn resolve_local_hydrates_leaf_and_summary_and_skips_missing_or_out_of_scope() {
+    let (temp, _) = test_config();
+    let scope = tinystoragedrivers_types::Scope::new("test:retrieval-fast").unwrap();
+    let config = MemoryConfig::open_with_storage(
+        temp.path(),
+        tinystoragedrivers_testkit::memory_storage(&scope),
+    )
+    .await
+    .unwrap();
     let leaf = sample_chunk("slack:#allowed", 0, "leaf");
     insert_chunks(&config, std::slice::from_ref(&leaf));
     insert_tree_row(
@@ -193,7 +200,9 @@ fn resolve_local_hydrates_leaf_and_summary_and_skips_missing_or_out_of_scope() {
     ]);
     let scope = HashSet::from(["slack:#allowed".to_string()]);
 
-    let response = resolve_local(&config, candidates, Some(&scope), 10).unwrap();
+    let response = resolve_local(&config, candidates, Some(&scope), 10)
+        .await
+        .unwrap();
 
     assert_eq!(response.total, 2);
     assert_eq!(response.hits[0].node_id, "summary");
@@ -229,11 +238,16 @@ async fn local_branch_intersects_entities_and_applies_scope_before_limit() {
             );
         }
     }
-    upsert_edges(
-        &config,
-        &pairs_from_entities(&["person:alice".into(), "topic:launch".into()]),
-        fixed_ts().timestamp_millis(),
-    )
+    let edge_config = config.clone();
+    std::thread::spawn(move || {
+        upsert_edges(
+            &edge_config,
+            &pairs_from_entities(&["person:alice".into(), "topic:launch".into()]),
+            fixed_ts().timestamp_millis(),
+        )
+        .unwrap();
+    })
+    .join()
     .unwrap();
     let scope = HashSet::from(["slack:#allowed".to_string()]);
 

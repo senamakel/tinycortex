@@ -28,8 +28,17 @@ pub fn enqueue_flush_stale(config: &MemoryConfig) -> Result<Option<String>> {
     store::enqueue(config, &new_job)
 }
 
+#[cfg(feature = "tokio")]
+pub(crate) async fn enqueue_flush_stale_async(config: &MemoryConfig) -> Result<Option<String>> {
+    let now = Utc::now();
+    let today_iso = now.date_naive().format("%Y-%m-%d").to_string();
+    let hour_block = now.hour() / 3;
+    let new_job = NewJob::flush_stale(&FlushStalePayload::default(), &today_iso, hour_block)?;
+    store::enqueue_async(config, &new_job).await
+}
+
 /// Requeue jobs that failed for transient reasons (network blips, timeouts,
-/// SQLITE_BUSY) so chunks never sit unprocessed until the next manual sync.
+/// temporary storage unavailability) so chunks never sit unprocessed until the next manual sync.
 /// Unrecoverable failures stay parked. Returns the number requeued.
 ///
 /// This only touches terminally-`failed` rows. It does **not** itself call
@@ -39,6 +48,11 @@ pub fn enqueue_flush_stale(config: &MemoryConfig) -> Result<Option<String>> {
 /// lease recovery as part of their own scheduler tick.
 pub fn self_heal(config: &MemoryConfig) -> Result<u64> {
     requeue_transient_failed(config)
+}
+
+#[cfg(any(feature = "tokio", test))]
+pub(crate) async fn self_heal_async(config: &MemoryConfig) -> Result<u64> {
+    crate::memory::queue::store_settle::requeue_transient_failed_async(config).await
 }
 
 #[cfg(test)]

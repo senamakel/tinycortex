@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::memory::chunks::with_connection;
+use crate::memory::chunks::{collections, versioned};
 use crate::memory::config::MemoryConfig;
 
 const WAVE_WINDOW_MS: i64 = 10 * 60 * 1000;
@@ -52,54 +52,82 @@ fn list_sync_statuses_at(
     config: &MemoryConfig,
     now_ms: i64,
 ) -> anyhow::Result<Vec<MemorySyncStatus>> {
-    with_connection(config, |connection| {
-        let mut statement = connection.prepare(
-            "WITH provider_chunks AS ( \
-                SELECT CASE WHEN INSTR(source_id, ':') > 0 \
-                    THEN SUBSTR(source_id, 1, INSTR(source_id, ':') - 1) \
-                    ELSE source_kind END AS provider, \
-                    created_at_ms, \
-                    CASE WHEN EXISTS (SELECT 1 FROM mem_tree_chunk_embeddings e WHERE e.chunk_id = c.id) \
-                      OR c.lifecycle_status = 'dropped' \
-                      OR EXISTS (SELECT 1 FROM mem_tree_chunk_reembed_skipped s WHERE s.chunk_id = c.id) \
-                    THEN 1 ELSE 0 END AS resolved, timestamp_ms \
-                FROM mem_tree_chunks c \
-             ), provider_max AS ( \
-                SELECT provider, MAX(created_at_ms) AS max_created FROM provider_chunks GROUP BY provider \
-             ), provider_pending AS ( \
-                SELECT p.provider, SUM(CASE WHEN p.resolved = 0 AND p.created_at_ms >= m.max_created - ?1 THEN 1 ELSE 0 END) AS pending \
-                FROM provider_chunks p JOIN provider_max m ON p.provider = m.provider GROUP BY p.provider \
-             ), wave_anchors AS ( \
-                SELECT p.provider, MIN(p.created_at_ms) AS anchor \
-                FROM provider_chunks p JOIN provider_max m ON p.provider = m.provider \
-                JOIN provider_pending pp ON p.provider = pp.provider \
-                WHERE pp.pending > 0 AND p.created_at_ms >= m.max_created - ?1 GROUP BY p.provider \
-             ) SELECT p.provider, COUNT(*) AS chunks_synced, \
-                SUM(CASE WHEN p.resolved = 0 THEN 1 ELSE 0 END) AS chunks_pending, \
-                SUM(CASE WHEN w.anchor IS NOT NULL AND p.created_at_ms >= w.anchor THEN 1 ELSE 0 END) AS batch_total, \
-                SUM(CASE WHEN w.anchor IS NOT NULL AND p.created_at_ms >= w.anchor AND p.resolved = 1 THEN 1 ELSE 0 END) AS batch_processed, \
-                MAX(p.timestamp_ms) AS last_chunk_at_ms \
-             FROM provider_chunks p LEFT JOIN wave_anchors w ON p.provider = w.provider \
-             GROUP BY p.provider ORDER BY last_chunk_at_ms DESC",
-        )?;
-        let rows = statement.query_map([WAVE_WINDOW_MS], |row| {
-            let last_chunk_at_ms = row.get(5)?;
-            Ok(MemorySyncStatus {
-                provider: row.get(0)?,
-                chunks_synced: nonnegative(row.get(1)?),
-                chunks_pending: nonnegative(row.get(2)?),
-                batch_total: nonnegative(row.get(3)?),
-                batch_processed: nonnegative(row.get(4)?),
-                last_chunk_at_ms,
-                freshness: FreshnessLabel::from_age_ms(last_chunk_at_ms, now_ms),
+    let chunks = versioned::list_chunks(config)?;
+    let embedded = state_chunk_ids(config, collections::CHUNK_EMBEDDINGS)?;
+    let skipped = state_chunk_ids(config, collections::CHUNK_REEMBED_SKIPS)?;
+    let lifecycle = versioned::list_state(config, collections::CHUNK_LIFECYCLE)?
+        .into_iter()
+        .filter_map(|(key, value)| {
+            (value.get("status").and_then(serde_json::Value::as_str) == Some("dropped"))
+                .then_some(key)
+        })
+        .collect::<std::collections::HashSet<_>>();
+
+    let mut by_provider = std::collections::HashMap::<String, Vec<(i64, i64, bool)>>::new();
+    for chunk in chunks {
+        let source_id = &chunk.metadata.source_id;
+        let provider = source_id.split_once(':').map_or_else(
+            || chunk.metadata.source_kind.as_str().to_owned(),
+            |(name, _)| name.to_owned(),
+        );
+        let created_at_ms = chunk.created_at.timestamp_millis();
+        let timestamp_ms = chunk.metadata.timestamp.timestamp_millis();
+        let resolved = embedded.contains(&chunk.id)
+            || skipped.contains(&chunk.id)
+            || lifecycle.contains(&chunk.id);
+        by_provider
+            .entry(provider)
+            .or_default()
+            .push((created_at_ms, timestamp_ms, resolved));
+    }
+
+    let mut statuses = Vec::with_capacity(by_provider.len());
+    for (provider, rows) in by_provider {
+        let max_created = rows.iter().map(|row| row.0).max().unwrap_or_default();
+        let wave_rows = rows
+            .iter()
+            .filter(|row| row.0 >= max_created.saturating_sub(WAVE_WINDOW_MS))
+            .collect::<Vec<_>>();
+        let pending_in_wave = wave_rows.iter().filter(|row| !row.2).count();
+        let anchor = (pending_in_wave > 0)
+            .then(|| wave_rows.iter().map(|row| row.0).min())
+            .flatten();
+        let batch_rows = anchor
+            .map(|anchor| {
+                rows.iter()
+                    .filter(|row| row.0 >= anchor)
+                    .collect::<Vec<_>>()
             })
-        })?;
-        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
-    })
+            .unwrap_or_default();
+        let last_chunk_at_ms = rows.iter().map(|row| row.1).max();
+        statuses.push(MemorySyncStatus {
+            provider,
+            chunks_synced: rows.len() as u64,
+            chunks_pending: rows.iter().filter(|row| !row.2).count() as u64,
+            batch_total: batch_rows.len() as u64,
+            batch_processed: batch_rows.iter().filter(|row| row.2).count() as u64,
+            last_chunk_at_ms,
+            freshness: FreshnessLabel::from_age_ms(last_chunk_at_ms, now_ms),
+        });
+    }
+    statuses.sort_by_key(|status| std::cmp::Reverse(status.last_chunk_at_ms));
+    Ok(statuses)
 }
 
-fn nonnegative(value: i64) -> u64 {
-    value.max(0) as u64
+fn state_chunk_ids(
+    config: &MemoryConfig,
+    collection: &str,
+) -> anyhow::Result<std::collections::HashSet<String>> {
+    versioned::list_state(config, collection)?
+        .into_iter()
+        .map(|(key, value)| {
+            value
+                .get("chunk_id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+                .ok_or_else(|| anyhow::anyhow!("malformed {collection} record at {key:?}"))
+        })
+        .collect()
 }
 
 #[cfg(test)]

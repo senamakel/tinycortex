@@ -21,15 +21,24 @@ use std::collections::{HashMap, HashSet};
 
 use anyhow::Result;
 
-use crate::memory::chunks::{list_chunks, Chunk, ListChunksQuery, Metadata, SourceKind};
+use crate::memory::chunks::{
+    list_chunks_with_content_state, list_chunks_with_content_state_async, Chunk, ListChunksQuery,
+    Metadata, SourceKind,
+};
 use crate::memory::config::MemoryConfig;
-use crate::memory::tree::store::{get_tree_by_scope, list_summaries_in_window};
+use crate::memory::tree::store::{
+    get_tree_by_scope, get_tree_by_scope_async, list_summaries_in_window,
+    list_summaries_in_window_async,
+};
 use crate::memory::tree::{SummaryNode, TreeKind};
 
-use super::types::{hydrated_chunk_hit, hydrated_summary_hit, QueryResponse, RetrievalHit};
+use super::types::{
+    hydrated_chunk_hit_from_snapshot, hydrated_chunk_hit_from_snapshot_async, hydrated_summary_hit,
+    hydrated_summary_hit_async, QueryResponse, RetrievalHit,
+};
 
 /// Page size used while scanning the complete in-window chunk set. Pagination
-/// bounds each SQLite materialisation without silently dropping later sources.
+/// bounds each materialization without silently dropping later sources.
 /// Derive the tree scope a chunk seals under: `path_scope` overrides
 /// `source_id` for shared-directory document sources, mirroring the append
 /// path's scope derivation.
@@ -120,6 +129,67 @@ pub fn cover_window_scoped(
     Ok(QueryResponse::new(hits, total))
 }
 
+/// Async counterpart to [`cover_window_scoped`] for current-thread Tokio hosts.
+pub async fn cover_window_scoped_async(
+    config: &MemoryConfig,
+    since_ms: i64,
+    until_ms: i64,
+    source_id: Option<&str>,
+    source_kind: Option<SourceKind>,
+    source_scope: Option<HashSet<String>>,
+    limit: usize,
+) -> Result<QueryResponse> {
+    let limit = if limit == 0 {
+        config.retrieval.limits.cover_default_limit
+    } else {
+        limit
+    };
+    if until_ms < since_ms {
+        return Err(anyhow::anyhow!(
+            "cover_window: until_ms ({until_ms}) precedes since_ms ({since_ms})"
+        ));
+    }
+
+    let mut hits = collect_cover_async(
+        config,
+        since_ms,
+        until_ms,
+        source_id,
+        source_kind,
+        source_scope,
+    )
+    .await?;
+    hits.sort_by(|a, b| {
+        a.tree_scope
+            .cmp(&b.tree_scope)
+            .then(a.time_range_start.cmp(&b.time_range_start))
+    });
+    let total = hits.len();
+    hits.truncate(limit);
+    Ok(QueryResponse::new(hits, total))
+}
+
+/// Async unscoped convenience wrapper for [`cover_window_scoped_async`].
+pub async fn cover_window_async(
+    config: &MemoryConfig,
+    since_ms: i64,
+    until_ms: i64,
+    source_id: Option<&str>,
+    source_kind: Option<SourceKind>,
+    limit: usize,
+) -> Result<QueryResponse> {
+    cover_window_scoped_async(
+        config,
+        since_ms,
+        until_ms,
+        source_id,
+        source_kind,
+        None,
+        limit,
+    )
+    .await
+}
+
 /// Build the cover. Chunk-driven: pull the in-window chunk set first (chunks
 /// exist before their tree is sealed), group by source, then look up each
 /// source's tree for eligible summaries.
@@ -134,8 +204,9 @@ fn collect_cover(
     let restrict_summaries = source_id.is_some() || source_scope.is_some();
     let page_size = config.retrieval.limits.window_chunk_page_size;
     let mut chunks = Vec::new();
+    let mut content_state = HashMap::<String, HashMap<String, serde_json::Value>>::new();
     loop {
-        let page = list_chunks(
+        let (page, page_state) = list_chunks_with_content_state(
             config,
             &ListChunksQuery {
                 source_id: source_id.map(str::to_owned),
@@ -150,6 +221,10 @@ fn collect_cover(
             },
         )?;
         let page_len = page.len();
+        for (collection, rows) in page_state {
+            let destination = content_state.entry(collection).or_default();
+            destination.extend(rows);
+        }
         chunks.extend(page);
         if page_len < page_size {
             break;
@@ -168,29 +243,108 @@ fn collect_cover(
     let mut hits: Vec<RetrievalHit> = Vec::new();
     for (source, src_chunks) in by_source {
         cover_one_source(
-            config,
+            CoverSourceContext {
+                config,
+                since_ms,
+                until_ms,
+                exact_source: restrict_summaries,
+                content_state: &content_state,
+                out: &mut hits,
+            },
             &source,
-            since_ms,
-            until_ms,
             src_chunks,
-            restrict_summaries,
-            &mut hits,
         )?;
     }
     Ok(hits)
 }
 
+async fn collect_cover_async(
+    config: &MemoryConfig,
+    since_ms: i64,
+    until_ms: i64,
+    source_id: Option<&str>,
+    source_kind: Option<SourceKind>,
+    source_scope: Option<HashSet<String>>,
+) -> Result<Vec<RetrievalHit>> {
+    let restrict_summaries = source_id.is_some() || source_scope.is_some();
+    let page_size = config.retrieval.limits.window_chunk_page_size;
+    let mut chunks = Vec::new();
+    let mut content_state = HashMap::<String, HashMap<String, serde_json::Value>>::new();
+    loop {
+        let (page, page_state) = list_chunks_with_content_state_async(
+            config,
+            &ListChunksQuery {
+                source_id: source_id.map(str::to_owned),
+                source_kind,
+                since_ms: Some(since_ms),
+                until_ms: Some(until_ms),
+                limit: Some(page_size),
+                offset: Some(chunks.len()),
+                exclude_dropped: true,
+                source_scope: source_scope.clone(),
+                ..Default::default()
+            },
+        )
+        .await?;
+        let page_len = page.len();
+        for (collection, rows) in page_state {
+            content_state.entry(collection).or_default().extend(rows);
+        }
+        chunks.extend(page);
+        if page_len < page_size {
+            break;
+        }
+    }
+
+    let mut by_source: HashMap<String, Vec<Chunk>> = HashMap::new();
+    for chunk in chunks {
+        let scope = chunk_tree_scope(&chunk.metadata);
+        by_source.entry(scope).or_default().push(chunk);
+    }
+
+    let mut hits = Vec::new();
+    for (source, src_chunks) in by_source {
+        cover_one_source_async(
+            CoverSourceContext {
+                config,
+                since_ms,
+                until_ms,
+                exact_source: restrict_summaries,
+                content_state: &content_state,
+                out: &mut hits,
+            },
+            &source,
+            src_chunks,
+        )
+        .await?;
+    }
+    Ok(hits)
+}
+
+struct CoverSourceContext<'a> {
+    config: &'a MemoryConfig,
+    since_ms: i64,
+    until_ms: i64,
+    exact_source: bool,
+    content_state: &'a HashMap<String, HashMap<String, serde_json::Value>>,
+    out: &'a mut Vec<RetrievalHit>,
+}
+
 /// Minimum cover for one source: frontier summaries (when the source has a
 /// sealed tree) plus every in-window chunk they don't already cover, raw.
 fn cover_one_source(
-    config: &MemoryConfig,
+    context: CoverSourceContext<'_>,
     source: &str,
-    since_ms: i64,
-    until_ms: i64,
     chunks: Vec<Chunk>,
-    exact_source: bool,
-    out: &mut Vec<RetrievalHit>,
 ) -> Result<()> {
+    let CoverSourceContext {
+        config,
+        since_ms,
+        until_ms,
+        exact_source,
+        content_state,
+        out,
+    } = context;
     let tree = get_tree_by_scope(config, TreeKind::Source, source)?;
     let (tree_id, eligible) = match &tree {
         Some(t) => (
@@ -215,7 +369,81 @@ fn cover_one_source(
         if plan.covered_chunk_ids.contains(&chunk.id) || suppressed_chunk_ids.contains(&chunk.id) {
             continue;
         }
-        out.push(hydrated_chunk_hit(config, chunk, &tree_id, source, 0.0));
+        let raw_refs = content_state
+            .get(crate::memory::chunks::collections::RAW_REFS)
+            .and_then(|rows| rows.get(&chunk.id));
+        let content_pointer = content_state
+            .get(crate::memory::chunks::collections::CHUNK_CONTENT_POINTERS)
+            .and_then(|rows| rows.get(&chunk.id));
+        out.push(hydrated_chunk_hit_from_snapshot(
+            config,
+            chunk,
+            &tree_id,
+            source,
+            0.0,
+            raw_refs,
+            content_pointer,
+        ));
+    }
+    Ok(())
+}
+
+async fn cover_one_source_async(
+    context: CoverSourceContext<'_>,
+    source: &str,
+    chunks: Vec<Chunk>,
+) -> Result<()> {
+    let CoverSourceContext {
+        config,
+        since_ms,
+        until_ms,
+        exact_source,
+        content_state,
+        out,
+    } = context;
+    let tree = get_tree_by_scope_async(config, TreeKind::Source, source).await?;
+    let (tree_id, eligible) = match &tree {
+        Some(tree) => (
+            tree.id.clone(),
+            list_summaries_in_window_async(config, &tree.id, since_ms, until_ms).await?,
+        ),
+        None => (String::new(), Vec::new()),
+    };
+    let (eligible, suppressed_chunk_ids) = filter_superseded_doc_versions(eligible);
+    let present: HashSet<&str> = chunks.iter().map(|chunk| chunk.id.as_str()).collect();
+    let plan = plan_cover(&eligible, exact_source.then_some(&present));
+    let by_id: HashMap<&str, &SummaryNode> = eligible
+        .iter()
+        .map(|summary| (summary.id.as_str(), summary))
+        .collect();
+    for id in &plan.maximal_ids {
+        if let Some(node) = by_id.get(id.as_str()) {
+            out.push(hydrated_summary_hit_async(config, node, source).await);
+        }
+    }
+
+    for chunk in &chunks {
+        if plan.covered_chunk_ids.contains(&chunk.id) || suppressed_chunk_ids.contains(&chunk.id) {
+            continue;
+        }
+        let raw_refs = content_state
+            .get(crate::memory::chunks::collections::RAW_REFS)
+            .and_then(|rows| rows.get(&chunk.id));
+        let content_pointer = content_state
+            .get(crate::memory::chunks::collections::CHUNK_CONTENT_POINTERS)
+            .and_then(|rows| rows.get(&chunk.id));
+        out.push(
+            hydrated_chunk_hit_from_snapshot_async(
+                config,
+                chunk,
+                &tree_id,
+                source,
+                0.0,
+                raw_refs,
+                content_pointer,
+            )
+            .await,
+        );
     }
     Ok(())
 }

@@ -9,9 +9,8 @@
 //! ## Loops
 //!
 //! - `run_worker`: repeatedly runs one job, sleeping between polls. Idle polls
-//!   use the configured backoff; transient SQLite errors back off by kind
-//!   (busy / I/O / disk-full) and re-poll; corruption triggers database
-//!   recovery and the loop continues polling.
+//!   use the configured backoff; typed transient storage errors and host file
+//!   I/O errors back off, while typed generic backend failures stop the loop.
 //! - `run_scheduler`: on a fixed cadence, recover expired leases, enqueue
 //!   `flush_stale` (dedupe-safe), and `self_heal` transiently-failed jobs.
 //! - `run`: bootstrap once, then drive both loops concurrently until
@@ -29,7 +28,7 @@ pub mod types;
 
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use tokio::time::sleep;
 
 use crate::memory::config::MemoryConfig;
@@ -48,9 +47,10 @@ const SLEEP_SLICE: Duration = Duration::from_millis(200);
 ///
 /// - work processed → yield and immediately poll again;
 /// - no work → sleep [`WorkerLoopConfig::idle_backoff`];
-/// - transient SQLite error → sleep the kind-specific backoff and re-poll;
-/// - corruption (`SQLITE_CORRUPT`/`NOTADB`) → return the error so the host can
-///   quarantine + rebuild rather than spin.
+/// - typed transient storage error → sleep the category-specific backoff;
+/// - typed generic backend failure → return it to the host. The storage port
+///   has no corruption category, so this loop never guesses from error text or
+///   attempts engine-owned filesystem repair.
 pub async fn run_worker(
     config: &MemoryConfig,
     delegates: &dyn QueueDelegates,
@@ -65,17 +65,10 @@ pub async fn run_worker(
                 tokio::task::yield_now().await;
             }
             Ok(false) => interruptible_sleep(opts.idle_backoff, shutdown).await,
-            Err(err) => {
-                if worker::is_sqlite_corrupt(&err) {
-                    crate::memory::chunks::recover_corrupt_db(config)
-                        .context("recover corrupt queue database")?;
-                    continue;
-                }
-                match backoff_for(&err, opts) {
-                    Some(backoff) => interruptible_sleep(backoff, shutdown).await,
-                    None => return Err(err),
-                }
-            }
+            Err(err) => match backoff_for(&err, opts) {
+                Some(backoff) => interruptible_sleep(backoff, shutdown).await,
+                None => return Err(err),
+            },
         }
     }
     Ok(())
@@ -84,8 +77,9 @@ pub async fn run_worker(
 /// Run the scheduler loop until [`Shutdown`] is triggered or a fatal error.
 ///
 /// Each tick enqueues a dedupe-suppressed `flush_stale` job and requeues
-/// transiently-failed jobs. Transient errors are swallowed (the next tick
-/// retries); corruption is returned to the host.
+/// transiently-failed jobs. Typed retryable storage errors are retried on the
+/// next tick; other typed storage errors are returned to the host. Non-storage
+/// scheduler errors retain the prior next-tick retry behavior.
 ///
 pub async fn run_scheduler(
     config: &MemoryConfig,
@@ -93,25 +87,21 @@ pub async fn run_scheduler(
     shutdown: &Shutdown,
 ) -> Result<()> {
     while !shutdown.is_triggered() {
-        if let Err(err) = crate::memory::queue::store_settle::recover_stale_locks(config) {
-            if worker::is_sqlite_corrupt(&err) {
-                crate::memory::chunks::recover_corrupt_db(config)
-                    .context("recover corrupt queue database")?;
-                continue;
+        if let Err(err) =
+            crate::memory::queue::store_settle::recover_stale_locks_async(config).await
+        {
+            if worker::is_fatal_storage_error(&err) {
+                return Err(err);
             }
         }
-        if let Err(err) = scheduler::enqueue_flush_stale(config) {
-            if worker::is_sqlite_corrupt(&err) {
-                crate::memory::chunks::recover_corrupt_db(config)
-                    .context("recover corrupt queue database")?;
-                continue;
+        if let Err(err) = scheduler::enqueue_flush_stale_async(config).await {
+            if worker::is_fatal_storage_error(&err) {
+                return Err(err);
             }
         }
-        if let Err(err) = scheduler::self_heal(config) {
-            if worker::is_sqlite_corrupt(&err) {
-                crate::memory::chunks::recover_corrupt_db(config)
-                    .context("recover corrupt queue database")?;
-                continue;
+        if let Err(err) = scheduler::self_heal_async(config).await {
+            if worker::is_fatal_storage_error(&err) {
+                return Err(err);
             }
         }
         interruptible_sleep(opts.tick, shutdown).await;
@@ -132,7 +122,7 @@ pub async fn run(
     scheduler_opts: &SchedulerLoopConfig,
     shutdown: &Shutdown,
 ) -> Result<()> {
-    worker::bootstrap(config)?;
+    worker::bootstrap_async(config).await?;
     tokio::try_join!(
         run_worker(config, delegates, worker_opts, shutdown),
         run_scheduler(config, scheduler_opts, shutdown),
@@ -140,13 +130,11 @@ pub async fn run(
     Ok(())
 }
 
-/// Choose a backoff for a `run_once` error, or `None` if it is fatal.
-///
-/// Classification order matters: corruption is checked first (fatal), then the
-/// transient families in descending severity.
+/// Choose a backoff for a worker error, or `None` when a typed generic storage
+/// backend failure must be surfaced to the host.
 ///
 fn backoff_for(err: &anyhow::Error, opts: &WorkerLoopConfig) -> Option<Duration> {
-    if worker::is_sqlite_corrupt(err) {
+    if worker::is_fatal_storage_error(err) {
         return None;
     }
     if worker::is_host_io_error(err) {
@@ -155,16 +143,12 @@ fn backoff_for(err: &anyhow::Error, opts: &WorkerLoopConfig) -> Option<Duration>
         // long, like disk-full, instead of hammering the generic error arm.
         return Some(opts.host_io_backoff);
     }
-    if worker::is_sqlite_disk_full(err) {
-        return Some(opts.disk_full_backoff);
+    match worker::storage_error_kind(err) {
+        Some(tinystoragedrivers_types::ErrorKind::Conflict) => Some(opts.conflict_backoff),
+        Some(tinystoragedrivers_types::ErrorKind::Unavailable) => Some(opts.unavailable_backoff),
+        Some(_) => None,
+        None => Some(opts.error_backoff),
     }
-    if worker::is_sqlite_io_transient(err) {
-        return Some(opts.io_backoff);
-    }
-    if worker::is_sqlite_busy(err) {
-        return Some(opts.busy_backoff);
-    }
-    Some(opts.error_backoff)
 }
 
 /// Sleep for `total`, but wake early (within [`SLEEP_SLICE`]) if [`Shutdown`]

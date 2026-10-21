@@ -1,10 +1,13 @@
 use super::*;
+use crate::memory::chunks::test_support::host_config;
+use crate::memory::chunks::{upsert_chunks_async, Chunk, Metadata, SourceKind};
 use crate::memory::config::MemoryConfig;
+use chrono::{TimeZone, Utc};
 use tempfile::TempDir;
 
 fn test_config() -> (TempDir, MemoryConfig) {
     let tmp = TempDir::new().unwrap();
-    let cfg = MemoryConfig::new(tmp.path());
+    let cfg = host_config(tmp.path());
     (tmp, cfg)
 }
 
@@ -43,6 +46,19 @@ fn sample_entity(id: &str) -> CanonicalEntity {
     }
 }
 
+fn sample_chunk(id: &str) -> Chunk {
+    let timestamp = Utc.timestamp_millis_opt(1_700_000_000_000).unwrap();
+    Chunk {
+        id: id.to_owned(),
+        content: "chunk fixture".into(),
+        metadata: Metadata::point_in_time(SourceKind::Chat, "room", "owner", timestamp),
+        token_count: 2,
+        seq_in_source: 0,
+        created_at: timestamp,
+        partial_message: false,
+    }
+}
+
 #[test]
 fn upsert_then_get_score() {
     let (_tmp, cfg) = test_config();
@@ -64,6 +80,86 @@ fn upsert_score_idempotent() {
     upsert_score(&cfg, &r).unwrap();
     upsert_score(&cfg, &r).unwrap();
     assert_eq!(count_scores(&cfg).unwrap(), 1);
+}
+
+#[tokio::test]
+async fn queue_score_planner_returns_owner_mutations_without_persisting_them() {
+    let (_tmp, cfg) = test_config();
+    let row = sample_row("planned-chunk", false);
+    upsert_chunks_async(&cfg, &[sample_chunk(&row.chunk_id)])
+        .await
+        .unwrap();
+    let result = crate::memory::score::ScoreResult {
+        chunk_id: row.chunk_id.clone(),
+        total: row.total,
+        signals: row.signals,
+        kept: true,
+        drop_reason: None,
+        extracted: Default::default(),
+        canonical_entities: vec![sample_entity("alice")],
+    };
+
+    let mutations = plan_score_persistence_for_queue(&cfg, &result, 123, Some("source"))
+        .await
+        .unwrap();
+
+    assert!(mutations.iter().any(|mutation| {
+        mutation.collection == crate::memory::queue::JobStateCollection::ChunkScores
+            && mutation.key == "planned-chunk"
+    }));
+    assert!(mutations.iter().any(|mutation| {
+        mutation.collection == crate::memory::queue::JobStateCollection::EntityIndex
+            && mutation.value.is_some()
+    }));
+    assert!(get_score_async(&cfg, "planned-chunk")
+        .await
+        .unwrap()
+        .is_none());
+    assert!(list_entity_ids_for_node_async(&cfg, "planned-chunk")
+        .await
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
+async fn queue_score_planner_refuses_missing_or_deleted_chunks() {
+    let (_tmp, cfg) = test_config();
+    let row = sample_row("missing-chunk", false);
+    let result = crate::memory::score::ScoreResult {
+        chunk_id: row.chunk_id.clone(),
+        total: row.total,
+        signals: row.signals.clone(),
+        kept: true,
+        drop_reason: None,
+        extracted: Default::default(),
+        canonical_entities: vec![],
+    };
+    assert!(
+        plan_score_persistence_for_queue(&cfg, &result, 123, Some("source"))
+            .await
+            .is_err()
+    );
+
+    upsert_chunks_async(&cfg, &[sample_chunk(&row.chunk_id)])
+        .await
+        .unwrap();
+    crate::memory::chunks::versioned::commit_if_state_matches_async(
+        &cfg,
+        &[],
+        &[],
+        &[crate::memory::chunks::versioned::StateChange {
+            collection: crate::memory::chunks::collections::CHUNK_LIFECYCLE.to_owned(),
+            key: row.chunk_id.clone(),
+            value: Some(serde_json::json!({ "status": "deleted" })),
+        }],
+    )
+    .await
+    .unwrap();
+    assert!(
+        plan_score_persistence_for_queue(&cfg, &result, 123, Some("source"))
+            .await
+            .is_err()
+    );
 }
 
 #[test]
@@ -153,14 +249,12 @@ fn lookup_limit_respected() {
     assert_eq!(hits.len(), 2);
 }
 
-/// Regression: `index_summary_entity_ids_tx` must write a parseable
+/// Regression: summary indexing must write a parseable
 /// `entity_kind` (the "<kind>" prefix before `:`) so `lookup_entity` can still
 /// round-trip rows through `EntityKind::parse`. Earlier code stored the full
 /// canonical id, which poisoned lookups mixing leaf and summary hits.
 #[test]
 fn summary_entity_index_kind_is_parseable() {
-    use crate::memory::chunks::with_connection;
-
     let (_tmp, cfg) = test_config();
 
     // Seed a leaf hit so lookup_entity has something leafy to mix with the
@@ -168,22 +262,16 @@ fn summary_entity_index_kind_is_parseable() {
     let leaf_entity = sample_entity("alice");
     index_entity(&cfg, &leaf_entity, "leaf-1", "leaf", 1000, Some("tree-1")).unwrap();
 
-    // Write a summary row via the tx helper under test.
-    with_connection(&cfg, |conn| {
-        let tx = conn.unchecked_transaction()?;
-        let n = index_summary_entity_ids_tx(
-            &tx,
-            &["email:alice@example.com".into(), "hashtag:launch-q2".into()],
-            "summary-1",
-            0.84,
-            2000,
-            Some("tree-1"),
-        )?;
-        assert_eq!(n, 2);
-        tx.commit()?;
-        Ok(())
-    })
+    let n = index_summary_entity_ids(
+        &cfg,
+        &["email:alice@example.com".into(), "hashtag:launch-q2".into()],
+        "summary-1",
+        0.84,
+        2000,
+        Some("tree-1"),
+    )
     .unwrap();
+    assert_eq!(n, 2);
 
     // The column stores "email" and the lookup succeeds with both rows.
     let hits = lookup_entity(&cfg, "email:alice@example.com", None).unwrap();
@@ -239,86 +327,89 @@ fn get_scores_batch_empty_input_and_missing_chunk_ids() {
 }
 
 #[test]
-fn transactional_score_and_entity_helpers_commit_together() {
-    use crate::memory::chunks::with_connection;
-
+fn staged_score_and_entities_commit_under_one_owner_head() {
     let (_tmp, cfg) = test_config();
     let row = sample_row("tx-chunk", false);
     let entities = vec![sample_entity("alice"), sample_entity("bob")];
-    with_connection(&cfg, |conn| {
-        let tx = conn.unchecked_transaction()?;
-        upsert_score_tx(&tx, &row)?;
-        assert_eq!(
-            index_entities_tx(&tx, &entities, "tx-chunk", "leaf", 42, Some("tree"))?,
-            2
-        );
-        assert_eq!(clear_entity_index_for_node_tx(&tx, "tx-chunk")?, 2);
-        assert_eq!(
-            index_entities_tx(&tx, &entities[..1], "tx-chunk", "leaf", 43, None)?,
-            1
-        );
-        tx.commit()?;
-        Ok(())
-    })
-    .unwrap();
+    let staged = stage_score_and_entities(&cfg, &row, &entities, true, 42, Some("tree")).unwrap();
+
+    // Building the transaction is side-effect free: neither its score row nor
+    // its entity occurrences/edges are visible before the owner-head CAS.
+    assert!(get_score(&cfg, "tx-chunk").unwrap().is_none());
+    assert!(list_entity_ids_for_node(&cfg, "tx-chunk")
+        .unwrap()
+        .is_empty());
+    assert_eq!(crate::memory::graph::count_edges(&cfg).unwrap(), 0);
+
+    // A concurrent writer to the same node invalidates the captured manifest
+    // and edge expectations. The stale transaction must publish none of its
+    // score or entity changes.
+    let concurrent = sample_entity("carol");
+    index_entities(&cfg, &[concurrent], "tx-chunk", "leaf", 41, Some("tree")).unwrap();
+    assert!(!crate::memory::chunks::versioned::commit_if_state_matches(
+        &cfg,
+        &staged.expected,
+        &[],
+        &staged.changes
+    )
+    .unwrap());
+    assert!(get_score(&cfg, "tx-chunk").unwrap().is_none());
+    assert_eq!(
+        list_entity_ids_for_node(&cfg, "tx-chunk").unwrap(),
+        vec!["email:carol"]
+    );
+
+    // Retake the snapshot and atomically publish the score and replacement
+    // entity set. The previously committed occurrence is removed in the same
+    // CAS as the new occurrences and score row.
+    let staged = stage_score_and_entities(&cfg, &row, &entities, true, 42, Some("tree")).unwrap();
+    assert!(crate::memory::chunks::versioned::commit_if_state_matches(
+        &cfg,
+        &staged.expected,
+        &[],
+        &staged.changes
+    )
+    .unwrap());
 
     assert_eq!(get_score(&cfg, "tx-chunk").unwrap().unwrap().total, 0.7);
     assert_eq!(
         list_entity_ids_for_node(&cfg, "tx-chunk").unwrap(),
-        vec!["email:alice"]
+        vec!["email:alice", "email:bob"]
     );
+    assert_eq!(crate::memory::graph::count_edges(&cfg).unwrap(), 1);
 }
 
 #[test]
-fn empty_transactional_entity_batches_are_noops() {
-    use crate::memory::chunks::with_connection;
-
+fn empty_entity_batches_are_noops() {
     let (_tmp, cfg) = test_config();
-    with_connection(&cfg, |conn| {
-        let tx = conn.unchecked_transaction()?;
-        assert_eq!(index_entities_tx(&tx, &[], "node", "leaf", 0, None)?, 0);
-        assert_eq!(
-            index_summary_entity_ids_tx(&tx, &[], "node", 0.0, 0, None)?,
-            0
-        );
-        tx.commit()?;
-        Ok(())
-    })
-    .unwrap();
     assert_eq!(
         index_entities(&cfg, &[], "node", "leaf", 0, None).unwrap(),
+        0
+    );
+    assert_eq!(
+        index_summary_entity_ids(&cfg, &[], "node", 0.0, 0, None).unwrap(),
         0
     );
 }
 
 #[test]
-fn score_batch_reads_across_sql_parameter_windows() {
+fn score_batch_reads_many_owner_records() {
     let (_tmp, cfg) = test_config();
-    let ids: Vec<String> = (0..=MAX_FETCH_BATCH)
-        .map(|index| format!("chunk-{index}"))
-        .collect();
+    let ids: Vec<String> = (0..300).map(|index| format!("chunk-{index}")).collect();
     for id in &ids {
         upsert_score(&cfg, &sample_row(id, false)).unwrap();
     }
 
     let scores = get_scores_batch(&cfg, &ids).unwrap();
 
-    assert_eq!(scores.len(), MAX_FETCH_BATCH + 1);
+    assert_eq!(scores.len(), ids.len());
     assert!(ids.iter().all(|id| scores.contains_key(id)));
 }
 
 #[test]
 fn summary_entity_without_colon_uses_whole_id_as_kind_and_surfaces_parse_error() {
-    use crate::memory::chunks::with_connection;
-
     let (_tmp, cfg) = test_config();
-    with_connection(&cfg, |conn| {
-        let tx = conn.unchecked_transaction()?;
-        index_summary_entity_ids_tx(&tx, &["unknown".into()], "summary", 1.0, 1, None)?;
-        tx.commit()?;
-        Ok(())
-    })
-    .unwrap();
+    index_summary_entity_ids(&cfg, &["unknown".into()], "summary", 1.0, 1, None).unwrap();
 
     assert!(lookup_entity(&cfg, "unknown", None).is_err());
 }
