@@ -367,6 +367,18 @@ async fn plain_upsert_keeps_default_lifecycle_implicit() {
         states[CHUNK_LIFECYCLE].is_empty(),
         "fresh plain upsert should not materialize one default lifecycle row per chunk"
     );
+    assert_eq!(
+        super::super::store::get_chunk_lifecycle_status(&config, &chunks[0].id).unwrap(),
+        Some(super::super::store::CHUNK_STATUS_ADMITTED.to_owned())
+    );
+    assert_eq!(
+        super::super::store::count_chunks_by_lifecycle_status(
+            &config,
+            super::super::store::CHUNK_STATUS_ADMITTED,
+        )
+        .unwrap(),
+        chunks.len() as u64
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
