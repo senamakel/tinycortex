@@ -51,6 +51,10 @@ struct OperationManifest {
     writes: Vec<ManifestWrite>,
     #[serde(default)]
     state_writes: Vec<StateManifestWrite>,
+    /// Lifecycle default for chunk versions in this operation. It is batch
+    /// metadata rather than one sidecar row per chunk.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    default_lifecycle_status: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -101,6 +105,7 @@ struct VisibleOperation {
     revision: u64,
     writes: HashSet<(String, String)>,
     state_writes: HashSet<(String, String, String)>,
+    default_lifecycle_status: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -200,7 +205,16 @@ pub(crate) async fn upsert_chunks_async(config: &MemoryConfig, chunks: &[Chunk])
         let snapshot = capture_head_async(config).await?;
         let changes =
             prepare_chunk_upsert_state_changes_async(config, &snapshot, chunks, &[]).await?;
-        match upsert_chunks_at_async(config, &snapshot, chunks, chunks, &changes).await {
+        match upsert_chunks_at_async(
+            config,
+            &snapshot,
+            chunks,
+            chunks,
+            &changes,
+            Some(super::store::CHUNK_STATUS_ADMITTED),
+        )
+        .await
+        {
             Ok(_) => return Ok(chunks.len()),
             Err(error) if is_storage_conflict(&error) => continue,
             Err(error) => return Err(error),
@@ -354,10 +368,24 @@ fn commit_operation(
         let snapshot = capture_head(config)?;
         let effective_changes =
             prepare_chunk_upsert_state_changes(config, &snapshot, &final_chunks, &final_changes)?;
-        if is_current_commit_retry(config, &snapshot, &final_chunks, &effective_changes)? {
+        let default_lifecycle_status = Some(super::store::CHUNK_STATUS_ADMITTED);
+        if is_current_commit_retry(
+            config,
+            &snapshot,
+            &final_chunks,
+            &effective_changes,
+            default_lifecycle_status,
+        )? {
             return Ok(chunks.len());
         }
-        match upsert_chunks_at(config, &snapshot, chunks, &final_chunks, &effective_changes) {
+        match upsert_chunks_at(
+            config,
+            &snapshot,
+            chunks,
+            &final_chunks,
+            &effective_changes,
+            default_lifecycle_status,
+        ) {
             Ok(count) => return Ok(count),
             Err(error) if is_storage_conflict(&error) => last_conflict = Some(error),
             Err(error) => return Err(error),
