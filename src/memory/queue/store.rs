@@ -1175,7 +1175,7 @@ pub(crate) async fn commit_claimed_async(
 }
 
 /// Remove legacy retired-kind records with a conditional owner-head commit.
-/// Ready-hint repair is handled separately by [`repair_pending_hints`].
+/// Ready-hint repair is handled separately by `repair_pending_hints`.
 /// Returns the number of retired rows removed.
 pub fn purge_retired_jobs(config: &MemoryConfig) -> Result<usize> {
     for _ in 0..PUBLISH_RETRIES {
