@@ -212,6 +212,20 @@ pub async fn import_legacy_batch(
             .into_iter()
             .map(|(collection, rows)| (collection, rows.into_iter().collect::<HashMap<_, _>>()))
             .collect::<HashMap<_, _>>();
+        for record in &batch.chunks {
+            if let Some(value) = state_map
+                .get(c::CHUNK_CONTENT_POINTERS)
+                .and_then(|rows| rows.get(&record.chunk.id))
+            {
+                let pointer: ExistingContentPointer = serde_json::from_value(value.clone())
+                    .context("decode existing imported chunk content pointer")?;
+                anyhow::ensure!(pointer.chunk_id == record.chunk.id);
+                anyhow::ensure!(
+                    safe_relative_path(&pointer.content_path) && is_sha256(&pointer.content_sha256),
+                    "existing imported chunk content pointer has an unsafe path or invalid SHA-256"
+                );
+            }
+        }
         let mut chunks_to_write = Vec::new();
         let mut expected = Vec::new();
         let mut changes = Vec::new();
@@ -441,23 +455,6 @@ pub async fn import_legacy_batch(
                     key,
                     value,
                 });
-            }
-        }
-
-        // Existing content pointers are decoded too, so malformed rows cannot
-        // be accepted as successful idempotent retries.
-        for record in &batch.chunks {
-            if let Some(value) = state_map
-                .get(c::CHUNK_CONTENT_POINTERS)
-                .and_then(|rows| rows.get(&record.chunk.id))
-            {
-                let pointer: ExistingContentPointer = serde_json::from_value(value.clone())
-                    .context("decode existing imported chunk content pointer")?;
-                anyhow::ensure!(pointer.chunk_id == record.chunk.id);
-                anyhow::ensure!(
-                    safe_relative_path(&pointer.content_path) && is_sha256(&pointer.content_sha256),
-                    "existing imported chunk content pointer has an unsafe path or invalid SHA-256"
-                );
             }
         }
 

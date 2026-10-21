@@ -124,7 +124,9 @@ fn delete_chunk_by_id_takes_one_chunk_and_leaves_the_source() {
 fn deleting_a_chunk_tombstones_lifecycle_and_removes_versioned_sidecars() {
     let (_tmp, cfg) = test_config();
     let chunk = chunk_with("delete-sidecars", 0, 3_000, "sidecar body");
-    upsert_chunks(&cfg, std::slice::from_ref(&chunk)).unwrap();
+    upsert_chunks_async(&cfg, std::slice::from_ref(&chunk))
+        .await
+        .unwrap();
     let signature = "delete-sidecars-model";
     super::set_chunk_embedding_for_signature(&cfg, &chunk.id, signature, &[0.1, 0.2]).unwrap();
     super::set_chunk_raw_refs(
@@ -323,7 +325,9 @@ async fn purge_all_leaves_host_audit_collection_alone() {
 
     let (_tmp, cfg) = test_config();
     let chunk = chunk_with("slack:#eng", 0, 1_000, "body");
-    upsert_chunks(&cfg, std::slice::from_ref(&chunk)).unwrap();
+    upsert_chunks_async(&cfg, std::slice::from_ref(&chunk))
+        .await
+        .unwrap();
     let docs = cfg.storage().unwrap().documents();
     docs.ensure_collection(&CollectionSpec::new("host_audit"))
         .await
