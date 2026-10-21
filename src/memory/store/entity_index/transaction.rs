@@ -130,15 +130,6 @@ pub(crate) async fn stage_delete_node_entities_async(
     stage_node_occurrences_from(entries, node_id, [], true)
 }
 
-/// Synchronous counterpart to [`stage_delete_node_entities_async`].
-pub(crate) fn stage_delete_node_entities(
-    config: &MemoryConfig,
-    node_id: &str,
-) -> Result<StagedEntityChanges> {
-    let entries = versioned::list_state(config, ENTITY_INDEX)?;
-    stage_node_occurrences_from(entries, node_id, [], true)
-}
-
 /// Stage deletion of every node occurrence owned by one tree. Aggregate
 /// co-occurrence edge history is intentionally retained: the legacy delete
 /// path removed occurrence rows but did not remove/decrement aggregate edges,

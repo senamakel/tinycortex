@@ -1,6 +1,6 @@
 use super::*;
 use crate::memory::chunks::test_support::host_config;
-use crate::memory::chunks::{upsert_chunks, upsert_chunks_async, Chunk, Metadata, SourceKind};
+use crate::memory::chunks::{upsert_chunks_async, Chunk, Metadata, SourceKind};
 use crate::memory::config::MemoryConfig;
 use chrono::{TimeZone, Utc};
 use tempfile::TempDir;
