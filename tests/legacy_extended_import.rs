@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Row};
+use sha2::{Digest, Sha256};
 use tinycortex::memory::{
     chunks::{
         self, Chunk, LegacyChunkRecord, LegacyContentPointer, LegacyEmbedding, LegacyEntityEdge,
@@ -20,7 +21,7 @@ use tinycortex::memory::{
     tree::{self, SummaryNode, Tree, TreeKind, TreeStatus},
 };
 
-const FIXTURE: &str = "fixtures/legacy-v0.1.3-extended-public-writer/memory_tree";
+const FIXTURE: &str = "tests/fixtures/legacy-v0.1.3-extended-public-writer/memory_tree";
 
 /// Import an authentic v0.1.3 database through the typed owner API and verify
 /// every populated record family through the current public readers.
@@ -105,10 +106,13 @@ async fn extended_v013_public_writer_batch_imports_and_reads_back() -> Result<()
         .iter()
         .find(|pointer| pointer.summary_id == source_summary.id)
         .context("summary content pointer missing")?;
+    let summary_body = read_summary_body(&config, &source_summary.id)?;
     assert_eq!(
         chunks::get_summary_content_pointers(&config, &source_summary.id)?,
         Some((summary_pointer.path.clone(), summary_pointer.sha256.clone()))
     );
+    assert_eq!(summary_body, source_summary.content);
+    assert_eq!(sha256_hex(summary_body.as_bytes()), summary_pointer.sha256);
 
     let node_entities = score::store::list_entity_ids_for_node(&config, &source_summary.id)?;
     let mut expected_entities = batch
@@ -138,6 +142,9 @@ async fn extended_v013_public_writer_batch_imports_and_reads_back() -> Result<()
     }
 
     let edge = &batch.edges[0];
+    // The public graph reader exposes adjacency and accumulated weight; the
+    // imported updated-at timestamp is retained in owner state but is not
+    // exposed by this read API.
     assert!(graph::edge_neighbors(&config, &edge.entity_a)?
         .contains(&(edge.entity_b.clone(), edge.weight)));
     assert_eq!(graph::count_edges(&config)?, 1);
@@ -152,6 +159,9 @@ async fn extended_v013_public_writer_batch_imports_and_reads_back() -> Result<()
     assert_eq!(actual_job.max_attempts, source_job.max_attempts);
     assert_eq!(actual_job.created_at_ms, source_job.created_at_ms);
     assert_eq!(actual_job.available_at_ms, source_job.available_at_ms);
+    assert_eq!(queue::count_total(&config)?, 1);
+    chunks::import_legacy_batch(&config, &batch).await?;
+    assert_eq!(queue::count_total(&config)?, 1);
 
     Ok(())
 }
@@ -479,6 +489,13 @@ fn decode_f32(bytes: Vec<u8>) -> Result<Vec<f32>> {
         .chunks_exact(4)
         .map(|part| f32::from_le_bytes([part[0], part[1], part[2], part[3]]))
         .collect())
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 fn to_sql_error(error: impl std::fmt::Display) -> rusqlite::Error {
