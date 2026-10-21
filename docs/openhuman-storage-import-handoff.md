@@ -31,3 +31,10 @@ The tagged writer's schema and migration behavior are separate from any
 hand-authored historical schema-transform cases. This repository currently
 checks in no `tinymemory_documents` fixture, so no such transform coverage is
 claimed here.
+
+The former SQLite startup migration `purge_global_topic_trees` selectively
+removed legacy global/topic tree rows and dependent jobs. That migration is
+retired with the SQLite layer; `purge_all` is a runtime full-store operation
+and is not equivalent. The host compatibility reader owns any required
+selective handling of those legacy rows. Unknown legacy job kinds must remain
+fail-closed rather than being interpreted as live work.

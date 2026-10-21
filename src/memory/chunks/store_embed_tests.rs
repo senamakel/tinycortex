@@ -379,7 +379,8 @@ fn batch_embedding_lookup_splits_id_list_above_per_batch_threshold() {
 }
 
 // `purge_global_topic_trees` was a one-time SQLite startup migration. The
-// SQLite migration layer is retired; runtime cleanup is covered by `purge_all`.
+// SQLite migration layer is retired; its selective legacy cleanup has no
+// equivalent in the owner store and is called out in the host import handoff.
 
 #[test]
 fn extraction_coverage_empty_store_is_zero() {
