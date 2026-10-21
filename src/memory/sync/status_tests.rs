@@ -1,7 +1,10 @@
 use chrono::{TimeZone, Utc};
 
 use super::*;
-use crate::memory::chunks::{upsert_chunks, Chunk, Metadata, SourceKind};
+use crate::memory::chunks::{
+    set_chunk_embedding_for_signature, set_chunk_lifecycle_status, upsert_chunks, Chunk, Metadata,
+    SourceKind,
+};
 
 fn chunk(id: &str, source_id: &str, created_ms: i64) -> Chunk {
     let timestamp = Utc.timestamp_millis_opt(created_ms).unwrap();
@@ -39,14 +42,8 @@ fn status_groups_provider_and_tracks_active_wave_resolution() {
         ],
     )
     .unwrap();
-    with_connection(&config, |connection| {
-        connection.execute(
-            "INSERT INTO mem_tree_chunk_embeddings (chunk_id, model_signature, vector, dim, created_at) VALUES ('a', 'test', X'00', 1, 0)",
-            [],
-        )?;
-        connection.execute("UPDATE mem_tree_chunks SET lifecycle_status = 'dropped' WHERE id = 'c'", [])?;
-        Ok(())
-    }).unwrap();
+    set_chunk_embedding_for_signature(&config, "a", "test", &[0.0]).unwrap();
+    set_chunk_lifecycle_status(&config, "c", "dropped").unwrap();
 
     let statuses = list_sync_statuses_at(&config, now).unwrap();
     let gmail = statuses
