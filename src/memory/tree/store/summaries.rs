@@ -423,15 +423,15 @@ pub fn get_summary_embedding_for_signature(
         })
         .collect();
     let values = crate::memory::chunks::versioned::read_state_keys(config, &keys)?;
-    for value in values.into_iter().flatten() {
-        let record: SummaryEmbeddingRecord = serde_json::from_value(value)?;
-        anyhow::ensure!(
-            record.dim == record.vector.len(),
-            "summary embedding dimension mismatch"
-        );
-        return Ok(Some(record.vector));
-    }
-    Ok(None)
+    let Some(value) = values.into_iter().flatten().next() else {
+        return Ok(None);
+    };
+    let record: SummaryEmbeddingRecord = serde_json::from_value(value)?;
+    anyhow::ensure!(
+        record.dim == record.vector.len(),
+        "summary embedding dimension mismatch"
+    );
+    Ok(Some(record.vector))
 }
 
 /// Async counterpart to [`get_summary_embedding_for_signature`].
@@ -448,15 +448,15 @@ pub async fn get_summary_embedding_for_signature_async(
         })
         .collect();
     let values = crate::memory::chunks::versioned::read_state_keys_async(config, &keys).await?;
-    for value in values.into_iter().flatten() {
-        let record: SummaryEmbeddingRecord = serde_json::from_value(value)?;
-        anyhow::ensure!(
-            record.dim == record.vector.len(),
-            "summary embedding dimension mismatch"
-        );
-        return Ok(Some(record.vector));
-    }
-    Ok(None)
+    let Some(value) = values.into_iter().flatten().next() else {
+        return Ok(None);
+    };
+    let record: SummaryEmbeddingRecord = serde_json::from_value(value)?;
+    anyhow::ensure!(
+        record.dim == record.vector.len(),
+        "summary embedding dimension mismatch"
+    );
+    Ok(Some(record.vector))
 }
 
 /// Fetch a summary embedding under the active model signature.

@@ -110,7 +110,7 @@ fn list_sync_statuses_at(
             freshness: FreshnessLabel::from_age_ms(last_chunk_at_ms, now_ms),
         });
     }
-    statuses.sort_by(|left, right| right.last_chunk_at_ms.cmp(&left.last_chunk_at_ms));
+    statuses.sort_by_key(|status| std::cmp::Reverse(status.last_chunk_at_ms));
     Ok(statuses)
 }
 
