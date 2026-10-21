@@ -53,7 +53,12 @@ pub(crate) struct TreeInsertConflict {
 
 impl fmt::Display for TreeInsertConflict {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "tree insert conflict for kind={} scope={}", self.kind.as_str(), self.scope)
+        write!(
+            f,
+            "tree insert conflict for kind={} scope={}",
+            self.kind.as_str(),
+            self.scope
+        )
     }
 }
 
