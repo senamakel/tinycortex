@@ -5,11 +5,12 @@
 use super::types::{chunk_id, Chunk, Metadata, SourceKind, SourceRef, StagedChunk};
 use super::{
     count_chunks_matching, list_chunk_details, list_chunks, set_chunk_embedding_for_signature,
-    set_chunk_lifecycle_status, source_totals, upsert_chunks, upsert_staged_chunks, ListChunksQuery,
+    set_chunk_lifecycle_status, source_totals, upsert_chunks, upsert_staged_chunks,
+    ListChunksQuery,
 };
-use crate::memory::config::MemoryConfig;
 use crate::memory::chunks::collections::CHUNK_LIFECYCLE;
 use crate::memory::chunks::versioned::{self, StateChange};
+use crate::memory::config::MemoryConfig;
 use crate::memory::store::entity_index::{CanonicalEntity, EntityIndex, EntityKind};
 use chrono::{TimeZone, Utc};
 use std::collections::HashSet;
@@ -312,8 +313,7 @@ fn chunk_details_report_stored_facts_without_reading_the_vault() {
     .unwrap();
     upsert_chunks(&cfg, std::slice::from_ref(&inline)).unwrap();
     set_chunk_lifecycle_status(&cfg, &staged.id, "sealed").unwrap();
-    set_chunk_embedding_for_signature(&cfg, &staged.id, "test/model@3", &[1.0, 2.0, 3.0])
-        .unwrap();
+    set_chunk_embedding_for_signature(&cfg, &staged.id, "test/model@3", &[1.0, 2.0, 3.0]).unwrap();
 
     let details = list_chunk_details(&cfg, &ListChunksQuery::default()).unwrap();
     assert_eq!(details.len(), 2);
@@ -397,7 +397,10 @@ fn exclude_dropped_keeps_a_row_whose_lifecycle_was_never_written() {
         .into_iter()
         .map(|chunk| chunk.id)
         .collect();
-    assert!(ids.contains(&bypassed.id), "missing lifecycle is not dropped");
+    assert!(
+        ids.contains(&bypassed.id),
+        "missing lifecycle is not dropped"
+    );
     assert_eq!(
         count_chunks_matching(&cfg, &query).expect("count"),
         ids.len() as u64,

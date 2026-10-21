@@ -304,52 +304,44 @@ fn delete_chunks_by_source_removes_chunks_side_rows_and_ingest_gate() {
     let other = sample_chunk("slack:c-2", 0, 1_700_000_002_000);
     upsert_chunks(&cfg, &[target_a.clone(), target_b.clone(), other.clone()]).unwrap();
 
-    with_connection(&cfg, |conn| {
-        let tx = conn.unchecked_transaction()?;
-        for chunk in [&target_a, &target_b, &other] {
-            tx.execute(
-                "INSERT INTO mem_tree_score (
-                    chunk_id, total, token_count_signal, unique_words_signal,
-                    metadata_weight, source_weight, interaction_weight,
-                    entity_density, dropped, reason, computed_at_ms
-                ) VALUES (?1, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0, NULL, 1700000000000)",
-                params![chunk.id],
-            )?;
-            tx.execute(
-                "INSERT INTO mem_tree_entity_index (
-                    entity_id, node_id, node_kind, entity_kind, surface, score, timestamp_ms
-                ) VALUES (?1, ?2, 'chunk', 'person', 'chat', 0.9, 1700000000000)",
-                params![format!("entity:{}", chunk.id), chunk.id],
-            )?;
-            tx.execute(
-                "INSERT INTO mem_tree_chunk_embeddings (
-                    chunk_id, model_signature, vector, dim, created_at
-                ) VALUES (?1, 'test/model@3', ?2, 3, 1700000000.0)",
-                params![chunk.id, vec![1_u8, 2, 3]],
-            )?;
-            tx.execute(
-                "INSERT INTO mem_tree_chunk_reembed_skipped (
-                    chunk_id, model_signature, reason, skipped_at_ms
-                ) VALUES (?1, 'test/model@3', 'terminal', 1700000000000)",
-                params![chunk.id],
-            )?;
-        }
-        assert!(claim_source_ingest_tx(
-            &tx,
-            SourceKind::Chat,
-            "slack:c-1",
-            1_700_000_000_000
-        )?);
-        assert!(claim_source_ingest_tx(
-            &tx,
-            SourceKind::Chat,
-            "slack:c-2",
-            1_700_000_000_000
-        )?);
-        tx.commit()?;
-        Ok(())
-    })
-    .unwrap();
+    let entity_index = crate::memory::store::entity_index::EntityIndex::for_memory_config(&cfg)
+        .unwrap();
+    for chunk in [&target_a, &target_b, &other] {
+        crate::memory::score::store::upsert_score(
+            &cfg,
+            &crate::memory::score::store::ScoreRow {
+                chunk_id: chunk.id.clone(),
+                total: 1.0,
+                signals: Default::default(),
+                dropped: false,
+                reason: None,
+                computed_at_ms: 1_700_000_000_000,
+                llm_importance_reason: None,
+            },
+        )
+        .unwrap();
+        let entity = crate::memory::store::entity_index::types::CanonicalEntity {
+            canonical_id: format!("chunk:{}", chunk.id),
+            kind: crate::memory::store::entity_index::types::EntityKind::Person,
+            surface: "chat".into(),
+            span_start: 0,
+            span_end: 4,
+            score: 0.9,
+        };
+        entity_index
+            .index_entity(&entity, &chunk.id, "chunk", 1_700_000_000_000, None)
+            .unwrap();
+        super::set_chunk_embedding_for_signature(&cfg, &chunk.id, "test/model@3", &[1.0, 2.0, 3.0])
+            .unwrap();
+        super::mark_chunk_reembed_skipped(&cfg, &chunk.id, "test/model@3", "terminal", 1_700_000_000_000)
+            .unwrap();
+    }
+    assert!(crate::memory::chunks::store_sources::claim_source_ingest(
+        &cfg, SourceKind::Chat, "slack:c-1", 1_700_000_000_000,
+    ).unwrap());
+    assert!(crate::memory::chunks::store_sources::claim_source_ingest(
+        &cfg, SourceKind::Chat, "slack:c-2", 1_700_000_000_000,
+    ).unwrap());
 
     let deleted = delete_chunks_by_source(&cfg, SourceKind::Chat, "slack:c-1").unwrap();
 
@@ -361,17 +353,12 @@ fn delete_chunks_by_source_removes_chunks_side_rows_and_ingest_gate() {
     assert!(!is_source_ingested(&cfg, SourceKind::Chat, "slack:c-1").unwrap());
     assert!(is_source_ingested(&cfg, SourceKind::Chat, "slack:c-2").unwrap());
 
-    with_connection(&cfg, |conn| {
-        let count_by_table = |table: &str| -> rusqlite::Result<i64> {
-            conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
-        };
-        assert_eq!(count_by_table("mem_tree_score")?, 1);
-        assert_eq!(count_by_table("mem_tree_entity_index")?, 1);
-        assert_eq!(count_by_table("mem_tree_chunk_embeddings")?, 1);
-        assert_eq!(count_by_table("mem_tree_chunk_reembed_skipped")?, 1);
-        Ok(())
-    })
-    .unwrap();
+    assert_eq!(crate::memory::score::store_query::count_scores(&cfg).unwrap(), 1);
+    assert_eq!(crate::memory::score::store_query::count_entity_index(&cfg).unwrap(), 1);
+    assert_eq!(crate::memory::chunks::get_chunk_embedding_for_signature(&cfg, &other.id, "test/model@3").unwrap(), Some(vec![1.0, 2.0, 3.0]));
+    assert!(crate::memory::chunks::get_chunk_embedding_for_signature(&cfg, &target_a.id, "test/model@3").unwrap().is_none());
+    assert!(crate::memory::chunks::is_chunk_reembed_skipped(&cfg, &other.id, "test/model@3").unwrap());
+    assert!(!crate::memory::chunks::is_chunk_reembed_skipped(&cfg, &target_a.id, "test/model@3").unwrap());
 }
 
 #[test]

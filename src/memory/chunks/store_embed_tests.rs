@@ -24,14 +24,13 @@ use super::{
     tree_active_signature, upsert_chunks, ListChunksQuery, DB_DIR,
     GLOBAL_TOPIC_PURGE_MIGRATION_VERSION,
 };
-use crate::memory::config::MemoryConfig;
 use crate::memory::chunks::collections::{CHUNK_REEMBED_SKIPS, SUMMARY_REEMBED_SKIPS};
 use crate::memory::chunks::versioned;
+use crate::memory::config::MemoryConfig;
 use crate::memory::store::content::read::{
     LEGACY_EMPTY_CHUNK_CONTENT_REASON_PREFIX, LEGACY_EMPTY_CONTENT_POINTER_REASON_PREFIX,
     LEGACY_NO_CONTENT_POINTER_REASON_PREFIX,
 };
-use crate::memory::tree::store::{Tree, TreeKind, TreeStatus};
 use chrono::{TimeZone, Utc};
 use rusqlite::params;
 use std::sync::Arc;
@@ -144,9 +143,13 @@ fn clear_reembed_skipped_for_signature_removes_all_tombstones_for_sig() {
     assert_eq!(deleted, 3);
 
     let remaining_chunks = versioned::list_state(&cfg, CHUNK_REEMBED_SKIPS).unwrap();
-    assert!(!remaining_chunks.iter().any(|(_, value)| value["model_signature"] == sig));
+    assert!(!remaining_chunks
+        .iter()
+        .any(|(_, value)| value["model_signature"] == sig));
     let remaining_summaries = versioned::list_state(&cfg, SUMMARY_REEMBED_SKIPS).unwrap();
-    assert!(!remaining_summaries.iter().any(|(_, value)| value["model_signature"] == sig));
+    assert!(!remaining_summaries
+        .iter()
+        .any(|(_, value)| value["model_signature"] == sig));
     assert_eq!(
         remaining_chunks
             .iter()
