@@ -96,6 +96,10 @@ fn test_config() -> (TempDir, MemoryConfig) {
     (tmp, cfg)
 }
 
+fn on_plain_thread<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -> T {
+    std::thread::spawn(work).join().expect("sync storage assertion thread")
+}
+
 fn substantive_batch() -> ChatBatch {
     ChatBatch {
         platform: "slack".into(),
@@ -139,9 +143,12 @@ async fn ingest_chat_writes_chunks_and_enqueues_extract_jobs() {
 
     assert!(!out.already_ingested);
     assert!(out.chunks_written >= 1);
-    assert_eq!(count_chunks(&cfg).unwrap(), out.chunks_written as u64);
+    let read_cfg = cfg.clone();
+    assert_eq!(on_plain_thread(move || count_chunks(&read_cfg)).unwrap(), out.chunks_written as u64);
     assert_eq!(out.chunk_ids.len(), out.chunks_written);
-    let pointers = get_chunk_content_pointers(&cfg, &out.chunk_ids[0])
+    let read_cfg = cfg.clone();
+    let chunk_id = out.chunk_ids[0].clone();
+    let pointers = on_plain_thread(move || get_chunk_content_pointers(&read_cfg, &chunk_id))
         .unwrap()
         .unwrap();
     assert!(!pointers.0.is_empty());
@@ -150,8 +157,10 @@ async fn ingest_chat_writes_chunks_and_enqueues_extract_jobs() {
     // Every scheduled chunk got an extract job and is parked at pending.
     assert_eq!(out.extract_jobs_enqueued, out.chunk_ids.len());
     assert_eq!(sink.ids.lock().unwrap().len(), out.extract_jobs_enqueued);
+    let read_cfg = cfg.clone();
+    let chunk_id = out.chunk_ids[0].clone();
     assert_eq!(
-        get_chunk_lifecycle_status(&cfg, &out.chunk_ids[0]).unwrap(),
+        on_plain_thread(move || get_chunk_lifecycle_status(&read_cfg, &chunk_id)).unwrap(),
         Some(CHUNK_STATUS_PENDING_EXTRACTION.to_string())
     );
 }
@@ -177,8 +186,9 @@ async fn queue_sink_commits_chunk_lifecycle_and_extract_job_together() {
         out.extract_jobs_enqueued as u64
     );
     for chunk_id in out.chunk_ids {
+        let read_cfg = cfg.clone();
         assert_eq!(
-            get_chunk_lifecycle_status(&cfg, &chunk_id)
+            on_plain_thread(move || get_chunk_lifecycle_status(&read_cfg, &chunk_id))
                 .unwrap()
                 .as_deref(),
             Some(CHUNK_STATUS_PENDING_EXTRACTION)
@@ -201,7 +211,8 @@ async fn ingest_chat_empty_batch_is_noop() {
         .unwrap();
     assert_eq!(out.chunks_written, 0);
     assert_eq!(out.extract_jobs_enqueued, 0);
-    assert_eq!(count_chunks(&cfg).unwrap(), 0);
+    let read_cfg = cfg.clone();
+    assert_eq!(on_plain_thread(move || count_chunks(&read_cfg)).unwrap(), 0);
 }
 
 #[tokio::test]
@@ -258,7 +269,8 @@ async fn second_document_ingest_with_same_source_id_is_short_circuited() {
     assert_eq!(second.chunks_written, 0);
     assert!(second.chunk_ids.is_empty());
 
-    assert_eq!(count_chunks(&cfg).unwrap(), first.chunks_written as u64);
+    let read_cfg = cfg.clone();
+    assert_eq!(on_plain_thread(move || count_chunks(&read_cfg)).unwrap(), first.chunks_written as u64);
     let staged_files_after = walkdir::WalkDir::new(crate::memory::chunks::content_root(&cfg))
         .into_iter()
         .filter_map(Result::ok)
@@ -299,8 +311,12 @@ async fn failed_queue_hint_publication_keeps_committed_intent_recoverable() {
     )
     .await;
     assert!(err.is_err(), "forced enqueue failure should surface as Err");
-    assert!(is_source_ingested(&cfg, SourceKind::Document, "notion:abc").unwrap());
-    let persisted_chunks = count_chunks(&cfg).unwrap() as usize;
+    let read_cfg = cfg.clone();
+    assert!(on_plain_thread(move || is_source_ingested(&read_cfg, SourceKind::Document, "notion:abc"))
+        .unwrap()
+        .unwrap());
+    let read_cfg = cfg.clone();
+    let persisted_chunks = on_plain_thread(move || count_chunks(&read_cfg)).unwrap().unwrap() as usize;
     assert!(persisted_chunks > 0, "the committed source has chunks");
     assert_eq!(
         super::dispatch_pending_extract_jobs_async(&cfg, &NullJobSink)
@@ -350,7 +366,10 @@ async fn failed_queue_hint_publication_keeps_committed_intent_recoverable() {
         "the source gate committed with the recoverable job intent",
     );
     assert_eq!(sink.ids.lock().unwrap().len(), persisted_chunks);
-    assert!(is_source_ingested(&cfg, SourceKind::Document, "notion:abc").unwrap());
+    let read_cfg = cfg.clone();
+    assert!(on_plain_thread(move || is_source_ingested(&read_cfg, SourceKind::Document, "notion:abc"))
+        .unwrap()
+        .unwrap());
 }
 
 #[tokio::test]
@@ -399,8 +418,16 @@ async fn ingest_head_failure_does_not_publish_or_expose_its_outbox_intent() {
     .await
     .is_err());
     assert!(sink.ids.lock().unwrap().is_empty());
-    assert_eq!(count_chunks(&cfg).unwrap(), 0);
-    assert!(!is_source_ingested(&cfg, SourceKind::Document, "notion:uncommitted").unwrap());
+    let read_cfg = cfg.clone();
+    assert_eq!(on_plain_thread(move || count_chunks(&read_cfg)).unwrap(), 0);
+    let read_cfg = cfg.clone();
+    assert!(!on_plain_thread(move || is_source_ingested(
+        &read_cfg,
+        SourceKind::Document,
+        "notion:uncommitted",
+    ))
+    .unwrap()
+    .unwrap());
 }
 
 #[tokio::test]
@@ -608,7 +635,11 @@ async fn ingest_email_with_raw_refs_attaches_archive_refs_to_every_chunk() {
     assert!(out.chunks_written >= 1);
     assert_eq!(out.extract_jobs_enqueued, out.chunk_ids.len());
     for chunk_id in &out.chunk_ids {
-        let stored = get_chunk_raw_refs(&cfg, chunk_id).unwrap().unwrap();
+        let read_cfg = cfg.clone();
+        let read_id = chunk_id.clone();
+        let stored = on_plain_thread(move || get_chunk_raw_refs(&read_cfg, &read_id))
+            .unwrap()
+            .unwrap();
         assert_eq!(stored.len(), raw_refs.len());
         assert_eq!(stored[0].path, raw_refs[0].path);
         assert_eq!(stored[1].start, raw_refs[1].start);
