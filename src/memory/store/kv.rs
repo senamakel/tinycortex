@@ -659,10 +659,10 @@ impl KvStore {
                     .map_err(|error| format!("decode listed KV entry: {error}"))?;
                 let namespace = entry
                     .namespace
-                    .as_deref()
+                    .clone()
                     .ok_or_else(|| format!("namespace missing for KV key '{}'", entry.key))?;
                 let expected_key =
-                    Self::storage_key(EntryKind::Namespace, Some(namespace), &entry.key);
+                    Self::storage_key(EntryKind::Namespace, Some(&namespace), &entry.key);
                 if row.id != expected_key || entry.kind != EntryKind::Namespace {
                     return Err(format!(
                         "KV identity mismatch while listing key '{}'",
@@ -670,7 +670,7 @@ impl KvStore {
                     ));
                 }
                 if namespace.starts_with(prefix) {
-                    records.push(record(entry, Some(namespace)));
+                    records.push(record(entry, Some(&namespace)));
                 }
             }
             cursor = page.next;
