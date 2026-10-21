@@ -33,6 +33,7 @@
 //!   layer (OpenHuman tied directly into `core::event_bus::DomainEvent`).
 
 mod bus;
+pub mod collections;
 mod inverted_index;
 mod store;
 mod tokenize;
@@ -42,6 +43,7 @@ pub use bus::{
     register_conversation_persistence_subscriber, ChannelEvent, ChannelEventHandler,
     ConversationEventBus, ConversationPersistenceSubscriber,
 };
+pub use collections::collections;
 pub use store::{
     append_message, delete_messages_from, delete_thread, ensure_thread, get_messages, list_threads,
     purge_threads, update_message, update_thread_labels, update_thread_title,
