@@ -223,11 +223,9 @@ impl KvStore {
     async fn import_entry(&self, entry: Entry) -> Result<(), String> {
         let storage_key = Self::storage_key(entry.kind, entry.namespace.as_deref(), &entry.key);
         for _ in 0..WRITE_RETRIES {
-            let current = self
-                .port
-                .get(&storage_key)
-                .await
-                .map_err(|error| format!("read before importing KV key '{}': {error}", entry.key))?;
+            let current = self.port.get(&storage_key).await.map_err(|error| {
+                format!("read before importing KV key '{}': {error}", entry.key)
+            })?;
             if let Some(current) = current {
                 let current = Self::checked_entry(
                     current,
@@ -322,24 +320,21 @@ impl KvStore {
             for record in page.items {
                 let entry: Entry = serde_json::from_value(record.doc)
                     .map_err(|error| format!("decode listed KV entry: {error}"))?;
-                let belongs = match (entry.kind, namespace) {
-                    (EntryKind::Global, None) => true,
-                    (EntryKind::Namespace, Some(expected)) => {
-                        entry.namespace.as_deref() == Some(expected)
-                    }
-                    _ => false,
+                let (expected_kind, expected_namespace) = match namespace {
+                    Some(namespace) => (EntryKind::Namespace, Some(namespace)),
+                    None => (EntryKind::Global, None),
                 };
-                if belongs {
-                    let expected_key =
-                        Self::storage_key(entry.kind, entry.namespace.as_deref(), &entry.key);
-                    if record.id != expected_key {
-                        return Err(format!(
-                            "KV identity mismatch while listing key '{}'",
-                            entry.key
-                        ));
-                    }
-                    entries.push(entry);
+                let expected_key = Self::storage_key(expected_kind, expected_namespace, &entry.key);
+                if record.id != expected_key
+                    || entry.kind != expected_kind
+                    || entry.namespace.as_deref() != expected_namespace
+                {
+                    return Err(format!(
+                        "KV identity mismatch while listing key '{}'",
+                        entry.key
+                    ));
                 }
+                entries.push(entry);
             }
             cursor = page.next;
             if cursor.is_none() {
@@ -424,10 +419,7 @@ impl KvStore {
     /// overwriting newer destination data. Reapplying a batch is safe; after
     /// a crash, the host can retry the same records. The source reader belongs
     /// to the host and is intentionally not part of this crate.
-    pub async fn import_legacy_records(
-        &self,
-        records: &[MemoryKvRecord],
-    ) -> Result<(), String> {
+    pub async fn import_legacy_records(&self, records: &[MemoryKvRecord]) -> Result<(), String> {
         let mut planned = std::collections::BTreeMap::<String, Entry>::new();
         for record in records {
             if !record.updated_at.is_finite() {

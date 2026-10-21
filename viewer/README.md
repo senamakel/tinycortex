@@ -38,6 +38,17 @@ TINYCORTEX_WORKSPACE=/tmp/tinycortex-demo npm run dev
 The viewer reads whatever is on disk each request, so re-running a sync and
 refreshing the page shows the new state.
 
+## Storage compatibility
+
+This viewer is a legacy local-workspace inspector. Its server-side readers open
+`memory_tree/skill_docs.db` and `memory_tree/chunks.db` directly and inspect
+entity markdown files; they do not connect to a host-provided TinyStorage
+bundle. The engine's current KV and memory records are host-owned, so this
+viewer does not display those stores unless a host exports a compatible local
+snapshot. Connecting it to the host's read API is tracked separately in
+OpenHuman issue #440. The SQLite files remain useful for inspecting legacy
+workspaces and migration fixtures.
+
 ## Environment
 
 - `TINYCORTEX_WORKSPACE` — path to the workspace to inspect (required).

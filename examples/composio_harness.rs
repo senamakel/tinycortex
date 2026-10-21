@@ -70,7 +70,6 @@ use std::sync::Mutex;
 
 use async_trait::async_trait;
 use serde_json::Value;
-use tinystoragedrivers_types::Scope;
 use tinycortex::memory::config::{ComposioMode, ComposioSyncConfig, MemoryConfig, SecretString};
 use tinycortex::memory::sync::{
     create_connection_link, get_connection_status, list_auth_configs, resolve_auth_config_id,
@@ -79,6 +78,7 @@ use tinycortex::memory::sync::{
     SkillDocSink, SkillDocument, SlackSyncPipeline, SyncContext, SyncEvent, SyncEventSink,
     SyncPipeline, SyncState, SyncStateStore,
 };
+use tinystoragedrivers_types::Scope;
 
 const DEFAULT_BASE_URL: &str = "https://backend.composio.dev/api/v3";
 const DEFAULT_MAX_ITEMS: u32 = 25;
@@ -734,8 +734,8 @@ async fn run() -> anyhow::Result<()> {
     let tmp = std::env::temp_dir().join("tinycortex-composio-harness");
     let scope = Scope::new(&format!("demo:composio-{}", uuid::Uuid::new_v4()))?;
     let storage = tinystoragedrivers_testkit::memory_storage(&scope);
-    let mut config = MemoryConfig::open_with_storage(tmp.to_string_lossy().into_owned(), storage)
-        .await?;
+    let mut config =
+        MemoryConfig::open_with_storage(tmp.to_string_lossy().into_owned(), storage).await?;
     config.sync.budget.max_items = Some(max_items);
 
     let captures = Arc::new(Captures::default());

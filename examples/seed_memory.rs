@@ -180,7 +180,6 @@ async fn seed_tree(
 }
 
 async fn seed_trees(cfg: &MemoryConfig) -> anyhow::Result<()> {
-
     let gmail: &[Message] = &[
         (
             "Kicking off Q3 planning — please send roadmap inputs by Friday.",

@@ -31,6 +31,40 @@ async fn global_and_namespace_values_roundtrip_without_identity_collisions() {
 }
 
 #[tokio::test]
+async fn global_and_namespace_get_delete_keep_scope_isolated() {
+    let config = config().await;
+    let kv = KvStore::from_config(&config).unwrap();
+    kv.set_global_async("shared", &json!("global"))
+        .await
+        .unwrap();
+    kv.set_namespace_async("scope", "shared", &json!("local"))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        kv.get_global_async("shared").await.unwrap(),
+        Some(json!("global"))
+    );
+    assert_eq!(
+        kv.get_namespace_async("scope", "shared").await.unwrap(),
+        Some(json!("local"))
+    );
+    assert!(kv.delete_namespace_async("scope", "shared").await.unwrap());
+    assert!(!kv.delete_namespace_async("scope", "shared").await.unwrap());
+    assert_eq!(
+        kv.get_namespace_async("scope", "shared").await.unwrap(),
+        None
+    );
+    assert_eq!(
+        kv.get_global_async("shared").await.unwrap(),
+        Some(json!("global"))
+    );
+    assert!(kv.delete_global_async("shared").await.unwrap());
+    assert!(!kv.delete_global_async("shared").await.unwrap());
+    assert_eq!(kv.get_global_async("shared").await.unwrap(), None);
+}
+
+#[tokio::test]
 async fn namespace_sanitization_and_scope_merge_preserve_precedence() {
     let config = config().await;
     let kv = KvStore::from_config(&config).unwrap();
@@ -96,7 +130,11 @@ async fn records_for_scope_keeps_namespace_records_ahead_of_global_ties() {
         .await
         .unwrap();
     let merged = kv.records_for_scope_async("scope").await.unwrap();
-    assert_eq!(merged.len(), 2, "namespace values shadow reads, not storage");
+    assert_eq!(
+        merged.len(),
+        2,
+        "namespace values shadow reads, not storage"
+    );
     assert_eq!(merged[0].namespace.as_deref(), Some("scope"));
     assert_eq!(merged[0].value, json!("local"));
     assert_eq!(merged[1].namespace, None);
@@ -127,6 +165,117 @@ async fn a_hashed_storage_key_with_wrong_body_identity_fails_closed() {
 }
 
 #[tokio::test]
+async fn global_corruption_fails_closed_for_every_read_shape() {
+    let config = config().await;
+    let kv = KvStore::from_config(&config).unwrap();
+    let key = "corrupt-global";
+    kv.port
+        .put(
+            &KvStore::storage_key(EntryKind::Global, None, key),
+            json!({"kind": "global", "namespace": null, "key": "other", "value": 1, "updated_at": 1.0}),
+        )
+        .await
+        .unwrap();
+
+    assert!(kv
+        .get_global_async(key)
+        .await
+        .unwrap_err()
+        .contains("identity mismatch"));
+    assert!(kv
+        .records_global_async()
+        .await
+        .unwrap_err()
+        .contains("identity mismatch"));
+    assert!(kv
+        .records_for_scope_async("scope")
+        .await
+        .unwrap_err()
+        .contains("identity mismatch"));
+}
+
+#[tokio::test]
+async fn namespace_corruption_fails_closed_for_every_read_shape() {
+    let config = config().await;
+    let kv = KvStore::from_config(&config).unwrap();
+    let namespace = "scope";
+    let key = "corrupt-namespace";
+    kv.port
+        .put(
+            &KvStore::storage_key(EntryKind::Namespace, Some(namespace), key),
+            serde_json::to_value(Entry {
+                kind: EntryKind::Namespace,
+                namespace: Some("different-scope".into()),
+                key: key.into(),
+                value: json!(1),
+                updated_at: 1.0,
+            })
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert!(kv
+        .get_namespace_async(namespace, key)
+        .await
+        .unwrap_err()
+        .contains("identity mismatch"));
+    assert!(kv
+        .list_namespace_async(namespace)
+        .await
+        .unwrap_err()
+        .contains("identity mismatch"));
+    assert!(kv
+        .records_namespace_async(namespace)
+        .await
+        .unwrap_err()
+        .contains("identity mismatch"));
+    assert!(kv
+        .records_for_scope_async(namespace)
+        .await
+        .unwrap_err()
+        .contains("identity mismatch"));
+}
+
+#[tokio::test]
+async fn pii_like_global_and_namespace_identities_keep_the_legacy_sanitization_policy() {
+    let config = config().await;
+    let kv = KvStore::from_config(&config).unwrap();
+    let private_id = "123-45-6789";
+    let sanitized_id = safety::pii::redact_pii(private_id).value;
+    assert_ne!(sanitized_id, private_id);
+
+    kv.set_global_async(&format!("global-{private_id}"), &json!("global"))
+        .await
+        .unwrap();
+    assert_eq!(
+        kv.get_global_async(&format!("global-{sanitized_id}"))
+            .await
+            .unwrap(),
+        Some(json!("global"))
+    );
+
+    kv.set_namespace_async(
+        &format!("team-{private_id}"),
+        &format!("key-{private_id}"),
+        &json!("namespace"),
+    )
+    .await
+    .unwrap();
+    let namespace = KvStore::normalize_namespace_write(&format!("team-{private_id}"));
+    let key = KvStore::normalized_namespace_key(&format!("key-{private_id}"));
+    assert_eq!(
+        kv.get_namespace_async(&namespace, &key).await.unwrap(),
+        Some(json!("namespace"))
+    );
+    assert!(kv
+        .set_namespace_async("safe", "sk-proj-abcdefghijklmnop", &json!(1))
+        .await
+        .unwrap_err()
+        .contains("cannot contain secrets"));
+}
+
+#[tokio::test]
 async fn imported_legacy_records_keep_values_namespaces_and_timestamps_on_retry() {
     let config = config().await;
     let kv = KvStore::from_config(&config).unwrap();
@@ -146,14 +295,20 @@ async fn imported_legacy_records_keep_values_namespaces_and_timestamps_on_retry(
     ];
     kv.import_legacy_records(&records).await.unwrap();
     kv.import_legacy_records(&records).await.unwrap();
-    assert_eq!(kv.records_global_async().await.unwrap()[0].updated_at, 1234.125);
+    assert_eq!(
+        kv.records_global_async().await.unwrap()[0].updated_at,
+        1234.125
+    );
     let imported = kv.records_namespace_async("team_alpha/_1").await.unwrap();
     assert_eq!(imported.len(), 1);
     assert_eq!(imported[0].namespace, records[1].namespace);
     assert_eq!(imported[0].key, records[1].key);
     assert_eq!(imported[0].value, records[1].value);
     assert_eq!(imported[0].updated_at, records[1].updated_at);
-    assert_eq!(kv.get_global_async("global-null").await.unwrap(), Some(Value::Null));
+    assert_eq!(
+        kv.get_global_async("global-null").await.unwrap(),
+        Some(Value::Null)
+    );
 }
 
 #[tokio::test]
