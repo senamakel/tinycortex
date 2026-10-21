@@ -1,0 +1,4 @@
+{
+  "persona-sync-state:transcript:/home/alice@example.test/.agent/sessions/run.jsonl": "cursor:opaque-value@example.test",
+  "persona-sync-state:git_history:/work/project": "0123456789abcdef"
+}

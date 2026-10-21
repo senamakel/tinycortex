@@ -18,7 +18,11 @@ call TinyCortex on demand.
 
 ## Source Registry
 
-Sources are persisted as `[[memory_sources]]` entries in `config.toml`.
+TinyCortex validates and mutates source entries through the host-provided
+`SourceConfigPort`. The host owns durable configuration and implements its
+revisioned compare-and-set while preserving unrelated settings. Importing the
+legacy `[[memory_sources]]` TOML entries is a one-time host migration; the
+TinyCortex registry does not read or write TOML files.
 
 Common fields:
 
@@ -53,9 +57,33 @@ Required CRUD:
 - `remove_source`
 - `upsert_composio_source`
 
-Mutations must load current config, modify, validate, and save atomically.
-OpenHuman lazily reconciles active Composio connections on list, so integrations
-connected before process boot become visible without restart.
+Mutations read the current host snapshot, modify and validate the entries, then
+compare-and-set the replacement against that snapshot revision. The host must
+compose connection lifecycle operations with registry mutations: after a
+successful Composio connect, upsert the source keyed by connected-account id;
+on disconnect or revocation, remove that account's source. When reconciling
+active accounts, use the same upsert/remove methods so pre-existing accounts
+become visible without a restart. `EntityStore` keeps the per-toolkit Composio
+entity id in host KV; production hosts should bind a durable storage scope.
+
+### Host adapter handoff
+
+The OpenHuman host adapter implements `SourceConfigPort` over its configuration
+owner. `read()` returns a revision tied to the exact `memory_sources` value;
+`compare_and_set()` replaces only that value when the revision still matches,
+preserving unrelated configuration and reporting conflicts without partial
+writes. The host performs the one-time import of existing TOML entries before
+exposing the port. It must not install an empty-source fallback when import or
+configuration access fails.
+
+Provider operations and config writes cannot share a transaction. After a
+successful connect, persist/reuse the per-toolkit entity id, then CAS-upsert the
+connected account's source. If that config update fails, report it and let
+active-account reconciliation retry the upsert. For disconnect/revocation,
+remove the source by connected-account id after the provider confirms the
+terminal state; reconciliation also removes source entries whose accounts are
+no longer active. Keep the entity id when removing one connection so a later
+connection for that toolkit retains its identity.
 
 ## Source Readers
 

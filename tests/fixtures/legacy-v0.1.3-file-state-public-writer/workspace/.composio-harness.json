@@ -1,0 +1,6 @@
+{
+  "entities": {
+    "gmail": "legacy-gmail-user",
+    "slack": "legacy-user@example.test"
+  }
+}
