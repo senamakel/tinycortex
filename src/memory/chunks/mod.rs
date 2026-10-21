@@ -116,7 +116,6 @@ pub use raw_refs::{
     list_chunk_raw_ref_paths_with_prefix, list_chunk_raw_ref_paths_with_prefix_async,
     list_summaries_with_content_path, set_chunk_raw_refs, RawRef,
 };
-pub(crate) use signature::signature_in_clause;
 pub use signature::{
     format_signature, parse_signature, signature_variants, signatures_equivalent, SignatureParts,
 };
