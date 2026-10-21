@@ -151,14 +151,20 @@ impl QueueDelegates for DocumentDelegate {
     }
 }
 
-async fn test_setup() -> (
+async fn test_setup(
+    llm_permits: usize,
+) -> (
     TempDir,
     crate::memory::config::MemoryConfig,
     store::Tree,
     Chunk,
 ) {
     let temp = TempDir::new().unwrap();
-    let config = crate::memory::chunks::test_support::host_config(temp.path());
+    let mut config = crate::memory::chunks::test_support::host_config(temp.path());
+    // These tests exercise document settlement/projection, not contention in
+    // the process-wide LLM gate. Give each one a distinct gate so parallel
+    // test execution cannot turn a successful job into an intentional defer.
+    config.queue.llm_permits = llm_permits;
     let tree = crate::memory::tree::get_or_create_tree_async(
         &config,
         TreeKind::Source,
@@ -184,7 +190,7 @@ fn delegate(invalidate_job_lease: Option<String>) -> DocumentDelegate {
 
 #[tokio::test(flavor = "current_thread")]
 async fn document_planning_is_invisible_until_worker_settlement_and_projects_after_commit() {
-    let (_temp, config, tree, chunk) = test_setup().await;
+    let (_temp, config, tree, chunk) = test_setup(991).await;
     let payload = SealDocumentPayload {
         tree_scope: tree.scope.clone(),
         doc_id: "doc-1".into(),
@@ -258,7 +264,7 @@ async fn document_planning_is_invisible_until_worker_settlement_and_projects_aft
 
 #[tokio::test(flavor = "current_thread")]
 async fn stale_document_lease_publishes_neither_summaries_nor_projection() {
-    let (_temp, config, tree, chunk) = test_setup().await;
+    let (_temp, config, tree, chunk) = test_setup(992).await;
     let payload = SealDocumentPayload {
         tree_scope: tree.scope.clone(),
         doc_id: "doc-stale".into(),
@@ -297,7 +303,7 @@ async fn stale_document_lease_publishes_neither_summaries_nor_projection() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn projection_failure_does_not_retry_a_committed_document_seal() {
-    let (_temp, config, tree, chunk) = test_setup().await;
+    let (_temp, config, tree, chunk) = test_setup(993).await;
     let payload = SealDocumentPayload {
         tree_scope: tree.scope.clone(),
         doc_id: "doc-projection-failure".into(),
