@@ -8,5 +8,8 @@ pub mod embedding;
 pub mod store;
 
 pub use embedding::{format_embedding_signature, EmbeddingBackend, InertEmbedding};
-pub use store::{bytes_to_vec, cosine_similarity, vec_to_bytes, SearchResult, VectorStore};
+pub use store::{
+    bytes_to_vec, cosine_similarity, vec_to_bytes, LegacyVectorMetadata, LegacyVectorRecord,
+    SearchResult, VectorStore,
+};
 pub use store::{collections, VECTOR_METADATA, VECTOR_RECORDS};

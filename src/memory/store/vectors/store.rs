@@ -22,6 +22,7 @@ pub const VECTOR_RECORDS: &str = "memory_vectors";
 /// Collection containing the embedding backend compatibility record.
 pub const VECTOR_METADATA: &str = "memory_vector_metadata";
 const VECTOR_META_ID: &str = "embedding-config";
+const LEGACY_SOURCE_META_PREFIX: &str = "legacy-source-";
 const QUERY_PAGE_SIZE: usize = 512;
 
 /// Collections owned by vector persistence. Hosts prepare these before use.
@@ -55,6 +56,48 @@ struct VectorMetadata {
     /// Informational provider name from the writer that initialized the store.
     backend_name: String,
     dimensions: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyVectorMetadataRecord {
+    provider_name: String,
+    dimensions: usize,
+}
+
+/// Source embedding metadata read by a host adapter from a legacy vector DB.
+/// The provider is provenance only; compatibility is guarded by dimensions,
+/// matching the historical store's reopen behavior.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LegacyVectorMetadata {
+    /// Historical provider name from the source database.
+    pub provider_name: String,
+    /// Dimension count recorded by the historical source store.
+    pub dimensions: usize,
+}
+
+/// One vector row decoded by a host's legacy storage reader.
+///
+/// `embedding_le` and `metadata_json` remain opaque so import preserves every
+/// float bit and the source metadata string without normalizing either value.
+#[derive(Debug, Clone)]
+pub struct LegacyVectorRecord {
+    /// Historical namespace.
+    pub namespace: String,
+    /// Historical logical vector ID.
+    pub id: String,
+    /// Stored document text.
+    pub text: String,
+    /// Dimension count stored with this vector.
+    pub dimensions: usize,
+    /// Original little-endian `f32` bytes.
+    pub embedding_le: Vec<u8>,
+    /// Raw serialized JSON metadata from the source row.
+    pub metadata_json: String,
+    /// Original source creation timestamp in seconds since epoch.
+    pub created_at: f64,
+    /// Original source update timestamp in seconds since epoch.
+    pub updated_at: f64,
 }
 
 /// A single search result from the vector store.
@@ -217,6 +260,125 @@ impl VectorStore {
             .await
             .map_err(anyhow::Error::from)?;
         Ok(())
+    }
+
+    /// Import rows decoded from a legacy SQLite vector store.
+    ///
+    /// The host owns reading the old database and supplies typed records here.
+    /// Dimensions must match both the source metadata and this store's active
+    /// backend. Identical retries are no-ops; a conflicting existing logical
+    /// ID fails before any new row is published. New rows and source-provider
+    /// provenance are written in one atomic document batch.
+    pub async fn import_legacy_records(
+        &self,
+        source: &LegacyVectorMetadata,
+        records: &[LegacyVectorRecord],
+    ) -> anyhow::Result<usize> {
+        anyhow::ensure!(
+            source.dimensions == self.backend.dimensions(),
+            "legacy vector dimension mismatch: source has {}, active backend uses {}",
+            source.dimensions,
+            self.backend.dimensions()
+        );
+
+        let mut seen = BTreeSet::new();
+        let mut validated = Vec::with_capacity(records.len());
+        for record in records {
+            anyhow::ensure!(
+                record.dimensions == source.dimensions,
+                "legacy vector {} dimension metadata does not match source",
+                record.id
+            );
+            anyhow::ensure!(
+                record.embedding_le.len() == record.dimensions.saturating_mul(4),
+                "legacy vector {} has an invalid packed embedding length",
+                record.id
+            );
+            let key = vector_document_id(&record.namespace, &record.id);
+            anyhow::ensure!(
+                seen.insert(key.clone()),
+                "legacy vector batch repeats logical ID {} in namespace {}",
+                record.id,
+                record.namespace
+            );
+            validated.push((key, VectorRecord {
+                namespace: record.namespace.clone(),
+                id: record.id.clone(),
+                text: record.text.clone(),
+                dimensions: record.dimensions,
+                embedding_le: record.embedding_le.clone(),
+                metadata_json: record.metadata_json.clone(),
+                created_at: record.created_at,
+                updated_at: record.updated_at,
+            }));
+        }
+
+        let provenance_id = legacy_source_metadata_id(source);
+        for _ in 0..3 {
+            let mut ops = Vec::with_capacity(validated.len() + 1);
+            let mut inserted = 0;
+            for (key, record) in &validated {
+                match self
+                    .documents
+                    .get_as::<VectorRecord>(VECTOR_RECORDS, key)
+                    .await?
+                {
+                    Some(existing) => {
+                        anyhow::ensure!(
+                            same_record(&existing.doc, record),
+                            "legacy vector import conflicts with existing ID {} in namespace {}",
+                            record.id,
+                            record.namespace
+                        );
+                    }
+                    None => {
+                        ops.push(WriteOp::Put {
+                            collection: VECTOR_RECORDS.to_owned(),
+                            id: key.clone(),
+                            doc: serde_json::to_value(record)?,
+                            precondition: Precondition::Absent,
+                        });
+                        inserted += 1;
+                    }
+                }
+            }
+
+            let source_doc = LegacyVectorMetadataRecord {
+                provider_name: source.provider_name.clone(),
+                dimensions: source.dimensions,
+            };
+            match self
+                .documents
+                .get_as::<LegacyVectorMetadataRecord>(VECTOR_METADATA, &provenance_id)
+                .await?
+            {
+                Some(existing) => anyhow::ensure!(
+                    existing.doc == source_doc,
+                    "legacy vector source metadata conflicts with existing provenance"
+                ),
+                None => ops.push(WriteOp::Put {
+                    collection: VECTOR_METADATA.to_owned(),
+                    id: provenance_id.clone(),
+                    doc: serde_json::to_value(source_doc)?,
+                    precondition: Precondition::Absent,
+                }),
+            }
+
+            if ops.is_empty() {
+                return Ok(0);
+            }
+            match self.documents.atomic_batch(ops).await {
+                Ok(()) => return Ok(inserted),
+                Err(error)
+                    if error.kind() == tinystoragedrivers_types::ErrorKind::Conflict =>
+                {
+                    // A concurrent identical importer may have won. Re-read
+                    // and compare all affected rows before accepting a retry.
+                }
+                Err(error) => return Err(anyhow::Error::from(error)),
+            }
+        }
+        anyhow::bail!("legacy vector import remained contended after retries")
     }
 
     /// Searches by embedding text, using the configured backend.
@@ -401,6 +563,26 @@ fn validate_metadata(
         )));
     }
     Ok(())
+}
+
+fn legacy_source_metadata_id(source: &LegacyVectorMetadata) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"tinycortex-legacy-vector-source-v1\0");
+    digest.update((source.provider_name.len() as u64).to_le_bytes());
+    digest.update(source.provider_name.as_bytes());
+    digest.update((source.dimensions as u64).to_le_bytes());
+    format!("{LEGACY_SOURCE_META_PREFIX}{:x}", digest.finalize())
+}
+
+fn same_record(left: &VectorRecord, right: &VectorRecord) -> bool {
+    left.namespace == right.namespace
+        && left.id == right.id
+        && left.text == right.text
+        && left.dimensions == right.dimensions
+        && left.embedding_le == right.embedding_le
+        && left.metadata_json == right.metadata_json
+        && left.created_at.to_bits() == right.created_at.to_bits()
+        && left.updated_at.to_bits() == right.updated_at.to_bits()
 }
 
 fn validate_embedding(embedding: &[f32], dimensions: usize) -> anyhow::Result<()> {
