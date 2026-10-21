@@ -2,8 +2,8 @@
 //!
 //! This domain owns the **"what feeds my memory?"** question: a typed registry
 //! of sources (Composio OAuth connections, local folders, GitHub repos, RSS
-//! feeds, Twitter queries, web pages, and agent conversations) persisted in
-//! `config.toml` under `[[memory_sources]]`.
+//! feeds, Twitter queries, web pages, and agent conversations). The host owns
+//! durable configuration and supplies it through [`SourceConfigPort`].
 //!
 //! It provides:
 //! - [`types`]: the [`MemorySourceEntry`] contract, [`SourceKind`] discriminator,

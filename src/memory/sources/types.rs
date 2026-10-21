@@ -169,7 +169,7 @@ where
 /// An absent field leaves the current value unchanged. For optional source
 /// properties, an explicit JSON `null` clears the value while a concrete value
 /// replaces it.
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct MemorySourcePatch {
     /// New human-readable label for the source.
     #[serde(default)]

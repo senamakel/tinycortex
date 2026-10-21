@@ -9,7 +9,7 @@
 //! temp file is removed so no litter accumulates.
 //!
 //! This mirrors the temp-file + rename pattern already used by the source
-//! registry (`sources::registry::SourceRegistry::atomic_write`); the stores
+//! registry (through the host-owned `SourceConfigPort`); the stores
 //! share this helper rather than re-implementing it per module.
 
 use std::io;

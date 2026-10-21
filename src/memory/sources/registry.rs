@@ -8,7 +8,7 @@
 
 use std::sync::Arc;
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{anyhow, bail, Result};
 use async_trait::async_trait;
 
 use super::types::{MemorySourceEntry, MemorySourcePatch, SourceKind};
