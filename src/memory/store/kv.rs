@@ -11,7 +11,7 @@ use sha2::{Digest, Sha256};
 use std::cmp::Ordering;
 use std::sync::Arc;
 use tinystoragedrivers_api::KvStore as KvPort;
-use tinystoragedrivers_types::{Cursor, ErrorKind, Precondition, Versioned};
+use tinystoragedrivers_types::{ErrorKind, Precondition, Versioned};
 
 use crate::memory::config::MemoryConfig;
 use crate::memory::storage::Blocking;
@@ -175,7 +175,7 @@ impl KvStore {
         let storage_key = Self::storage_key(kind, namespace.as_deref(), &key);
         let entry = Entry {
             kind,
-            namespace,
+            namespace: namespace.clone(),
             key: key.clone(),
             value: safety::sanitize_json(&value).value,
             updated_at: Self::now_ts(),
@@ -323,12 +323,9 @@ impl KvStore {
             return Err("kv key cannot contain secrets".to_string());
         }
         let store = self.clone();
+        let value = value.clone();
         self.blocking
-            .run(async move {
-                store
-                    .put_entry(EntryKind::Global, None, key, value.clone())
-                    .await
-            })
+            .run(async move { store.put_entry(EntryKind::Global, None, key, value).await })
             .map_err(|error| error.to_string())?
     }
 
@@ -360,10 +357,11 @@ impl KvStore {
     pub fn set_namespace(&self, namespace: &str, key: &str, value: &Value) -> Result<(), String> {
         let (namespace, key) = normalize_write_identity(namespace, key)?;
         let store = self.clone();
+        let value = value.clone();
         self.blocking
             .run(async move {
                 store
-                    .put_entry(EntryKind::Namespace, Some(namespace), key, value.clone())
+                    .put_entry(EntryKind::Namespace, Some(namespace), key, value)
                     .await
             })
             .map_err(|error| error.to_string())?
@@ -384,11 +382,12 @@ impl KvStore {
     /// Read a namespace-scoped key; corrupt stored data returns an error.
     pub fn get_namespace(&self, namespace: &str, key: &str) -> Result<Option<Value>, String> {
         let namespace = Self::sanitize_namespace(namespace);
+        let key = key.to_string();
         let store = self.clone();
         self.blocking
             .run(async move {
                 store
-                    .get_value(EntryKind::Namespace, Some(&namespace), key)
+                    .get_value(EntryKind::Namespace, Some(&namespace), &key)
                     .await
             })
             .map_err(|error| error.to_string())?
@@ -422,11 +421,12 @@ impl KvStore {
     /// Delete a namespace key; returns whether a record existed.
     pub fn delete_namespace(&self, namespace: &str, key: &str) -> Result<bool, String> {
         let namespace = Self::sanitize_namespace(namespace);
+        let key = key.to_string();
         let store = self.clone();
         self.blocking
             .run(async move {
                 store
-                    .delete_key(EntryKind::Namespace, Some(&namespace), key)
+                    .delete_key(EntryKind::Namespace, Some(&namespace), &key)
                     .await
             })
             .map_err(|error| error.to_string())?
