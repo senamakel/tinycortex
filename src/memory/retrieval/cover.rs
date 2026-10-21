@@ -343,7 +343,7 @@ fn cover_one_source(
         until_ms,
         exact_source,
         content_state,
-        mut out,
+        out,
     } = context;
     let tree = get_tree_by_scope(config, TreeKind::Source, source)?;
     let (tree_id, eligible) = match &tree {
@@ -399,7 +399,7 @@ async fn cover_one_source_async(
         until_ms,
         exact_source,
         content_state,
-        mut out,
+        out,
     } = context;
     let tree = get_tree_by_scope_async(config, TreeKind::Source, source).await?;
     let (tree_id, eligible) = match &tree {
