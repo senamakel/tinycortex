@@ -9,6 +9,7 @@
 
 pub mod address_book;
 pub mod collections;
+pub mod legacy_import;
 pub mod resolver;
 pub mod scorer;
 pub mod store;
