@@ -454,6 +454,10 @@ pub async fn import_legacy_batch(
                 let pointer: ExistingContentPointer = serde_json::from_value(value.clone())
                     .context("decode existing imported chunk content pointer")?;
                 anyhow::ensure!(pointer.chunk_id == record.chunk.id);
+                anyhow::ensure!(
+                    safe_relative_path(&pointer.content_path) && is_sha256(&pointer.content_sha256),
+                    "existing imported chunk content pointer has an unsafe path or invalid SHA-256"
+                );
             }
         }
 
