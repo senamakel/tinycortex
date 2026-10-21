@@ -8,7 +8,7 @@ export type OwnerSnapshot = {
   skill_documents: Array<{
     namespace: string | null;
     key: string;
-    value: Record<string, unknown>;
+    value: unknown;
     updated_at: number;
   }>;
   chunks: Array<{
@@ -82,7 +82,7 @@ export function parseOwnerSnapshot(value: unknown): OwnerSnapshot {
   const root = object(value);
   const skill_documents = array(root.skill_documents, "skill_documents").map((value) => {
     const row = object(value);
-    const storedValue = object(row.value);
+    const storedValue = row.value;
     return {
       namespace: nullableString(row.namespace, "skill document namespace"),
       key: string(row.key, "skill document key"),
@@ -216,6 +216,72 @@ const snapshotForRequest = cache(async (workspace: string): Promise<OwnerSnapsho
   return parseOwnerSnapshot(decoded);
 });
 
-export function readOwnerSnapshot(workspace: string): Promise<OwnerSnapshot> {
-  return snapshotForRequest(workspace);
+export function readOwnerSnapshot(workspace: string, chunkLimit = 300): Promise<OwnerSnapshot> {
+  const boundedLimit = Math.max(1, Math.min(10_000, Math.floor(chunkLimit)));
+  if (!Number.isFinite(boundedLimit)) throw new Error("invalid owner snapshot limit");
+  return snapshotForRequest(workspace, boundedLimit);
 }
+
+const snapshotForRequest = cache(async (workspace: string, chunkLimit: number): Promise<OwnerSnapshot> => {
+  const binary = process.env.TINYCORTEX_INSPECTOR_BIN?.trim();
+  const storageUrl = process.env.TINYCORTEX_STORAGE_URL?.trim();
+  const scope = process.env.TINYCORTEX_STORAGE_SCOPE?.trim();
+  if (!binary || !isAbsolute(binary)) {
+    throw new Error("TINYCORTEX_INSPECTOR_BIN must name an absolute inspector executable path");
+  }
+  if (!storageUrl || !scope) {
+    throw new Error("TINYCORTEX_STORAGE_URL and TINYCORTEX_STORAGE_SCOPE are required");
+  }
+
+  const env: NodeJS.ProcessEnv = { PATH: process.env.PATH };
+  for (const name of ["HOME", "TMPDIR", "SSL_CERT_FILE", "SSL_CERT_DIR", "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY"]) {
+    if (process.env[name]) env[name] = process.env[name];
+  }
+  env.TINYCORTEX_WORKSPACE = workspace;
+  env.TINYCORTEX_STORAGE_URL = storageUrl;
+  env.TINYCORTEX_STORAGE_SCOPE = scope;
+  env.TINYCORTEX_INSPECTOR_CHUNK_LIMIT = String(boundedLimit);
+
+  const stdout: Buffer[] = [];
+  let stdoutBytes = 0;
+  const raw = await new Promise<string>((resolve, reject) => {
+    const child = spawn(binary, [], { env, stdio: ["ignore", "pipe", "pipe"], shell: false });
+    let settled = false;
+    const finishError = (error: Error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      reject(error);
+    };
+    const timer = setTimeout(() => {
+      child.kill("SIGKILL");
+      finishError(new Error("owner inspection exceeded its time limit"));
+    }, INSPECT_TIMEOUT_MS);
+    child.stdout.on("data", (part: Buffer) => {
+      stdoutBytes += part.length;
+      if (stdoutBytes > MAX_STDOUT_BYTES) {
+        child.kill("SIGKILL");
+        finishError(new Error("owner inspection exceeded its output limit"));
+        return;
+      }
+      stdout.push(part);
+    });
+    child.stderr.on("data", () => {});
+    child.on("error", () => finishError(new Error("could not start the owner inspector")));
+    child.on("close", (code) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (code !== 0) reject(new Error("owner inspector could not read the configured scope"));
+      else resolve(Buffer.concat(stdout).toString("utf8"));
+    });
+  });
+
+  let decoded: unknown;
+  try {
+    decoded = JSON.parse(raw);
+  } catch {
+    throw new Error("owner inspector returned invalid JSON");
+  }
+  return parseOwnerSnapshot(decoded);
+});
