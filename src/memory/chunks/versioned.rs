@@ -199,8 +199,8 @@ pub(crate) async fn upsert_chunks_async(config: &MemoryConfig, chunks: &[Chunk])
     for _ in 0..CAS_RETRIES {
         let snapshot = capture_head_async(config).await?;
         let defaults = chunk_upsert_state_changes(chunks, &[]);
-        let changes = restore_deleted_chunk_lifecycles_async(config, &snapshot, chunks, &defaults)
-            .await?;
+        let changes =
+            restore_deleted_chunk_lifecycles_async(config, &snapshot, chunks, &defaults).await?;
         match upsert_chunks_at_async(config, &snapshot, chunks, chunks, &changes).await {
             Ok(_) => return Ok(chunks.len()),
             Err(error) if is_storage_conflict(&error) => continue,
@@ -338,7 +338,7 @@ fn commit_operation(
             final_chunks.push(chunk.clone());
         }
     }
-    let mut changes_with_defaults = chunk_upsert_state_changes(chunks, changes);
+    let changes_with_defaults = chunk_upsert_state_changes(chunks, changes);
     let mut final_changes = Vec::new();
     let mut change_positions = HashMap::new();
     for change in &changes_with_defaults {
