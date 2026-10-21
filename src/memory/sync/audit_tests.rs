@@ -20,24 +20,26 @@ fn entry(id: &str, timestamp: DateTime<Utc>) -> SyncAuditEntry {
     }
 }
 
-#[test]
-fn audit_round_trip_is_newest_first_and_skips_malformed_lines() {
+#[tokio::test]
+async fn audit_round_trip_is_newest_first_and_skips_malformed_lines() {
     let temp = tempfile::tempdir().unwrap();
-    let config = MemoryConfig::new(temp.path());
+    let config = crate::memory::chunks::test_support::host_config(temp.path());
     let first = entry("first", Utc::now());
     let second = entry("second", Utc::now());
-    append_audit_entry(&config, &first).unwrap();
-    std::fs::OpenOptions::new()
-        .append(true)
-        .open(temp.path().join("memory_tree/sync_audit.jsonl"))
+    append_audit_entry_async(&config, &first).await.unwrap();
+    config
+        .storage()
         .unwrap()
-        .write_all(b"not-json\n")
+        .streams()
+        .append("tinycortex:sync-audit:v1", serde_json::json!({"broken": true}))
+        .await
         .unwrap();
-    append_audit_entry(&config, &second).unwrap();
-    let entries = read_audit_log(&config).unwrap();
+    append_audit_entry_async(&config, &second).await.unwrap();
+    let entries = read_audit_log_async(&config).await.unwrap();
     assert_eq!(entries.len(), 2);
     assert_eq!(entries[0].source_id, "second");
     assert_eq!(entries[1].source_id, "first");
+    assert!(!temp.path().join("memory_tree/sync_audit.jsonl").exists());
 }
 
 #[test]

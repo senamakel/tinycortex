@@ -1,13 +1,15 @@
 //! Append-only synchronization cost and outcome audit log.
 
-use std::io::Write;
+use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use tinystoragedrivers_api::StreamStore;
 
 use crate::memory::config::MemoryConfig;
 
-const AUDIT_FILENAME: &str = "sync_audit.jsonl";
+const AUDIT_STREAM: &str = "tinycortex:sync-audit:v1";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SyncAuditEntry {
@@ -43,32 +45,53 @@ impl SyncAuditEntry {
 }
 
 pub fn append_audit_entry(config: &MemoryConfig, entry: &SyncAuditEntry) -> anyhow::Result<()> {
-    let directory = config.workspace.join("memory_tree");
-    std::fs::create_dir_all(&directory)?;
-    let mut file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(directory.join(AUDIT_FILENAME))?;
-    serde_json::to_writer(&mut file, entry)?;
-    writeln!(file)?;
+    let blocking = config.storage_blocking()?.clone();
+    let streams = Arc::clone(config.storage()?.streams());
+    let value = serde_json::to_value(entry)?;
+    blocking
+        .run(async move { streams.append(AUDIT_STREAM, value).await })
+        .map_err(anyhow::Error::from)?;
+    tracing::debug!(source_id = %entry.source_id, success = entry.success, "[memory_sync:audit] entry appended");
+    Ok(())
+}
+
+pub async fn append_audit_entry_async(
+    config: &MemoryConfig,
+    entry: &SyncAuditEntry,
+) -> anyhow::Result<()> {
+    let streams = Arc::clone(config.storage()?.streams());
+    let value = serde_json::to_value(entry)?;
+    streams
+        .append(AUDIT_STREAM, value)
+        .await
+        .map_err(anyhow::Error::from)?;
     tracing::debug!(source_id = %entry.source_id, success = entry.success, "[memory_sync:audit] entry appended");
     Ok(())
 }
 
 pub fn read_audit_log(config: &MemoryConfig) -> anyhow::Result<Vec<SyncAuditEntry>> {
-    let path = config.workspace.join("memory_tree").join(AUDIT_FILENAME);
-    let content = match std::fs::read_to_string(path) {
-        Ok(content) => content,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(error) => return Err(error.into()),
-    };
-    let mut entries: Vec<_> = content
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .filter_map(|line| match serde_json::from_str(line) {
+    let blocking = config.storage_blocking()?.clone();
+    let streams = Arc::clone(config.storage()?.streams());
+    blocking
+        .run(async move { read_entries(&*streams).await })
+        .map_err(anyhow::Error::from)?
+}
+
+pub async fn read_audit_log_async(config: &MemoryConfig) -> anyhow::Result<Vec<SyncAuditEntry>> {
+    read_entries(&**config.storage()?.streams()).await
+}
+
+async fn read_entries(streams: &dyn tinystoragedrivers_api::StreamStore) -> anyhow::Result<Vec<SyncAuditEntry>> {
+    let len = streams.len(AUDIT_STREAM).await?;
+    let entries = streams
+        .read_window(AUDIT_STREAM, 0, usize::try_from(len).unwrap_or(usize::MAX))
+        .await?;
+    let mut entries: Vec<_> = entries
+        .into_iter()
+        .filter_map(|entry| match serde_json::from_value::<SyncAuditEntry>(entry.value) {
             Ok(entry) => Some(entry),
             Err(error) => {
-                tracing::warn!(%error, "[memory_sync:audit] malformed audit line skipped");
+                tracing::warn!(%error, "[memory_sync:audit] malformed audit record skipped");
                 None
             }
         })

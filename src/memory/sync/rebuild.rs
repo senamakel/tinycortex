@@ -17,7 +17,7 @@ use crate::memory::tree::{
 };
 use crate::memory::tree::{store::list_summaries_at_level, TreeFactory};
 
-use super::audit::{append_audit_entry, RealCostAccumulator, SyncAuditEntry};
+use super::audit::{append_audit_entry_async, RealCostAccumulator, SyncAuditEntry};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RawFileRef {
@@ -351,7 +351,7 @@ pub async fn rebuild_tree_from_raw_with_audit(
     let output_tokens = cost.audit_output_tokens();
     let estimated_cost_usd = cost.estimated_cost();
     let actual_charged_usd = cost.actual_charged_usd();
-    append_audit_entry(
+    append_audit_entry_async(
         config,
         &SyncAuditEntry {
             timestamp: chrono::Utc::now(),
@@ -370,7 +370,8 @@ pub async fn rebuild_tree_from_raw_with_audit(
             success: true,
             error: None,
         },
-    )?;
+    )
+    .await?;
     Ok(RebuildOutcome {
         files_read,
         batches: batch_count,
