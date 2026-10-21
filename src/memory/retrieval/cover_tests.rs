@@ -533,7 +533,15 @@ fn cover_fails_closed_to_preview_for_corrupt_refs_and_unsafe_pointer_path() {
         .into_iter()
         .map(|hit| hit.content)
         .collect::<HashSet<_>>();
-    assert_eq!(contents, ["safe refs preview", "safe pointer preview"]);
+    assert_eq!(
+        contents,
+        [
+            "safe refs preview".to_string(),
+            "safe pointer preview".to_string()
+        ]
+        .into_iter()
+        .collect()
+    );
 }
 
 #[tokio::test]

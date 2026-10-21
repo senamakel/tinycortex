@@ -5,7 +5,8 @@
 use super::types::{chunk_id, Chunk, Metadata, SourceKind, SourceRef};
 use super::{
     content_root, count_chunks, delete_chunk_by_id, delete_chunks_by_source, get_chunk,
-    is_source_ingested, purge_all, purge_all_async, upsert_chunks, upsert_staged_chunks,
+    is_source_ingested, purge_all, purge_all_async, upsert_chunks, upsert_chunks_async,
+    upsert_staged_chunks,
 };
 use crate::memory::config::MemoryConfig;
 use chrono::{TimeZone, Utc};
@@ -318,7 +319,6 @@ fn purge_failure_keeps_the_captured_owner_state_visible() {
 
 #[tokio::test]
 async fn purge_all_leaves_host_audit_collection_alone() {
-    use tinystoragedrivers_api::DocumentStore;
     use tinystoragedrivers_types::{CollectionSpec, Precondition};
 
     let (_tmp, cfg) = test_config();
