@@ -17,7 +17,7 @@ use crate::memory::score::store::ScoreRow;
 use crate::memory::store::entity_index::transaction::{
     stage_node_occurrences_async, EntityOccurrence,
 };
-use crate::memory::tree::store::{SummaryNode, Tree};
+use crate::memory::tree::store::{Buffer, HotnessCounters, SummaryNode, Tree};
 
 /// A legacy content pointer already copied and verified by the host importer.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -129,6 +129,46 @@ pub struct LegacySummaryEmbedding {
     pub created_at_ms: i64,
 }
 
+/// An unsealed tree frontier copied from the legacy buffer table.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LegacyBuffer {
+    /// Existing owning tree and level.
+    pub buffer: Buffer,
+}
+
+/// Durable entity hotness counters copied from the legacy store.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LegacyHotness {
+    /// Complete persisted counter record, including its historical timestamp.
+    pub counters: HotnessCounters,
+}
+
+/// A chunk/model pair that the legacy embedder permanently skipped.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LegacyChunkReembedSkip {
+    /// Existing chunk identifier.
+    pub chunk_id: String,
+    /// Historical model signature.
+    pub model_signature: String,
+    /// Original skip reason.
+    pub reason: String,
+    /// Original skipped-at timestamp in epoch milliseconds.
+    pub skipped_at_ms: i64,
+}
+
+/// A summary/model pair that the legacy embedder permanently skipped.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LegacySummaryReembedSkip {
+    /// Existing summary identifier.
+    pub summary_id: String,
+    /// Historical model signature.
+    pub model_signature: String,
+    /// Original skip reason.
+    pub reason: String,
+    /// Original skipped-at timestamp in epoch milliseconds.
+    pub skipped_at_ms: i64,
+}
+
 /// One import batch read by the host's legacy adapter.
 #[derive(Clone, Debug, Default)]
 pub struct LegacyImportBatch {
@@ -150,6 +190,14 @@ pub struct LegacyImportBatch {
     pub source_gates: Vec<LegacySourceGate>,
     /// Durable extract jobs with stable IDs supplied by the source adapter.
     pub jobs: Vec<ImportedJob>,
+    /// Pending buffers, preserving item order, token sum, and oldest timestamp.
+    pub buffers: Vec<LegacyBuffer>,
+    /// Persisted hotness rows, preserving all historical counters and timestamps.
+    pub hotness: Vec<LegacyHotness>,
+    /// Chunk/model re-embedding skips with their original reason and time.
+    pub chunk_reembed_skips: Vec<LegacyChunkReembedSkip>,
+    /// Summary/model re-embedding skips with their original reason and time.
+    pub summary_reembed_skips: Vec<LegacySummaryReembedSkip>,
 }
 
 /// Counts imported logical records. Existing identical records count as
@@ -166,6 +214,12 @@ pub struct LegacyImportCounts {
     pub trees: usize,
     /// Ready job hints published or repaired after commit.
     pub jobs: usize,
+    /// Pending tree buffers imported.
+    pub buffers: usize,
+    /// Entity hotness rows imported.
+    pub hotness: usize,
+    /// Durable re-embedding skip rows imported across chunks and summaries.
+    pub reembed_skips: usize,
 }
 
 #[derive(Deserialize)]
@@ -199,6 +253,10 @@ pub async fn import_legacy_batch(
                 c::SUMMARIES,
                 c::SUMMARY_CONTENT_POINTERS,
                 c::SUMMARY_EMBEDDINGS,
+                c::BUFFERS,
+                c::ENTITY_HOTNESS,
+                c::CHUNK_REEMBED_SKIPS,
+                c::SUMMARY_REEMBED_SKIPS,
                 c::ENTITY_INDEX,
                 c::ENTITY_EDGES,
             ],
@@ -370,6 +428,48 @@ pub async fn import_legacy_batch(
                 })),
             )?;
         }
+        for record in &batch.buffers {
+            add_desired(
+                &mut desired,
+                c::BUFFERS,
+                &format!("buffer:{}:{}", record.buffer.tree_id, record.buffer.level),
+                Some(serde_json::to_value(&record.buffer)?),
+            )?;
+        }
+        for record in &batch.hotness {
+            add_desired(
+                &mut desired,
+                c::ENTITY_HOTNESS,
+                &record.counters.entity_id,
+                Some(serde_json::to_value(&record.counters)?),
+            )?;
+        }
+        for skip in &batch.chunk_reembed_skips {
+            add_desired(
+                &mut desired,
+                c::CHUNK_REEMBED_SKIPS,
+                &serde_json::to_string(&(&skip.chunk_id, &skip.model_signature))?,
+                Some(serde_json::json!({
+                    "chunk_id": skip.chunk_id,
+                    "model_signature": skip.model_signature,
+                    "reason": skip.reason,
+                    "skipped_at_ms": skip.skipped_at_ms,
+                })),
+            )?;
+        }
+        for skip in &batch.summary_reembed_skips {
+            add_desired(
+                &mut desired,
+                c::SUMMARY_REEMBED_SKIPS,
+                &serde_json::to_string(&(&skip.summary_id, &skip.model_signature))?,
+                Some(serde_json::json!({
+                    "summary_id": skip.summary_id,
+                    "model_signature": skip.model_signature,
+                    "reason": skip.reason,
+                    "skipped_at_ms": skip.skipped_at_ms,
+                })),
+            )?;
+        }
         for edge in &batch.edges {
             let (a, b) = if edge.entity_a < edge.entity_b {
                 (&edge.entity_a, &edge.entity_b)
@@ -477,6 +577,10 @@ pub async fn import_legacy_batch(
                     .sum::<usize>(),
             trees: batch.trees.len() + batch.summaries.len(),
             jobs: staged_jobs.publish.len(),
+            buffers: batch.buffers.len(),
+            hotness: batch.hotness.len(),
+            reembed_skips: batch.chunk_reembed_skips.len()
+                + batch.summary_reembed_skips.len(),
         };
 
         let committed = if chunks_to_write.is_empty() && changes.is_empty() {
@@ -599,6 +703,58 @@ fn validate_batch(batch: &LegacyImportBatch) -> Result<()> {
             "invalid legacy summary content pointer for {}",
             content.summary_id
         );
+    }
+    let mut buffer_keys = HashSet::new();
+    for record in &batch.buffers {
+        let buffer = &record.buffer;
+        anyhow::ensure!(
+            tree_ids.contains(buffer.tree_id.as_str())
+                && buffer_keys.insert((buffer.tree_id.as_str(), buffer.level)),
+            "legacy buffer has an unknown tree or duplicate tree/level key"
+        );
+        let mut item_ids = HashSet::new();
+        anyhow::ensure!(
+            buffer.item_ids.iter().all(|id| {
+                !id.is_empty()
+                    && item_ids.insert(id.as_str())
+                    && (chunk_ids.contains(id.as_str()) || summary_ids.contains(id.as_str()))
+            }),
+            "legacy buffer has a duplicate, empty, or unknown pending item"
+        );
+        anyhow::ensure!(buffer.token_sum >= 0, "legacy buffer has negative token sum");
+    }
+    let mut hotness_ids = HashSet::new();
+    for record in &batch.hotness {
+        let counters = &record.counters;
+        anyhow::ensure!(
+            !counters.entity_id.is_empty()
+                && hotness_ids.insert(counters.entity_id.as_str())
+                && counters.graph_centrality.is_none_or(f32::is_finite)
+                && counters.last_hotness.is_none_or(f32::is_finite),
+            "invalid or duplicate legacy hotness row"
+        );
+    }
+    let mut chunk_skip_keys = HashSet::new();
+    for skip in &batch.chunk_reembed_skips {
+        anyhow::ensure!(
+            chunk_ids.contains(skip.chunk_id.as_str())
+                && !skip.model_signature.trim().is_empty()
+                && chunk_skip_keys.insert((skip.chunk_id.as_str(), skip.model_signature.as_str())),
+            "invalid or duplicate legacy chunk re-embed skip"
+        );
+        super::embeddings::validate_reembed_skip_key("chunk_id", &skip.chunk_id)?;
+        super::embeddings::validate_reembed_skip_key("model_signature", &skip.model_signature)?;
+    }
+    let mut summary_skip_keys = HashSet::new();
+    for skip in &batch.summary_reembed_skips {
+        anyhow::ensure!(
+            summary_ids.contains(skip.summary_id.as_str())
+                && !skip.model_signature.trim().is_empty()
+                && summary_skip_keys.insert((skip.summary_id.as_str(), skip.model_signature.as_str())),
+            "invalid or duplicate legacy summary re-embed skip"
+        );
+        super::embeddings::validate_reembed_skip_key("summary_id", &skip.summary_id)?;
+        super::embeddings::validate_reembed_skip_key("model_signature", &skip.model_signature)?;
     }
     let valid_nodes: HashSet<_> = chunk_ids
         .iter()

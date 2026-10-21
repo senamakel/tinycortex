@@ -156,6 +156,7 @@ fn settle_job(config: &MemoryConfig, job: &Job, result: Result<JobOutcome>) -> R
     )
 }
 
+#[cfg(test)]
 fn settle_planned_job(
     config: &MemoryConfig,
     job: &Job,
@@ -373,6 +374,7 @@ pub(crate) fn storage_error_kind(err: &anyhow::Error) -> Option<ErrorKind> {
 }
 
 /// Whether a typed storage failure is retryable without changing the request.
+#[cfg(test)]
 pub(crate) fn is_retryable_storage_error(err: &anyhow::Error) -> bool {
     matches!(
         storage_error_kind(err),

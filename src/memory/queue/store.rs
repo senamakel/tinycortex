@@ -29,7 +29,9 @@ const MAX_STALE_HINTS: usize = 64;
 /// Default visibility lock — a crashed worker is redelivered after this window.
 pub const DEFAULT_LOCK_DURATION_MS: i64 = 5 * 60 * 1_000;
 /// Backoff math for retry. Returns `now + min(base * 2^attempts, cap)`.
+#[cfg(test)]
 pub(crate) const RETRY_BASE_MS: i64 = 60 * 1_000;
+#[cfg(test)]
 pub(crate) const RETRY_CAP_MS: i64 = 60 * 60 * 1_000;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -262,7 +264,7 @@ pub(crate) async fn stage_import_jobs_at_snapshot(
                 completed_at_ms >= job.created_at_ms
                     && job
                         .started_at_ms
-                        .map_or(true, |started| completed_at_ms >= started),
+                        .is_none_or(|started| completed_at_ms >= started),
                 "typed queue import job {id} completed before its creation or start"
             );
         }
@@ -1439,6 +1441,7 @@ pub(crate) async fn update_test_record_async(
 }
 
 /// Backoff math shared by settlement and its deterministic unit tests.
+#[cfg(test)]
 pub(crate) fn backoff_ms(attempts: u32) -> i64 {
     backoff_ms_with_policy(attempts, RETRY_BASE_MS, RETRY_CAP_MS)
 }
