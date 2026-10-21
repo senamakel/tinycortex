@@ -387,6 +387,31 @@ async fn plain_upsert_keeps_default_lifecycle_implicit() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn explicit_null_lifecycle_suppresses_implicit_admission() {
+    let config = config().await;
+    let value = chunk("legacy-null-lifecycle", "inline");
+    super::super::store::upsert_chunks(&config, std::slice::from_ref(&value)).unwrap();
+    write_state(
+        &config,
+        StateChange {
+            collection: CHUNK_LIFECYCLE.to_owned(),
+            key: value.id.clone(),
+            value: Some(Value::Null),
+        },
+    )
+    .unwrap();
+
+    assert_eq!(
+        super::super::store::get_chunk_lifecycle_status(&config, &value.id).unwrap(),
+        None
+    );
+    let (_, states) = list_chunk_snapshot(&config, &[CHUNK_LIFECYCLE]).unwrap();
+    assert!(states[CHUNK_LIFECYCLE]
+        .iter()
+        .any(|(key, state)| key == &value.id && state == &Value::Null));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn public_chunk_write_and_read_use_the_host_document_store() {
     let config = config().await;
     let original = chunk("chunk-1", "first");

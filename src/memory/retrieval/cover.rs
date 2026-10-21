@@ -138,10 +138,7 @@ fn collect_cover(
     let restrict_summaries = source_id.is_some() || source_scope.is_some();
     let page_size = config.retrieval.limits.window_chunk_page_size;
     let mut chunks = Vec::new();
-    let mut content_state = HashMap::<
-        String,
-        HashMap<String, serde_json::Value>,
-    >::new();
+    let mut content_state = HashMap::<String, HashMap<String, serde_json::Value>>::new();
     loop {
         let (page, page_state) = list_chunks_with_content_state(
             config,
