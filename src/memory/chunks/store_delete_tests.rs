@@ -358,23 +358,6 @@ fn seed_full_tier(cfg: &MemoryConfig, chunk: &Chunk) {
     .unwrap();
 }
 
-const PURGED_TABLES: [&str; 14] = [
-    "mem_tree_score",
-    "mem_tree_entity_index",
-    "mem_tree_entity_edges",
-    "mem_tree_entity_hotness",
-    "mem_tree_jobs",
-    "mem_tree_buffers",
-    "mem_tree_summary_embeddings",
-    "mem_tree_summary_reembed_skipped",
-    "mem_tree_summaries",
-    "mem_tree_trees",
-    "mem_tree_chunk_embeddings",
-    "mem_tree_chunk_reembed_skipped",
-    "mem_tree_chunks",
-    "mem_tree_ingested_sources",
-];
-
 /// A failed host write cannot expose any part of a multi-collection purge.
 #[test]
 fn purge_failure_keeps_the_captured_owner_state_visible() {
@@ -443,11 +426,10 @@ fn purge_all_leaves_the_write_audit_trail_alone() {
     })
     .unwrap();
 
-    let expected: i64 = PURGED_TABLES
-        .iter()
-        .map(|table| count_rows(&cfg, table))
-        .sum();
-    assert_eq!(purge_all(&cfg).unwrap() as i64, expected);
+    // The fixture's chunk lives in the host document store, not the legacy
+    // SQLite tables counted by PURGED_TABLES. Purge reports logical owner
+    // rows removed, while the audit record remains outside that domain.
+    assert_eq!(purge_all(&cfg).unwrap(), 1);
     assert_eq!(
         count_rows(&cfg, "mcp_writes"),
         1,

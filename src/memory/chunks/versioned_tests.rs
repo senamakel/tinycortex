@@ -321,6 +321,11 @@ async fn listing_chunk_state_resolves_many_lifecycle_keys_in_bounded_queries() {
             key: chunk.id.clone(),
             value: Some(serde_json::json!({"chunk_id":chunk.id,"total":0.5})),
         })
+        .chain(chunks.iter().map(|chunk| StateChange {
+            collection: CHUNK_LIFECYCLE.into(),
+            key: chunk.id.clone(),
+            value: Some(serde_json::json!({"status":"active"})),
+        }))
         .collect::<Vec<_>>();
     assert!(commit_if_state_matches(&config, &[], &[], &score_rows).unwrap());
     state_version_queries.store(0, Ordering::SeqCst);

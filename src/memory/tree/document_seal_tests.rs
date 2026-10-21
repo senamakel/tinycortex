@@ -231,13 +231,23 @@ async fn document_planning_is_invisible_until_worker_settlement_and_projects_aft
             .status,
         JobStatus::Done
     );
-    assert!(store::get_summary_async(&config, &planned.result.root_id)
+    let committed_tree = store::get_tree_async(&config, &tree.id)
         .await
         .unwrap()
-        .is_some());
+        .unwrap();
+    let committed_root = committed_tree.root_id.expect("worker publishes tree root");
+    let root_summary = store::get_summary_async(&config, &committed_root)
+        .await
+        .unwrap()
+        .expect("worker publishes root summary");
+    assert_eq!(root_summary.tree_id, tree.id);
+    let committed_summaries = store::list_summaries_at_level_async(&config, &tree.id, 1)
+        .await
+        .unwrap();
+    assert!(!committed_summaries.is_empty());
     assert_eq!(
         service.projected.load(Ordering::SeqCst),
-        planned.result.summaries.len()
+        committed_summaries.len()
     );
 }
 
