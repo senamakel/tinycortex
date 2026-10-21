@@ -66,9 +66,10 @@ fn list_sync_statuses_at(
     let mut by_provider = std::collections::HashMap::<String, Vec<(i64, i64, bool)>>::new();
     for chunk in chunks {
         let source_id = &chunk.metadata.source_id;
-        let provider = source_id
-            .split_once(':')
-            .map_or_else(|| chunk.metadata.source_kind.as_str().to_owned(), |(name, _)| name.to_owned());
+        let provider = source_id.split_once(':').map_or_else(
+            || chunk.metadata.source_kind.as_str().to_owned(),
+            |(name, _)| name.to_owned(),
+        );
         let created_at_ms = chunk.created_at.timestamp_millis();
         let timestamp_ms = chunk.metadata.timestamp.timestamp_millis();
         let resolved = embedded.contains(&chunk.id)
@@ -92,7 +93,11 @@ fn list_sync_statuses_at(
             .then(|| wave_rows.iter().map(|row| row.0).min())
             .flatten();
         let batch_rows = anchor
-            .map(|anchor| rows.iter().filter(|row| row.0 >= anchor).collect::<Vec<_>>())
+            .map(|anchor| {
+                rows.iter()
+                    .filter(|row| row.0 >= anchor)
+                    .collect::<Vec<_>>()
+            })
             .unwrap_or_default();
         let last_chunk_at_ms = rows.iter().map(|row| row.1).max();
         statuses.push(MemorySyncStatus {
