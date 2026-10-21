@@ -6,17 +6,16 @@
 //!
 //! - [`content`]       — markdown content store (YAML front-matter, atomic
 //!   writes, `content_path`/`content_sha256` pointers, Obsidian-vault paths).
-//! - [`vectors`]       — SQLite-backed packed-`f32` cosine vector DB.
+//! - [`vectors`]       — host-document-backed packed-`f32` cosine vector store.
 //! - [`kv`]            — host-port global + namespace JSON key-value store.
 //! - [`entity_index`] — entity occurrence index over tree nodes.
 //! - [`safety`]       — secret / PII detection guard used by KV writes.
 //!
 //! ## Concurrency contract
 //!
-//! Host-backed stores attach to the `MemoryConfig` storage bundle. The KV
-//! adapter uses optimistic compare-and-swap and does not own a database
-//! connection. Other primitives may retain their own storage implementation
-//! until their ports are migrated.
+//! Persistent collections are supplied by the host through the storage ports;
+//! these domain stores do not open their own database connections. KV writes
+//! use optimistic compare-and-swap.
 
 /// Markdown content store: source-of-truth files with YAML front matter,
 /// atomic writes, and `content_path`/`content_sha256` provenance pointers.
@@ -33,7 +32,7 @@ pub mod safety;
 pub mod store;
 /// Core memory contract types ([`StoreError`], [`MemoryRecord`], etc.).
 pub mod types;
-/// SQLite-backed packed-`f32` cosine vector DB and embedding backends.
+/// Host-document-backed packed-`f32` cosine vector store and embedding backends.
 pub mod vectors;
 
 pub use store::{InMemoryMemoryStore, MemoryStore};

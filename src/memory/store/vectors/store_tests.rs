@@ -4,6 +4,7 @@ use crate::memory::store::vectors::embedding::{
 };
 use serde_json::json;
 use std::sync::Arc;
+use tinystoragedrivers_types::Precondition;
 
 /// A test embedding backend that returns deterministic vectors.
 struct FakeEmbedding {
@@ -59,7 +60,29 @@ impl EmbeddingBackend for MismatchEmbedding {
 }
 
 fn fake_store(dims: usize) -> VectorStore {
-    VectorStore::open_in_memory(Arc::new(FakeEmbedding { dims })).unwrap()
+    fake_store_with_backend(Arc::new(FakeEmbedding { dims }))
+}
+
+fn fake_store_with_backend(backend: Arc<dyn EmbeddingBackend>) -> VectorStore {
+    let config = crate::memory::chunks::test_support::host_config("unused-vector-workspace");
+    std::thread::spawn(move || VectorStore::from_config(&config, backend))
+        .join()
+        .unwrap()
+        .unwrap()
+}
+
+fn put_raw_record(store: &VectorStore, namespace: &str, id: &str, doc: serde_json::Value) {
+    let documents = Arc::clone(&store.documents);
+    let document_id = super::vector_document_id(namespace, id);
+    store
+        .blocking
+        .run(async move {
+            documents
+                .put(super::VECTOR_RECORDS, &document_id, doc, Precondition::None)
+                .await
+        })
+        .unwrap()
+        .unwrap();
 }
 
 // ── vec_to_bytes / bytes_to_vec ─────────────────────────
@@ -70,6 +93,22 @@ fn roundtrip_vec_bytes() {
     let bytes = vec_to_bytes(&original);
     assert_eq!(bytes.len(), original.len() * 4);
     assert_eq!(original, bytes_to_vec(&bytes).unwrap());
+}
+
+#[test]
+fn vector_bytes_preserve_all_f32_bit_patterns() {
+    let original = [f32::from_bits(0x7fc0_1234), f32::INFINITY, -0.0];
+    let decoded = bytes_to_vec(&vec_to_bytes(&original)).unwrap();
+    assert_eq!(
+        decoded
+            .iter()
+            .map(|value| value.to_bits())
+            .collect::<Vec<_>>(),
+        original
+            .iter()
+            .map(|value| value.to_bits())
+            .collect::<Vec<_>>()
+    );
 }
 
 #[test]
@@ -123,35 +162,23 @@ fn cosine_similar_high() {
 // ── VectorStore: open / metadata ────────────────────────
 
 #[test]
-fn open_in_memory_succeeds() {
+fn prepared_host_store_starts_empty() {
     let store = fake_store(3);
     assert_eq!(store.count(None).unwrap(), 0);
 }
 
 #[test]
-fn open_on_disk() {
-    let dir = tempfile::tempdir().unwrap();
-    let db_path = dir.path().join("sub/dir/vectors.db");
-    let store = VectorStore::open(&db_path, Arc::new(FakeEmbedding { dims: 3 })).unwrap();
-    assert_eq!(store.count(None).unwrap(), 0);
-    assert!(db_path.exists());
+fn reopening_prepared_store_with_same_backend_succeeds() {
+    let config = crate::memory::chunks::test_support::host_config("unused-vector-workspace");
+    VectorStore::from_config(&config, Arc::new(FakeEmbedding { dims: 4 })).unwrap();
+    VectorStore::from_config(&config, Arc::new(FakeEmbedding { dims: 4 })).unwrap();
 }
 
 #[test]
-fn open_reopen_same_dims_succeeds() {
-    let dir = tempfile::tempdir().unwrap();
-    let db_path = dir.path().join("v.db");
-    VectorStore::open(&db_path, Arc::new(FakeEmbedding { dims: 4 })).unwrap();
-    // Reopen with same dims — should work.
-    VectorStore::open(&db_path, Arc::new(FakeEmbedding { dims: 4 })).unwrap();
-}
-
-#[test]
-fn open_reopen_different_dims_errors() {
-    let dir = tempfile::tempdir().unwrap();
-    let db_path = dir.path().join("v.db");
-    VectorStore::open(&db_path, Arc::new(FakeEmbedding { dims: 4 })).unwrap();
-    let result = VectorStore::open(&db_path, Arc::new(FakeEmbedding { dims: 8 }));
+fn reopening_prepared_store_with_different_dims_errors() {
+    let config = crate::memory::chunks::test_support::host_config("unused-vector-workspace");
+    VectorStore::from_config(&config, Arc::new(FakeEmbedding { dims: 4 })).unwrap();
+    let result = VectorStore::from_config(&config, Arc::new(FakeEmbedding { dims: 8 }));
     let msg = result.err().expect("should be an error").to_string();
     assert!(msg.contains("dimension mismatch"), "msg: {msg}");
     assert!(msg.contains("4"), "should mention stored dims: {msg}");
@@ -159,24 +186,109 @@ fn open_reopen_different_dims_errors() {
 }
 
 #[test]
-fn open_rejects_corrupt_dimension_metadata() {
-    let dir = tempfile::tempdir().unwrap();
-    let db_path = dir.path().join("v.db");
-    {
-        let store = VectorStore::open(&db_path, Arc::new(FakeEmbedding { dims: 4 })).unwrap();
+fn reopening_prepared_store_with_different_backend_name_and_same_dims_succeeds() {
+    let config = crate::memory::chunks::test_support::host_config("unused-vector-workspace");
+    VectorStore::from_config(&config, Arc::new(FakeEmbedding { dims: 2 })).unwrap();
+    VectorStore::from_config(&config, Arc::new(MismatchEmbedding))
+        .expect("the historical store only guards embedding dimensions");
+}
+
+#[tokio::test]
+async fn legacy_import_conflict_does_not_publish_other_batch_rows() {
+    let store = fake_store(2);
+    store
+        .insert_with_vector_async(
+            "existing",
+            "notes",
+            "current value",
+            &[1.0, 0.0],
+            json!({"current": true}),
+        )
+        .await
+        .unwrap();
+    let source = super::LegacyVectorMetadata {
+        provider_name: "legacy-provider".into(),
+        dimensions: 2,
+    };
+    let record = |id: &str, text: &str| super::LegacyVectorRecord {
+        namespace: "notes".into(),
+        id: id.into(),
+        text: text.into(),
+        dimensions: 2,
+        embedding_le: super::vec_to_bytes(&[0.0, 1.0]),
+        metadata_json: "{}".into(),
+        created_at: 1.0,
+        updated_at: 2.0,
+    };
+
+    let error = store
+        .import_legacy_records(
+            &source,
+            &[record("new", "new value"), record("existing", "old value")],
+        )
+        .await
+        .unwrap_err();
+
+    assert!(error.to_string().contains("conflicts with existing ID"));
+    assert_eq!(store.count_async(None).await.unwrap(), 1);
+    assert_eq!(
         store
-            .conn
-            .lock()
-            .execute(
-                "UPDATE store_meta SET value = 'not-a-number' WHERE key = 'embed_dims'",
-                [],
+            .documents
+            .count(
+                super::VECTOR_METADATA,
+                &tinystoragedrivers_types::Filter::All
             )
-            .unwrap();
-    }
-    let err = VectorStore::open(&db_path, Arc::new(FakeEmbedding { dims: 4 }))
+            .await
+            .unwrap(),
+        1,
+        "failed import must not publish source provenance"
+    );
+}
+
+#[test]
+fn equal_scores_use_a_deterministic_logical_id_tiebreaker() {
+    let store = fake_store(2);
+    store
+        .insert_with_vector("z-id", "ns", "z", &[1.0, 0.0], json!({}))
+        .unwrap();
+    store
+        .insert_with_vector("a-id", "ns", "a", &[1.0, 0.0], json!({}))
+        .unwrap();
+
+    let results = store.search_by_vector("ns", &[1.0, 0.0], 2).unwrap();
+
+    assert_eq!(
+        results
+            .iter()
+            .map(|row| row.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["a-id", "z-id"]
+    );
+}
+
+#[test]
+fn open_rejects_corrupt_dimension_metadata() {
+    let config = crate::memory::chunks::test_support::host_config("unused-vector-workspace");
+    let store = VectorStore::from_config(&config, Arc::new(FakeEmbedding { dims: 4 })).unwrap();
+    let documents = Arc::clone(&store.documents);
+    store
+        .blocking
+        .run(async move {
+            documents
+                .put(
+                    super::VECTOR_METADATA,
+                    super::VECTOR_META_ID,
+                    json!({ "dimensions": "not-a-number" }),
+                    Precondition::None,
+                )
+                .await
+        })
+        .unwrap()
+        .unwrap();
+    let err = VectorStore::from_config(&config, Arc::new(FakeEmbedding { dims: 4 }))
         .err()
         .expect("corrupt metadata must fail closed");
-    assert!(err.to_string().contains("invalid vector store embed_dims"));
+    assert!(err.to_string().contains("invalid type"));
 }
 
 #[test]
@@ -192,16 +304,16 @@ fn insert_with_vector_rejects_wrong_dimensions() {
 #[test]
 fn search_rejects_corrupt_embedding_blob() {
     let store = fake_store(2);
-    store
-        .conn
-        .lock()
-        .execute(
-            "INSERT INTO vectors
-                (id, namespace, text, embedding, metadata, created_at, updated_at)
-             VALUES ('bad', 'ns', 'text', X'0000000000', '{}', 0, 0)",
-            [],
-        )
-        .unwrap();
+    put_raw_record(
+        &store,
+        "ns",
+        "bad",
+        json!({
+            "namespace": "ns", "id": "bad", "text": "text", "dimensions": 2,
+            "embedding_le": [0, 0, 0, 0, 0], "metadata_json": "{}",
+            "created_at": 0.0, "updated_at": 0.0
+        }),
+    );
     assert!(store.search_by_vector("ns", &[1.0, 0.0], 5).is_err());
 }
 
@@ -220,6 +332,47 @@ fn embedding_signature_format_is_stable() {
     );
     let backend = FakeEmbedding { dims: 7 };
     assert_eq!(backend.signature(), "provider=fake;model=fake;dims=7");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn vector_store_uses_the_prepared_host_document_port() {
+    let config = crate::memory::chunks::test_support::host_config("unused-vector-workspace");
+    let store = VectorStore::from_config_async(&config, Arc::new(FakeEmbedding { dims: 2 }))
+        .await
+        .unwrap();
+
+    store
+        .insert_with_vector_async(
+            "host-backed",
+            "notes",
+            "text",
+            &[1.0, 0.0],
+            json!({"source": "test"}),
+        )
+        .await
+        .unwrap();
+
+    let results = store
+        .search_by_vector_async("notes", &[1.0, 0.0], 1)
+        .await
+        .unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].id, "host-backed");
+    assert_eq!(results[0].metadata["source"], "test");
+
+    let stored = config
+        .storage()
+        .unwrap()
+        .documents()
+        .get(
+            super::VECTOR_RECORDS,
+            &super::vector_document_id("notes", "host-backed"),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    let record: super::VectorRecord = serde_json::from_value(stored.doc).unwrap();
+    assert_eq!(record.embedding_le, vec_to_bytes(&[1.0, 0.0]));
 }
 
 #[tokio::test]
@@ -246,9 +399,9 @@ async fn insert_and_count() {
     store.insert("a", "ns1", "hello", json!({})).await.unwrap();
     store.insert("b", "ns1", "world", json!({})).await.unwrap();
     store.insert("c", "ns2", "other", json!({})).await.unwrap();
-    assert_eq!(store.count(Some("ns1")).unwrap(), 2);
-    assert_eq!(store.count(Some("ns2")).unwrap(), 1);
-    assert_eq!(store.count(None).unwrap(), 3);
+    assert_eq!(store.count_async(Some("ns1")).await.unwrap(), 2);
+    assert_eq!(store.count_async(Some("ns2")).await.unwrap(), 1);
+    assert_eq!(store.count_async(None).await.unwrap(), 3);
 }
 
 #[tokio::test]
@@ -262,9 +415,10 @@ async fn insert_upsert_replaces() {
         .insert("a", "ns", "updated", json!({"v": 2}))
         .await
         .unwrap();
-    assert_eq!(store.count(Some("ns")).unwrap(), 1);
+    assert_eq!(store.count_async(Some("ns")).await.unwrap(), 1);
     let results = store
-        .search_by_vector("ns", &text_to_vec("updated", 4), 10)
+        .search_by_vector_async("ns", &text_to_vec("updated", 4), 10)
+        .await
         .unwrap();
     assert_eq!(results[0].text, "updated");
     assert_eq!(results[0].metadata["v"], 2);
@@ -290,19 +444,98 @@ async fn insert_batch_multiple() {
         ("c", "gamma", json!({})),
     ];
     store.insert_batch("ns", &entries).await.unwrap();
-    assert_eq!(store.count(Some("ns")).unwrap(), 3);
+    assert_eq!(store.count_async(Some("ns")).await.unwrap(), 3);
+}
+
+#[tokio::test]
+async fn empty_logical_id_roundtrips_in_empty_namespace() {
+    let store = fake_store(2);
+    store
+        .insert_with_vector_async("", "", "empty identity", &[1.0, 0.0], json!({"kept": true}))
+        .await
+        .unwrap();
+
+    let results = store
+        .search_by_vector_async("", &[1.0, 0.0], 1)
+        .await
+        .unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].id, "");
+    assert_eq!(results[0].namespace, "");
+    assert_eq!(results[0].metadata, json!({"kept": true}));
+    assert!(store.delete_async("", "").await.unwrap());
+    assert!(store
+        .search_by_vector_async("", &[1.0, 0.0], 1)
+        .await
+        .unwrap()
+        .is_empty());
+
+    let imported = LegacyVectorRecord {
+        namespace: "".to_owned(),
+        id: "".to_owned(),
+        text: "imported empty identity".to_owned(),
+        dimensions: 2,
+        embedding_le: vec_to_bytes(&[1.0, 0.0]),
+        metadata_json: "null".to_owned(),
+        created_at: 1.0,
+        updated_at: 2.0,
+    };
+    assert_eq!(
+        store
+            .import_legacy_records(
+                &LegacyVectorMetadata {
+                    provider_name: "legacy".to_owned(),
+                    dimensions: 2,
+                },
+                &[imported],
+            )
+            .await
+            .unwrap(),
+        1
+    );
+    let imported = store
+        .search_by_vector_async("", &[1.0, 0.0], 1)
+        .await
+        .unwrap();
+    assert_eq!(imported.len(), 1);
+    assert_eq!(imported[0].id, "");
+    assert_eq!(imported[0].text, "imported empty identity");
+}
+
+#[tokio::test]
+async fn duplicate_batch_ids_keep_the_last_entry() {
+    let store = fake_store(2);
+    store
+        .insert_batch(
+            "notes",
+            &[
+                ("same", "first", json!({"version": 1})),
+                ("same", "last", json!({"version": 2})),
+            ],
+        )
+        .await
+        .unwrap();
+
+    let result = store
+        .search_by_vector_async("notes", &text_to_vec("last", 2), 1)
+        .await
+        .unwrap();
+    assert_eq!(result.len(), 1);
+    assert_eq!(result[0].id, "same");
+    assert_eq!(result[0].text, "last");
+    assert_eq!(result[0].metadata, json!({"version": 2}));
 }
 
 #[tokio::test]
 async fn insert_batch_empty() {
     let store = fake_store(4);
     store.insert_batch("ns", &[]).await.unwrap();
-    assert_eq!(store.count(None).unwrap(), 0);
+    assert_eq!(store.count_async(None).await.unwrap(), 0);
 }
 
 #[tokio::test]
 async fn insert_batch_mismatch_error() {
-    let store = VectorStore::open_in_memory(Arc::new(MismatchEmbedding)).unwrap();
+    let store = fake_store_with_backend(Arc::new(MismatchEmbedding));
     let entries = vec![("a", "alpha", json!({})), ("b", "beta", json!({}))];
     let err = store.insert_batch("ns", &entries).await.unwrap_err();
     assert!(err.to_string().contains("mismatch"));
@@ -328,6 +561,52 @@ async fn search_returns_ranked_results() {
     let results = store.search("ns", "the quick brown fox", 2).await.unwrap();
     assert_eq!(results.len(), 2);
     assert!(results[0].score >= results[1].score);
+}
+
+#[tokio::test]
+#[ignore = "manual synthetic vector-store scan benchmark"]
+async fn synthetic_scan_benchmark_reports_exact_recall_and_latency() {
+    use std::time::{Duration, Instant};
+
+    const VECTOR_COUNT: usize = 1_000;
+    const DIMENSIONS: usize = 384;
+    const QUERY_COUNT: usize = 100;
+
+    let store = fake_store(DIMENSIONS);
+    let ids = (0..VECTOR_COUNT)
+        .map(|index| format!("synthetic-{index:04}"))
+        .collect::<Vec<_>>();
+    let texts = ids
+        .iter()
+        .map(|id| format!("embedding fixture for {id}"))
+        .collect::<Vec<_>>();
+    let entries = ids
+        .iter()
+        .zip(&texts)
+        .map(|(id, text)| (id.as_str(), text.as_str(), json!({"dataset": "synthetic"})))
+        .collect::<Vec<_>>();
+    store.insert_batch("synthetic", &entries).await.unwrap();
+
+    let mut elapsed = Vec::<Duration>::with_capacity(QUERY_COUNT);
+    let mut exact_hits = 0;
+    for index in 0..QUERY_COUNT {
+        let query = text_to_vec(&texts[index], DIMENSIONS);
+        let started = Instant::now();
+        let results = store
+            .search_by_vector_async("synthetic", &query, 1)
+            .await
+            .unwrap();
+        elapsed.push(started.elapsed());
+        exact_hits += usize::from(results.first().is_some_and(|hit| hit.id == ids[index]));
+    }
+    elapsed.sort_unstable();
+    let percentile = |p: usize| elapsed[(elapsed.len() - 1) * p / 100].as_secs_f64() * 1_000.0;
+    println!(
+        "synthetic vector scan: rows={VECTOR_COUNT} dimensions={DIMENSIONS} queries={QUERY_COUNT} exact_recall@1={exact_hits}/{QUERY_COUNT} p50_ms={:.3} p95_ms={:.3}",
+        percentile(50),
+        percentile(95),
+    );
+    assert_eq!(exact_hits, QUERY_COUNT);
 }
 
 #[tokio::test]
@@ -411,23 +690,16 @@ fn search_by_vector_returns_metadata_of_surviving_rows() {
 #[test]
 fn search_by_vector_falls_back_to_null_on_invalid_metadata() {
     let store = fake_store(3);
-    {
-        let conn = store.conn.lock();
-        conn.execute(
-            "INSERT INTO vectors (id, namespace, text, embedding, metadata, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            rusqlite::params![
-                "bad",
-                "ns",
-                "t",
-                vec_to_bytes(&[1.0, 0.0, 0.0]),
-                "{not valid json",
-                0.0_f64,
-                0.0_f64
-            ],
-        )
-        .unwrap();
-    }
+    put_raw_record(
+        &store,
+        "ns",
+        "bad",
+        json!({
+            "namespace": "ns", "id": "bad", "text": "t", "dimensions": 3,
+            "embedding_le": vec_to_bytes(&[1.0, 0.0, 0.0]),
+            "metadata_json": "{not valid json", "created_at": 0.0, "updated_at": 0.0
+        }),
+    );
 
     let results = store.search_by_vector("ns", &[1.0, 0.0, 0.0], 5).unwrap();
 
