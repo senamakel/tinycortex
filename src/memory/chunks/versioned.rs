@@ -933,6 +933,10 @@ pub(crate) fn list_chunk_snapshot_with_head(
                     None => break,
                 }
             }
+            let implicit_lifecycle = latest
+                .iter()
+                .filter_map(|(id, (_, _, status))| status.clone().map(|status| (id.clone(), status)))
+                .collect::<HashMap<_, _>>();
             let mut ids = HashSet::new();
             ids.extend(latest.keys().cloned());
             ids.extend(legacy.keys().cloned());
@@ -950,7 +954,7 @@ pub(crate) fn list_chunk_snapshot_with_head(
             let mut states =
                 bulk_state_values_at_snapshot(&*documents, &snapshot, &visible, &state_collections)
                     .await?;
-            add_implicit_lifecycle_states(&latest, &mut states);
+            add_implicit_lifecycle_states(&implicit_lifecycle, &mut states);
             let deleted_ids: HashSet<String> = states
                 .get(CHUNK_LIFECYCLE)
                 .into_iter()
@@ -1047,6 +1051,10 @@ pub(crate) async fn list_chunk_snapshot_with_head_async(
                     None => break,
                 }
             }
+            let implicit_lifecycle = latest
+                .iter()
+                .filter_map(|(id, (_, _, status))| status.clone().map(|status| (id.clone(), status)))
+                .collect::<HashMap<_, _>>();
             let mut ids = HashSet::new();
             ids.extend(latest.keys().cloned());
             ids.extend(legacy.keys().cloned());
@@ -1068,7 +1076,7 @@ pub(crate) async fn list_chunk_snapshot_with_head_async(
                 &state_collections,
             )
             .await?;
-            add_implicit_lifecycle_states(&latest, &mut states);
+            add_implicit_lifecycle_states(&implicit_lifecycle, &mut states);
             Ok::<_, tinystoragedrivers_types::StorageError>((chunks, states))
         })
         .await??;
