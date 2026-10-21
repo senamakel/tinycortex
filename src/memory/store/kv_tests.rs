@@ -27,7 +27,7 @@ async fn global_and_namespace_values_roundtrip_without_identity_collisions() {
         kv.get_namespace_async("global", "same").await.unwrap(),
         Some(json!(7))
     );
-    assert!(kv.delete_global_async("missing").await.unwrap() == false);
+    assert!(!kv.delete_global_async("missing").await.unwrap());
 }
 
 #[tokio::test]
