@@ -1481,9 +1481,12 @@ async fn state_change_matches_at(
     let mut actual =
         read_state_at(documents, snapshot, &condition.collection, &condition.key).await?;
     if actual.is_none() && condition.collection == CHUNK_LIFECYCLE {
-        actual = implicit_chunk_lifecycle_status(documents, snapshot, &condition.key)
+        let implicit = implicit_chunk_lifecycle_status(documents, snapshot, &condition.key)
             .await?
             .map(|status| serde_json::json!({"status": status}));
+        if implicit.is_some() {
+            return Ok(condition.value == implicit);
+        }
     }
     Ok(actual == condition.value)
 }
