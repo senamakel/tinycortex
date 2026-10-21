@@ -57,8 +57,7 @@ async fn duplicate_channel_event_is_idempotent() {
     let store = ConversationStore::open(&config).unwrap();
     let subscriber = ConversationPersistenceSubscriber::new(&config).unwrap();
     let received = event(workspace.path().to_path_buf(), "hello");
-    subscriber.handle(&received).await;
-    subscriber.handle(&received).await;
+    tokio::join!(subscriber.handle(&received), subscriber.handle(&received));
     let threads = store.list_threads_async().await.unwrap();
     let messages = store.get_messages_async(&threads[0].id).await.unwrap();
     assert_eq!(messages.len(), 1);

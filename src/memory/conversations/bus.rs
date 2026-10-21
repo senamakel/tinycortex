@@ -1,5 +1,5 @@
 //! Event-bus subscriber that mirrors inbound channel messages into the
-//! workspace-backed conversation store, so non-web channels (Slack, Telegram,
+//! host-backed conversation store, so non-web channels (Slack, Telegram,
 //! etc.) persist alongside UI-driven threads.
 //!
 //! ## What was abstracted from OpenHuman
@@ -272,12 +272,9 @@ struct ChannelTurnDescriptor<'a> {
 /// create-or-touch the channel thread, then append the message if it hasn't
 /// already been persisted.
 ///
-/// Idempotent per `(role, message_id)`: the dedup check reads back the
-/// thread's full message list and skips the append if `{role}:{message_id}`
-/// is already present, so redelivery of the same event is a no-op. That
-/// dedup check re-reads every message in the thread on every call — cheap for
-/// short-lived channel threads, O(n) per turn (O(n²) over a thread's
-/// lifetime) for long-running ones.
+/// Idempotent per `(role, message_id)`: the owner stream CAS checks the
+/// thread's current message IDs and appends only if this event has not already
+/// been committed, so concurrent redelivery also becomes a no-op.
 ///
 async fn persist_channel_turn(
     store: &super::ConversationStore,
@@ -328,17 +325,8 @@ async fn persist_channel_turn(
         .await?;
 
     let persisted_message_id = format!("{}:{}", descriptor.role, descriptor.message_id);
-    if store
-        .get_messages_async(&thread_id)
-        .await?
-        .iter()
-        .any(|message| message.id == persisted_message_id)
-    {
-        return Ok(());
-    }
-
     store
-        .append_message_async(
+        .append_message_idempotent_async(
             &thread_id,
             ConversationMessage {
                 id: persisted_message_id,

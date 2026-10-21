@@ -420,12 +420,33 @@ impl ConversationStore {
         thread_id: &str,
         message: ConversationMessage,
     ) -> Result<ConversationMessage, String> {
+        self.append_message_with_idempotency(thread_id, message, false)
+            .await
+    }
+
+    /// Append a message once per ID, for event sources that redeliver stable
+    /// external message IDs such as channel provider IDs.
+    pub async fn append_message_idempotent_async(
+        &self,
+        thread_id: &str,
+        message: ConversationMessage,
+    ) -> Result<ConversationMessage, String> {
+        self.append_message_with_idempotency(thread_id, message, true)
+            .await
+    }
+
+    async fn append_message_with_idempotency(
+        &self,
+        thread_id: &str,
+        message: ConversationMessage,
+        dedupe_any_id: bool,
+    ) -> Result<ConversationMessage, String> {
         for _ in 0..MAX_WRITE_ATTEMPTS {
             let before = self.snapshot(thread_id).await?;
             if before.thread.is_none() {
                 return Err(format!("thread {thread_id} not found"));
             }
-            if is_deterministic_message_id(&message.id) {
+            if dedupe_any_id || is_deterministic_message_id(&message.id) {
                 if let Some(existing) = before.messages.iter().find(|item| item.id == message.id) {
                     return Ok(existing.clone());
                 }
@@ -909,6 +930,18 @@ pub fn append_message(
     message: ConversationMessage,
 ) -> Result<ConversationMessage, String> {
     open_error(config)?.append_message(thread_id, message)
+}
+
+/// Append one externally identified message at most once per thread.
+pub async fn append_message_idempotent_async(
+    config: &crate::memory::config::MemoryConfig,
+    thread_id: &str,
+    message: ConversationMessage,
+) -> Result<ConversationMessage, String> {
+    let store = open_error(config)?;
+    store
+        .append_message_idempotent_async(thread_id, message)
+        .await
 }
 
 pub fn update_thread_title(
