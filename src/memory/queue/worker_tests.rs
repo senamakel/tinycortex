@@ -411,7 +411,7 @@ fn is_host_io_error_matches_family_code_context_text() {
     // downcast must still find it through the anyhow context chain.
     let wrapped = anyhow::Error::from(std::io::Error::from_raw_os_error(5))
         .context("Failed to create memory_tree dir: /home/x/workspace/memory_tree")
-        .context("with_connection closure failed");
+        .context("storage operation failed");
     assert!(is_host_io_error(&wrapped));
     // Text fallback: no io::Error to downcast (flattened to a plain string), the
     // os-error-number anchor still classifies it.
