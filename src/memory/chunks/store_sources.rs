@@ -8,7 +8,8 @@ use chrono::Utc;
 use super::collections::{CHUNK_LIFECYCLE, INGESTED_SOURCES};
 use super::types::SourceKind;
 use super::versioned::{
-    insert_state_changes_if_absent, list_state, read_state, write_state, StateChange,
+    insert_state_changes_if_absent, list_chunk_snapshot, list_state, read_state,
+    read_chunk_lifecycle_status as read_implicit_lifecycle_status, write_state, StateChange,
 };
 use crate::memory::config::MemoryConfig;
 
@@ -44,10 +45,7 @@ pub fn set_chunk_lifecycle_status(
 /// # Errors
 /// Returns `Err` only if the underlying query fails.
 pub fn get_chunk_lifecycle_status(config: &MemoryConfig, chunk_id: &str) -> Result<Option<String>> {
-    read_state(config, CHUNK_LIFECYCLE, chunk_id)?
-        .map(|value| serde_json::from_value(value["status"].clone()))
-        .transpose()
-        .map_err(anyhow::Error::from)
+    read_implicit_lifecycle_status(config, chunk_id)
 }
 
 /// Count chunks currently sitting at a given lifecycle status. Matches
@@ -57,8 +55,11 @@ pub fn get_chunk_lifecycle_status(config: &MemoryConfig, chunk_id: &str) -> Resu
 /// # Errors
 /// Returns `Err` only if the underlying query fails.
 pub fn count_chunks_by_lifecycle_status(config: &MemoryConfig, status: &str) -> Result<u64> {
-    Ok(list_state(config, CHUNK_LIFECYCLE)?
-        .iter()
+    let (_, states) = list_chunk_snapshot(config, &[CHUNK_LIFECYCLE])?;
+    Ok(states
+        .get(CHUNK_LIFECYCLE)
+        .into_iter()
+        .flatten()
         .filter(|(_, value)| value["status"] == status)
         .count() as u64)
 }

@@ -971,6 +971,25 @@ pub(crate) fn list_chunk_snapshot_with_head(
         .map_err(anyhow::Error::from)
 }
 
+fn add_implicit_lifecycle_states(
+    defaults: &HashMap<String, String>,
+    states: &mut HashMap<String, Vec<(String, Value)>>,
+) {
+    let lifecycle = states.entry(CHUNK_LIFECYCLE.to_owned()).or_default();
+    let explicit = lifecycle
+        .iter()
+        .map(|(key, _)| key.as_str())
+        .collect::<HashSet<_>>();
+    lifecycle.extend(defaults.iter().filter_map(|(key, status)| {
+        (!explicit.contains(key.as_str())).then(|| {
+            (
+                key.clone(),
+                serde_json::json!({"status": status}),
+            )
+        })
+    }));
+}
+
 /// Async materialization of a chunk and state snapshot for current-thread
 /// Tokio callers. The returned head is the strict precondition for a later
 /// multi-record delete or cascade.
@@ -1204,6 +1223,75 @@ async fn read_chunk_at(
         .transpose()
         .map_err(tinystoragedrivers_types::StorageError::from)?;
     Ok(legacy)
+}
+
+pub(crate) fn read_chunk_lifecycle_status(
+    config: &MemoryConfig,
+    chunk_id: &str,
+) -> Result<Option<String>> {
+    let snapshot = capture_head(config)?;
+    let documents = config.storage()?.documents().clone();
+    let chunk_id = chunk_id.to_owned();
+    config
+        .storage_blocking()?
+        .run(async move {
+            let explicit = read_state_at(&*documents, &snapshot, CHUNK_LIFECYCLE, &chunk_id).await?;
+            if let Some(value) = explicit {
+                return Ok(value.get("status").and_then(Value::as_str).map(str::to_owned));
+            }
+            implicit_chunk_lifecycle_status(&*documents, &snapshot, &chunk_id).await
+        })?
+        .map_err(anyhow::Error::from)
+}
+
+async fn implicit_chunk_lifecycle_status(
+    documents: &dyn tinystoragedrivers_api::DocumentStore,
+    snapshot: &HeadSnapshot,
+    logical_id: &str,
+) -> tinystoragedrivers_types::Result<Option<String>> {
+    let mut query = Query::filter(Filter::eq("logical_id", logical_id))
+        .sort(Sort::desc("revision"))
+        .limit(PAGE_SIZE);
+    loop {
+        let page = documents.query(CHUNK_VERSIONS, &query).await?;
+        for row in page.items {
+            let version: ChunkVersion = serde_json::from_value(row.doc)
+                .map_err(tinystoragedrivers_types::StorageError::from)?;
+            if version.logical_id != logical_id
+                || version.chunk.id != logical_id
+                || version_id(logical_id, &version.operation_id) != row.id
+            {
+                continue;
+            }
+            let Some(manifest) = manifest_at_revision(
+                documents,
+                &version.operation_id,
+                version.revision,
+            )
+            .await?
+            else {
+                continue;
+            };
+            if manifest.revision <= snapshot.revision
+                && manifest.default_lifecycle_status.is_some()
+                && operation_contains_chunk_write(
+                    documents,
+                    snapshot,
+                    &version.operation_id,
+                    version.revision,
+                    &row.id,
+                )
+                .await?
+            {
+                return Ok(manifest.default_lifecycle_status);
+            }
+        }
+        match page.next {
+            Some(cursor) => query = query.clone().after(cursor),
+            None => break,
+        }
+    }
+    Ok(None)
 }
 
 pub(crate) fn read_state(
