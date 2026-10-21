@@ -197,6 +197,10 @@ name = "composio_sync_mock"
 required-features = ["sync"]
 
 [[test]]
+name = "legacy_people_import"
+required-features = ["people"]
+
+[[test]]
 name = "composio_sync_live"
 required-features = ["sync"]
 
