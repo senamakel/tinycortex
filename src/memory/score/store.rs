@@ -222,15 +222,22 @@ pub async fn plan_score_persistence_for_queue(
         staged.expected.len() == staged.changes.len(),
         "score planner produced mismatched preconditions and changes"
     );
+    let mut expected_by_key = HashMap::with_capacity(staged.expected.len());
+    for expected in staged.expected {
+        let identity = (expected.collection.clone(), expected.key.clone());
+        anyhow::ensure!(
+            expected_by_key.insert(identity, expected.value).is_none(),
+            "score planner produced duplicate precondition identity"
+        );
+    }
     let mut mutations = staged
-        .expected
+        .changes
         .into_iter()
-        .zip(staged.changes)
-        .map(|(expected, change)| {
-            anyhow::ensure!(
-                expected.collection == change.collection && expected.key == change.key,
-                "score planner produced mismatched mutation identity"
-            );
+        .map(|change| {
+            let identity = (change.collection.clone(), change.key.clone());
+            let expected = expected_by_key
+                .remove(&identity)
+                .context("score planner produced a change without a matching precondition")?;
             let collection = match change.collection.as_str() {
                 SCORES => JobStateCollection::ChunkScores,
                 ENTITY_INDEX => JobStateCollection::EntityIndex,
@@ -239,11 +246,15 @@ pub async fn plan_score_persistence_for_queue(
             Ok(JobMutation {
                 collection,
                 key: change.key,
-                expected: expected.value,
+                expected,
                 value: change.value,
             })
         })
         .collect::<Result<Vec<_>>>()?;
+    anyhow::ensure!(
+        expected_by_key.is_empty(),
+        "score planner produced a precondition without a matching change"
+    );
     // Persisting the unchanged lifecycle value is a same-head existence guard:
     // a concurrent deletion cannot let a stale extraction publish score or
     // entity state after the chunk has been tombstoned.

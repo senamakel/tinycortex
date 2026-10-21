@@ -143,7 +143,18 @@ async fn queue_score_planner_refuses_missing_or_deleted_chunks() {
     upsert_chunks_async(&cfg, &[sample_chunk(&row.chunk_id)])
         .await
         .unwrap();
-    crate::memory::chunks::set_chunk_lifecycle_status(&cfg, &row.chunk_id, "deleted").unwrap();
+    crate::memory::chunks::versioned::commit_if_state_matches_async(
+        &cfg,
+        &[],
+        &[],
+        &[crate::memory::chunks::versioned::StateChange {
+            collection: crate::memory::chunks::collections::CHUNK_LIFECYCLE.to_owned(),
+            key: row.chunk_id.clone(),
+            value: Some(serde_json::json!({ "status": "deleted" })),
+        }],
+    )
+    .await
+    .unwrap();
     assert!(
         plan_score_persistence_for_queue(&cfg, &result, 123, Some("source"))
             .await
