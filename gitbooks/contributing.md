@@ -12,14 +12,14 @@ TinyCortex is a single root-level Rust library crate. There is no hosted service
 
 You need a stable Rust toolchain with Rust 2021 edition support. Install via [rustup](https://rustup.rs/) and confirm `cargo` is on your `PATH`.
 
-The crate pulls in one native dependency by default, so a working C toolchain is required for the first build:
+Legacy-import integration tests build bundled SQLite, so a working C toolchain is required to run those tests. Normal library builds do not compile SQLite:
 
 | Dependency | When | Why it needs a native build |
 | --- | --- | --- |
-| `rusqlite` (with the `bundled` feature) | always | compiles a vendored SQLite from C; no system SQLite needed |
+| `rusqlite` (with the `bundled` feature) | legacy-import integration tests only | compiles a vendored SQLite from C; no system SQLite needed |
 | `git2` | only with the `git-diff` feature | links against libgit2 for the git-backed [Diff Layer](diff-layer.md) |
 
-Because `rusqlite` is configured with `bundled`, you do **not** need a system SQLite install — but you do need a C compiler (`cc`/clang) available for the bundled build. `git2` is **optional and off by default**; a plain `cargo build` never compiles it. The full dependency set is declared in `Cargo.toml` at the repo root.
+Because test-only `rusqlite` is configured with `bundled`, you do **not** need a system SQLite install — but you do need a C compiler (`cc`/clang) to run legacy-import integration tests. Ordinary library builds do not compile SQLite. `git2` is **optional and off by default**; a plain `cargo build` never compiles it. The full dependency set is declared in `Cargo.toml` at the repo root.
 
 ### Cargo features
 

@@ -24,7 +24,7 @@ By participating in this project, you agree to be respectful and constructive. W
    cd tinycortex
    ```
 
-2. **Set up your environment** — you need a stable Rust toolchain ([rustup](https://rustup.rs/)) and a C compiler (`rusqlite` builds a bundled SQLite; no system SQLite needed). Then:
+2. **Set up your environment** — you need a stable Rust toolchain ([rustup](https://rustup.rs/)). The legacy-import integration tests use `rusqlite` with bundled SQLite and need a C compiler; ordinary library builds do not compile SQLite. Then:
 
    ```bash
    cargo check                  # fast validation
