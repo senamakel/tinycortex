@@ -2,6 +2,7 @@
 
 use std::sync::Arc;
 
+use anyhow::Context;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use tinystoragedrivers_types::{Capability, ErrorKind};
@@ -114,7 +115,11 @@ pub async fn import_legacy_audit_entries_async(
         .collect::<Result<Vec<_>, _>>()?;
 
     for _ in 0..IMPORT_RETRIES {
-        let existing = read_legacy_records(&*streams).await?;
+        // Capture the append position before reading. Rows below this tail are
+        // immutable, and the final conditional append rejects any writer that
+        // advances it while reconciliation is in progress.
+        let expected = streams.len(LEGACY_AUDIT_STREAM).await?;
+        let existing = read_legacy_import_records(&*streams, expected).await?;
         let for_source = existing
             .iter()
             .filter(|record| record.source_id == source_id)
@@ -131,7 +136,6 @@ pub async fn import_legacy_audit_entries_async(
             return Ok(());
         }
 
-        let expected = streams.len(LEGACY_AUDIT_STREAM).await?;
         match streams
             .append_batch_if_offset(LEGACY_AUDIT_STREAM, expected, values.clone())
             .await
@@ -184,6 +188,21 @@ async fn read_legacy_records(
     Ok(records)
 }
 
+async fn read_legacy_import_records(
+    streams: &dyn tinystoragedrivers_api::StreamStore,
+    captured_tail: u64,
+) -> anyhow::Result<Vec<LegacyAuditRecord>> {
+    read_stream_through(streams, LEGACY_AUDIT_STREAM, captured_tail)
+        .await?
+        .into_iter()
+        .enumerate()
+        .map(|(offset, value)| {
+            serde_json::from_value::<LegacyAuditRecord>(value)
+                .with_context(|| format!("malformed legacy audit import record at offset {offset}"))
+        })
+        .collect()
+}
+
 async fn read_live_entries(
     streams: &dyn tinystoragedrivers_api::StreamStore,
 ) -> anyhow::Result<Vec<SyncAuditEntry>> {
@@ -215,6 +234,34 @@ async fn read_stream(
         for record in page {
             offset = record.offset.saturating_add(1);
             values.push(record.value);
+        }
+    }
+    Ok(values)
+}
+
+async fn read_stream_through(
+    streams: &dyn tinystoragedrivers_api::StreamStore,
+    name: &str,
+    end: u64,
+) -> anyhow::Result<Vec<serde_json::Value>> {
+    let mut offset = 0_u64;
+    let mut values = Vec::new();
+    while offset < end {
+        let remaining = usize::try_from(end - offset).unwrap_or(usize::MAX);
+        let page = streams
+            .read_window(name, offset, remaining.min(512))
+            .await?;
+        anyhow::ensure!(
+            !page.is_empty(),
+            "audit stream ended before its reported length"
+        );
+        for record in page {
+            anyhow::ensure!(
+                record.offset == offset && record.offset < end,
+                "audit stream returned an unexpected offset while reading a captured tail"
+            );
+            values.push(record.value);
+            offset += 1;
         }
     }
     Ok(values)
