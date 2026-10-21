@@ -485,6 +485,52 @@ async fn search_returns_ranked_results() {
 }
 
 #[tokio::test]
+#[ignore = "manual synthetic vector-store scan benchmark"]
+async fn synthetic_scan_benchmark_reports_exact_recall_and_latency() {
+    use std::time::{Duration, Instant};
+
+    const VECTOR_COUNT: usize = 1_000;
+    const DIMENSIONS: usize = 384;
+    const QUERY_COUNT: usize = 100;
+
+    let store = fake_store(DIMENSIONS);
+    let ids = (0..VECTOR_COUNT)
+        .map(|index| format!("synthetic-{index:04}"))
+        .collect::<Vec<_>>();
+    let texts = ids
+        .iter()
+        .map(|id| format!("embedding fixture for {id}"))
+        .collect::<Vec<_>>();
+    let entries = ids
+        .iter()
+        .zip(&texts)
+        .map(|(id, text)| (id.as_str(), text.as_str(), json!({"dataset": "synthetic"})))
+        .collect::<Vec<_>>();
+    store.insert_batch("synthetic", &entries).await.unwrap();
+
+    let mut elapsed = Vec::<Duration>::with_capacity(QUERY_COUNT);
+    let mut exact_hits = 0;
+    for index in 0..QUERY_COUNT {
+        let query = text_to_vec(&texts[index], DIMENSIONS);
+        let started = Instant::now();
+        let results = store
+            .search_by_vector_async("synthetic", &query, 1)
+            .await
+            .unwrap();
+        elapsed.push(started.elapsed());
+        exact_hits += usize::from(results.first().is_some_and(|hit| hit.id == ids[index]));
+    }
+    elapsed.sort_unstable();
+    let percentile = |p: usize| elapsed[(elapsed.len() - 1) * p / 100].as_secs_f64() * 1_000.0;
+    println!(
+        "synthetic vector scan: rows={VECTOR_COUNT} dimensions={DIMENSIONS} queries={QUERY_COUNT} exact_recall@1={exact_hits}/{QUERY_COUNT} p50_ms={:.3} p95_ms={:.3}",
+        percentile(50),
+        percentile(95),
+    );
+    assert_eq!(exact_hits, QUERY_COUNT);
+}
+
+#[tokio::test]
 async fn search_respects_limit() {
     let store = fake_store(4);
     for i in 0..10 {
