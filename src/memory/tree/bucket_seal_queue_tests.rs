@@ -111,7 +111,7 @@ impl QueueDelegates for SealDelegate {
         &self,
         _: &crate::memory::config::MemoryConfig,
         _: &SealDocumentPayload,
-    ) -> Result<DelegateOutput<()>> {
+    ) -> Result<DelegateOutput<crate::memory::tree::DocumentSealPlanResult>> {
         bail!("not a document seal job")
     }
 

@@ -935,7 +935,7 @@ pub(crate) async fn list_chunk_snapshot_with_head_async(
         state_collections.push(CHUNK_LIFECYCLE.to_owned());
     }
     let read_snapshot = snapshot.clone();
-    let (mut chunks, mut states) = config
+    let (mut chunks, states) = config
         .storage_blocking()?
         .run_async(async move {
             let manifests = load_operation_manifests(&*documents).await?;

@@ -148,6 +148,98 @@ fn deleting_a_chunk_tombstones_lifecycle_and_removes_versioned_sidecars() {
         .is_empty());
 }
 
+#[test]
+fn purge_removes_tree_gate_and_queue_state_when_there_are_no_chunks() {
+    let (_tmp, cfg) = test_config();
+    let source_id = "purge-empty-source";
+    assert!(super::claim_source_ingest(&cfg, SourceKind::Chat, source_id, 123).unwrap());
+    super::versioned::write_state(
+        &cfg,
+        super::versioned::StateChange {
+            collection: super::collections::SUMMARIES.into(),
+            key: "summary:orphan-without-chunk".into(),
+            value: Some(serde_json::json!({"id":"orphan-without-chunk"})),
+        },
+    )
+    .unwrap();
+    let job_id = crate::memory::queue::store::enqueue(
+        &cfg,
+        &crate::memory::queue::NewJob {
+            id: Some("purge-empty-job".into()),
+            kind: crate::memory::queue::JobKind::ExtractChunk,
+            payload_json: "{}".into(),
+            dedupe_key: None,
+            available_at_ms: None,
+            max_attempts: None,
+        },
+    )
+    .unwrap()
+    .expect("new job is persisted");
+
+    assert_eq!(count_chunks(&cfg).unwrap(), 0);
+    assert_eq!(purge_all(&cfg).unwrap(), 3);
+    assert!(
+        super::versioned::list_state(&cfg, super::collections::SUMMARIES)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(!is_source_ingested(&cfg, SourceKind::Chat, source_id).unwrap());
+    assert!(crate::memory::queue::store::get_job(&cfg, &job_id)
+        .unwrap()
+        .is_none());
+    assert_eq!(purge_all(&cfg).unwrap(), 0);
+}
+
+#[test]
+fn enqueue_advancing_the_head_invalidates_a_captured_purge_snapshot() {
+    let (_tmp, cfg) = test_config();
+    let collection = super::collections::SUMMARIES;
+    let change = super::versioned::StateChange {
+        collection: collection.into(),
+        key: "summary:before-enqueue".into(),
+        value: Some(serde_json::json!({"id":"before-enqueue"})),
+    };
+    super::versioned::write_state(&cfg, change.clone()).unwrap();
+    let snapshot = super::versioned::capture_head(&cfg).unwrap();
+    crate::memory::queue::store::enqueue(
+        &cfg,
+        &crate::memory::queue::NewJob {
+            id: Some("purge-concurrent-enqueue".into()),
+            kind: crate::memory::queue::JobKind::ExtractChunk,
+            payload_json: "{}".into(),
+            dedupe_key: None,
+            available_at_ms: None,
+            max_attempts: None,
+        },
+    )
+    .unwrap();
+
+    let committed = super::versioned::commit_if_state_matches_at_snapshot(
+        &cfg,
+        &snapshot,
+        std::slice::from_ref(&change),
+        &[],
+        &[super::versioned::StateChange {
+            value: None,
+            ..change.clone()
+        }],
+    )
+    .unwrap();
+
+    assert!(
+        !committed,
+        "new queue intent must invalidate the old purge head"
+    );
+    assert_eq!(
+        super::versioned::list_state(&cfg, collection)
+            .unwrap()
+            .len(),
+        1,
+        "a stale purge snapshot must not partially clear tree state"
+    );
+    assert_eq!(purge_all(&cfg).unwrap(), 2);
+}
+
 /// Seed one row in every table `purge_all` empties, so a table name that does
 /// not exist in the schema fails the test rather than passing silently.
 fn seed_full_tier(cfg: &MemoryConfig, chunk: &Chunk) {

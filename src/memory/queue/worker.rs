@@ -139,7 +139,7 @@ async fn run_once_with_gate(
     let result = handlers::plan_job(config, &job, delegates).await;
     drop(permit);
 
-    settle_planned_job_async(config, &job, result).await?;
+    settle_planned_job_async(config, &job, result, delegates).await?;
     Ok(true)
 }
 
@@ -159,6 +159,7 @@ fn settle_job(config: &MemoryConfig, job: &Job, result: Result<JobOutcome>) -> R
             follow_ups: Vec::new(),
             expected: Vec::new(),
             mutations: Vec::new(),
+            document_projection: None,
         }),
     )
 }
@@ -174,6 +175,7 @@ fn settle_planned_job(
             follow_ups,
             expected,
             mutations,
+            document_projection,
         }) => {
             let arms_reembed = follow_ups
                 .iter()
@@ -189,6 +191,24 @@ fn settle_planned_job(
                 set_backfill_in_progress(arms_reembed);
             } else if committed && arms_reembed {
                 set_backfill_in_progress(true);
+            }
+
+            if committed {
+                if let Some(projection) = document_projection {
+                    if let Err(error) = delegates
+                        .document_summaries_committed(
+                            config,
+                            &projection.tree_id,
+                            &projection.summaries,
+                        )
+                        .await
+                    {
+                        log::error!(
+                            "document summary projection failed after durable settlement for tree {}: {error:#}",
+                            projection.tree_id
+                        );
+                    }
+                }
             }
 
             // A same-level seal enqueue can be suppressed while this row is
@@ -276,6 +296,7 @@ async fn settle_planned_job_async(
     config: &MemoryConfig,
     job: &Job,
     result: Result<handlers::JobPlan>,
+    delegates: &dyn QueueDelegates,
 ) -> Result<()> {
     match result {
         Ok(handlers::JobPlan {
@@ -283,6 +304,7 @@ async fn settle_planned_job_async(
             follow_ups,
             expected,
             mutations,
+            document_projection,
         }) => {
             let arms_reembed = follow_ups
                 .iter()
@@ -299,6 +321,23 @@ async fn settle_planned_job_async(
                 set_backfill_in_progress(arms_reembed);
             } else if committed && arms_reembed {
                 set_backfill_in_progress(true);
+            }
+            if committed {
+                if let Some(projection) = document_projection {
+                    if let Err(error) = delegates
+                        .document_summaries_committed(
+                            config,
+                            &projection.tree_id,
+                            &projection.summaries,
+                        )
+                        .await
+                    {
+                        log::error!(
+                            "document summary projection failed after durable settlement for tree {}: {error:#}",
+                            projection.tree_id
+                        );
+                    }
+                }
             }
             // Post-seal rechecks are intentionally kept out of this async
             // path until the tree store exposes its owner-state async read.

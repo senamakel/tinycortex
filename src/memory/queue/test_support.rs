@@ -140,11 +140,16 @@ impl QueueDelegates for RecordingDelegates {
     async fn seal_document(
         &self,
         _config: &MemoryConfig,
-        _payload: &SealDocumentPayload,
-    ) -> Result<DelegateOutput<()>> {
+        payload: &SealDocumentPayload,
+    ) -> Result<DelegateOutput<crate::memory::tree::DocumentSealPlanResult>> {
         self.counts.seal_document.fetch_add(1, Ordering::Relaxed);
         Ok(DelegateOutput {
-            result: (),
+            result: crate::memory::tree::DocumentSealPlanResult {
+                tree_id: payload.tree_scope.clone(),
+                root_id: String::new(),
+                summaries: Vec::new(),
+                follow_ups: Vec::new(),
+            },
             mutations: self.document_mutations.clone(),
         })
     }

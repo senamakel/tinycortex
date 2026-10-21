@@ -49,6 +49,7 @@ pub use bucket_seal::{
     SealLevelResult, MERGE_LEVEL_BASE,
 };
 pub use direct_ingest::{ingest_summary, SummaryIngestInput, SummaryIngestOutcome};
+pub use document_seal::{plan_document_subtree_for_queue, DocumentSealPlanResult};
 pub use factory::{TreeFactory, TreeProfile, GLOBAL_SCOPE};
 pub use flavoured::{
     compile_flavoured_root, compile_flavoured_root_async, flavoured_root_abs_path,

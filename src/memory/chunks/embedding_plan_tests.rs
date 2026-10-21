@@ -51,7 +51,7 @@ impl QueueDelegates for ReembedDelegate {
         &self,
         _: &crate::memory::config::MemoryConfig,
         _: &SealDocumentPayload,
-    ) -> Result<DelegateOutput<()>> {
+    ) -> Result<DelegateOutput<crate::memory::tree::DocumentSealPlanResult>> {
         bail!("unexpected document seal")
     }
 

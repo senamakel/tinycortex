@@ -19,6 +19,8 @@ use crate::memory::config::MemoryConfig;
 /// queue worker commits the job lease and these mutations together.
 #[derive(Clone, Debug)]
 pub struct DocumentSealPlanResult {
+    /// Tree that will own the projected summaries.
+    pub tree_id: String,
     /// Root summary for this document version.
     pub root_id: String,
     /// Newly-created summaries, in child-before-parent order.
@@ -191,6 +193,7 @@ pub async fn plan_document_subtree_for_queue(
     };
     let root_id = doc_root.id.clone();
     let result = DocumentSealPlanResult {
+        tree_id: tree.id.clone(),
         root_id,
         summaries,
         follow_ups,

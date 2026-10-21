@@ -124,6 +124,8 @@ pub enum JobStateCollection {
     Trees,
     /// Sealed tree summaries.
     Summaries,
+    /// Per-signature summary vectors.
+    SummaryEmbeddings,
     /// Content-addressed summary body pointers.
     SummaryContentPointers,
     /// Mutable tree buffers.
@@ -147,6 +149,7 @@ impl JobStateCollection {
             Self::ChunkScores => SCORES,
             Self::Trees => TREES,
             Self::Summaries => SUMMARIES,
+            Self::SummaryEmbeddings => crate::memory::chunks::collections::SUMMARY_EMBEDDINGS,
             Self::SummaryContentPointers => SUMMARY_CONTENT_POINTERS,
             Self::TreeBuffers => BUFFERS,
             Self::ChunkEmbeddings => CHUNK_EMBEDDINGS,
@@ -245,7 +248,20 @@ pub trait QueueDelegates: Send + Sync {
         &self,
         config: &MemoryConfig,
         payload: &SealDocumentPayload,
-    ) -> Result<DelegateOutput<()>>;
+    ) -> Result<DelegateOutput<crate::memory::tree::DocumentSealPlanResult>>;
+
+    /// Project committed document summaries into a host-owned mirror. Called
+    /// only after queue receipt and domain state commit successfully together.
+    /// A projection error is logged separately and never retries committed
+    /// inference or owner mutations.
+    async fn document_summaries_committed(
+        &self,
+        _config: &MemoryConfig,
+        _tree_id: &str,
+        _summaries: &[crate::memory::tree::SummaryNode],
+    ) -> Result<()> {
+        Ok(())
+    }
 
     /// Embed one bounded re-embed batch at `signature` and return its mutations.
     async fn reembed_batch(
@@ -268,6 +284,12 @@ pub(crate) struct JobPlan {
     pub follow_ups: Vec<NewJob>,
     pub expected: Vec<StateChange>,
     pub mutations: Vec<StateChange>,
+    pub document_projection: Option<DocumentProjection>,
+}
+
+pub(crate) struct DocumentProjection {
+    pub tree_id: String,
+    pub summaries: Vec<crate::memory::tree::SummaryNode>,
 }
 
 impl JobPlan {
@@ -277,6 +299,7 @@ impl JobPlan {
             follow_ups,
             expected: Vec::new(),
             mutations: Vec::new(),
+            document_projection: None,
         }
     }
 }
@@ -380,6 +403,7 @@ async fn handle_extract(
         follow_ups,
         expected,
         mutations,
+        document_projection: None,
     })
 }
 
@@ -417,6 +441,7 @@ async fn handle_append_buffer(
         follow_ups,
         expected,
         mutations,
+        document_projection: None,
     })
 }
 
@@ -487,6 +512,7 @@ async fn handle_seal_document(
         return Ok(JobPlan::done(Vec::new()));
     }
     let output = delegates.seal_document(config, &payload).await?;
+    let result = output.result;
     let (expected, mutations): (Vec<_>, Vec<_>) = output
         .mutations
         .into_iter()
@@ -494,9 +520,13 @@ async fn handle_seal_document(
         .unzip();
     Ok(JobPlan {
         outcome: JobOutcome::Done,
-        follow_ups: Vec::new(),
+        follow_ups: result.follow_ups.clone(),
         expected,
         mutations,
+        document_projection: Some(DocumentProjection {
+            tree_id: result.tree_id,
+            summaries: result.summaries,
+        }),
     })
 }
 
@@ -523,6 +553,7 @@ async fn handle_reembed_backfill(
         follow_ups: Vec::new(),
         expected,
         mutations,
+        document_projection: None,
     };
     match output.result {
         ReembedProgress::Wrote {
