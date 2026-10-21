@@ -5,16 +5,15 @@ use super::embeddings::{active_embedding_dims, embedding_to_blob};
 use super::types::{chunk_id, Chunk, Metadata, SourceKind, SourceRef, StagedChunk};
 use super::{
     clear_chunk_reembed_skipped, clear_reembed_skipped_for_signature, content_root, count_chunks,
-    count_raw_paths_ingested_with_prefix,
-    delete_chunk_by_id, delete_chunks_by_owner, delete_chunks_by_source, extraction_coverage,
-    filter_raw_paths_not_ingested, get_chunk, get_chunk_content_path, get_chunk_content_pointers,
-    get_chunk_embedding, get_chunk_embedding_for_signature,
-    get_chunk_embeddings_for_signature_batch, get_chunk_raw_refs, get_chunks_batch,
-    get_summary_content_pointers, is_source_ingested, list_chunk_raw_ref_paths_with_prefix,
-    list_chunks, list_summaries_with_content_path, mark_chunk_reembed_skipped,
-    mark_raw_paths_ingested, set_chunk_embedding, set_chunk_embedding_for_signature,
-    set_chunk_raw_refs, tree_active_signature, upsert_chunks, upsert_staged_chunks,
-    ListChunksQuery, RawRef,
+    count_raw_paths_ingested_with_prefix, delete_chunk_by_id, delete_chunks_by_owner,
+    delete_chunks_by_source, extraction_coverage, filter_raw_paths_not_ingested, get_chunk,
+    get_chunk_content_path, get_chunk_content_pointers, get_chunk_embedding,
+    get_chunk_embedding_for_signature, get_chunk_embeddings_for_signature_batch,
+    get_chunk_raw_refs, get_chunks_batch, get_summary_content_pointers, is_source_ingested,
+    list_chunk_raw_ref_paths_with_prefix, list_chunks, list_summaries_with_content_path,
+    mark_chunk_reembed_skipped, mark_raw_paths_ingested, set_chunk_embedding,
+    set_chunk_embedding_for_signature, set_chunk_raw_refs, tree_active_signature, upsert_chunks,
+    upsert_staged_chunks, ListChunksQuery, RawRef,
 };
 use crate::memory::config::MemoryConfig;
 use chrono::{TimeZone, Utc};

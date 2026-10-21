@@ -8,8 +8,9 @@ use chrono::Utc;
 use super::collections::{CHUNK_LIFECYCLE, INGESTED_SOURCES};
 use super::types::SourceKind;
 use super::versioned::{
-    insert_state_changes_if_absent, list_chunk_snapshot, list_state, read_state,
-    read_chunk_lifecycle_status as read_implicit_lifecycle_status, write_state, StateChange,
+    insert_state_changes_if_absent, list_chunk_snapshot, list_state,
+    read_chunk_lifecycle_status as read_implicit_lifecycle_status, read_state, write_state,
+    StateChange,
 };
 use crate::memory::config::MemoryConfig;
 

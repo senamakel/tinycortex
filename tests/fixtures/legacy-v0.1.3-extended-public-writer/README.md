@@ -28,6 +28,11 @@ SHA-256 for this generated output:
 | `memory_tree/content/chat/slack-extended-migration-fixture/1bc5dcab126259aa4b5a9dd9b96ed3df.md` | `b9fdde82eaf39378f89bddbba29aef68e8d4af6983e207d1019944f2e88a3b27` |
 | `memory_tree/content/wiki/summaries/source-slack-extended-migration-fixture/L1/summary-1792544917907-L1-4097db96.md` | `1e5d1463b00fd8ce60456357c4823020ce4657ba5c03419e7c8d0fdc29b87aa1` |
 
+The summary row's semantic `content_sha256` is
+`7acfc05fdf4bf82899e58d889bc6dcbd9420d79eaa133e1cf060ac0f81a1a029`; it
+hashes the Markdown body after frontmatter, while the table records the hash
+of the complete physical file.
+
 ## Regeneration
 
 From the TinyCortex checkout containing this fixture, fetch the source commit

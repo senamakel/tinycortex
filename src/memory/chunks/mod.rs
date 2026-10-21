@@ -126,17 +126,18 @@ pub use store::{
     get_chunk_lifecycle_status, get_chunks_batch, get_chunks_batch_async, is_source_ingested,
     list_source_ids_with_prefix, mark_raw_paths_ingested, set_chunk_lifecycle_status,
     update_chunk_content_sha256, update_summary_content_sha256,
-    update_summary_content_sha256_async, upsert_chunks, upsert_chunks_async,
-    upsert_staged_chunks, CHUNK_STATUS_ADMITTED, CHUNK_STATUS_BUFFERED,
-    CHUNK_STATUS_DROPPED, CHUNK_STATUS_PENDING_EXTRACTION, CHUNK_STATUS_SEALED, RAW_FILE_GATE_KIND,
+    update_summary_content_sha256_async, upsert_chunks, upsert_chunks_async, upsert_staged_chunks,
+    CHUNK_STATUS_ADMITTED, CHUNK_STATUS_BUFFERED, CHUNK_STATUS_DROPPED,
+    CHUNK_STATUS_PENDING_EXTRACTION, CHUNK_STATUS_SEALED, RAW_FILE_GATE_KIND,
 };
+pub(crate) use store_delete::remove_unreferenced_content_files_async;
 pub use store_delete::{
     delete_chunk_by_id, delete_chunk_by_id_async, delete_chunks_by_owner,
     delete_chunks_by_owner_async, delete_chunks_by_source, delete_chunks_by_source_async,
     delete_chunks_by_source_prefix, delete_chunks_by_source_prefix_async,
     delete_orphaned_source_tree, delete_orphaned_source_tree_async, purge_all, purge_all_async,
 };
-pub(crate) use store_delete::remove_unreferenced_content_files_async;
+pub(crate) use store_list::list_chunks_with_content_state;
 pub use store_list::{
     count_chunks_matching, list_chunk_details, list_chunks, source_totals, ChunkDetailRow,
     ListChunksQuery, SourceTotal,

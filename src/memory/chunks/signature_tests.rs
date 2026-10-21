@@ -108,4 +108,3 @@ fn the_canonical_spelling_matches_the_namespace_store_byte_for_byte() {
         crate::memory::store::vectors::format_embedding_signature("cloud", "embedding-v1", 1024)
     );
 }
-

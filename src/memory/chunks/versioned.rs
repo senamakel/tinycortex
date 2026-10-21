@@ -553,7 +553,14 @@ fn upsert_chunks_at(
     default_lifecycle_status: Option<&str>,
 ) -> Result<usize> {
     let (revision, ancestors) = next_revision(config, snapshot)?;
-    let operation = make_manifest(snapshot, revision, ancestors, final_chunks, changes, default_lifecycle_status)?;
+    let operation = make_manifest(
+        snapshot,
+        revision,
+        ancestors,
+        final_chunks,
+        changes,
+        default_lifecycle_status,
+    )?;
     let expected_parent = snapshot.clone();
     let final_chunks = final_chunks.to_vec();
     let changes = changes.to_vec();
@@ -620,7 +627,14 @@ async fn upsert_chunks_at_async(
     default_lifecycle_status: Option<&str>,
 ) -> Result<usize> {
     let (revision, ancestors) = next_revision_async(config, snapshot).await?;
-    let operation = make_manifest(snapshot, revision, ancestors, final_chunks, changes, default_lifecycle_status)?;
+    let operation = make_manifest(
+        snapshot,
+        revision,
+        ancestors,
+        final_chunks,
+        changes,
+        default_lifecycle_status,
+    )?;
     let expected_parent = snapshot.clone();
     let final_chunks = final_chunks.to_vec();
     let changes = changes.to_vec();
@@ -911,7 +925,11 @@ pub(crate) fn list_chunk_snapshot_with_head(
                     if replace {
                         latest.insert(
                             version.logical_id,
-                            (version.revision, version.chunk, operation.default_lifecycle_status.clone()),
+                            (
+                                version.revision,
+                                version.chunk,
+                                operation.default_lifecycle_status.clone(),
+                            ),
                         );
                     }
                 }
@@ -935,7 +953,9 @@ pub(crate) fn list_chunk_snapshot_with_head(
             }
             let implicit_lifecycle = latest
                 .iter()
-                .filter_map(|(id, (_, _, status))| status.clone().map(|status| (id.clone(), status)))
+                .filter_map(|(id, (_, _, status))| {
+                    status.clone().map(|status| (id.clone(), status))
+                })
                 .collect::<HashMap<_, _>>();
             let mut ids = HashSet::new();
             ids.extend(latest.keys().cloned());
@@ -981,12 +1001,8 @@ fn add_implicit_lifecycle_states(
         .map(|(key, _)| key.as_str())
         .collect::<HashSet<_>>();
     lifecycle.extend(defaults.iter().filter_map(|(key, status)| {
-        (!explicit.contains(key.as_str())).then(|| {
-            (
-                key.clone(),
-                serde_json::json!({"status": status}),
-            )
-        })
+        (!explicit.contains(key.as_str()))
+            .then(|| (key.clone(), serde_json::json!({"status": status})))
     }));
 }
 
@@ -1049,7 +1065,11 @@ pub(crate) async fn list_chunk_snapshot_with_head_async(
                     {
                         latest.insert(
                             version.logical_id,
-                            (version.revision, version.chunk, operation.default_lifecycle_status.clone()),
+                            (
+                                version.revision,
+                                version.chunk,
+                                operation.default_lifecycle_status.clone(),
+                            ),
                         );
                     }
                 }
@@ -1072,7 +1092,9 @@ pub(crate) async fn list_chunk_snapshot_with_head_async(
             }
             let implicit_lifecycle = latest
                 .iter()
-                .filter_map(|(id, (_, _, status))| status.clone().map(|status| (id.clone(), status)))
+                .filter_map(|(id, (_, _, status))| {
+                    status.clone().map(|status| (id.clone(), status))
+                })
                 .collect::<HashMap<_, _>>();
             let mut ids = HashSet::new();
             ids.extend(latest.keys().cloned());
@@ -1235,9 +1257,13 @@ pub(crate) fn read_chunk_lifecycle_status(
     config
         .storage_blocking()?
         .run(async move {
-            let explicit = read_state_at(&*documents, &snapshot, CHUNK_LIFECYCLE, &chunk_id).await?;
+            let explicit =
+                read_state_at(&*documents, &snapshot, CHUNK_LIFECYCLE, &chunk_id).await?;
             if let Some(value) = explicit {
-                return Ok(value.get("status").and_then(Value::as_str).map(str::to_owned));
+                return Ok(value
+                    .get("status")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned));
             }
             implicit_chunk_lifecycle_status(&*documents, &snapshot, &chunk_id).await
         })?
@@ -1263,12 +1289,8 @@ async fn implicit_chunk_lifecycle_status(
             {
                 continue;
             }
-            let Some(manifest) = manifest_at_revision(
-                documents,
-                &version.operation_id,
-                version.revision,
-            )
-            .await?
+            let Some(manifest) =
+                manifest_at_revision(documents, &version.operation_id, version.revision).await?
             else {
                 continue;
             };
