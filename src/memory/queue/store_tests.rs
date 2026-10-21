@@ -320,6 +320,28 @@ async fn typed_import_preserves_job_history_and_recovers_running_work() {
                 .then_some(1_700_000_200_000 + index as i64)
         );
     }
+
+    // Reapplying the same source snapshot cannot roll a job back after the
+    // destination worker has advanced it.
+    update_test_record_async(&cfg, "legacy-ready", |record| {
+        record.status = JobStatus::Done.as_str().to_owned();
+        record.attempts = 3;
+        record.completed_at_ms = Some(1_800_000_000_000);
+    })
+    .await
+    .unwrap();
+    let snapshot = crate::memory::chunks::versioned::capture_state_snapshot_async(&cfg)
+        .await
+        .unwrap();
+    let retry = stage_import_jobs_at_snapshot(&cfg, &snapshot, &jobs)
+        .await
+        .unwrap();
+    assert!(retry.changes.is_empty());
+    assert!(retry.publish.is_empty());
+    let progressed = get_job_async(&cfg, "legacy-ready").await.unwrap().unwrap();
+    assert_eq!(progressed.status, JobStatus::Done);
+    assert_eq!(progressed.attempts, 3);
+    assert_eq!(progressed.completed_at_ms, Some(1_800_000_000_000));
 }
 
 #[tokio::test]
