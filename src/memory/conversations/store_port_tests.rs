@@ -1,4 +1,5 @@
 use super::*;
+use crate::memory::conversations::run_reply_message_id;
 
 #[tokio::test]
 async fn conversation_store_uses_prepared_streams_and_rebuildable_document_index() {

@@ -35,6 +35,7 @@
 mod bus;
 pub mod collections;
 mod inverted_index;
+#[path = "store_owner.rs"]
 mod store;
 mod tokenize;
 mod types;
