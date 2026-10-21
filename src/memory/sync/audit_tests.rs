@@ -115,7 +115,7 @@ async fn legacy_audit_import_preserves_append_order_and_is_retry_safe() {
 }
 
 #[tokio::test]
-async fn concurrent_legacy_audit_imports_share_the_captured_tail() {
+async fn audit_import_reconciles_a_competing_append_at_its_captured_tail() {
     let scope = tinystoragedrivers_types::Scope::new("test:audit-import-race").unwrap();
     let raw = tinystoragedrivers_testkit::memory_storage(&scope);
     let rows = vec![
