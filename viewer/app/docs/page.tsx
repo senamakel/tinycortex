@@ -18,7 +18,7 @@ export default async function DocsPage({
   }
 
   const { toolkit, q } = await searchParams;
-  const all = listSkillDocs(ws);
+  const all = await listSkillDocs(ws);
   const toolkits = skillDocCountsByToolkit(all);
   const needle = (q ?? "").trim().toLowerCase();
 

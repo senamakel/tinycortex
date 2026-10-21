@@ -1,8 +1,11 @@
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+
+const viewerRoot = path.dirname(fileURLToPath(import.meta.url));
+
 /** @type {import('next').NextConfig} */
 const nextConfig = {
-  // better-sqlite3 is a native addon; keep it out of the bundler and load it
-  // as a normal Node require at runtime (server-only).
-  serverExternalPackages: ["better-sqlite3"],
+  outputFileTracingRoot: viewerRoot,
 };
 
 export default nextConfig;

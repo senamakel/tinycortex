@@ -1,14 +1,9 @@
-// Server-only data access over a local TinyCortex memory workspace.
-//
-// Everything here runs on the Node server (never shipped to the browser): it
-// opens the workspace's SQLite stores read-only and reads the JSON/markdown
-// artifacts a sync run leaves behind. Each reader tolerates a missing store so
-// a partially-populated workspace still renders.
+// Server-only projection of TinyCortex owner storage plus host-owned artifacts.
 
 import "server-only";
-import Database from "better-sqlite3";
 import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
+import { readOwnerSnapshot } from "@/lib/inspector";
 
 // ── Workspace resolution ────────────────────────────────────────────────────
 
@@ -19,8 +14,6 @@ export function workspacePath(): string | null {
 
 export type StorePaths = {
   workspace: string;
-  skillDocsDb: string;
-  chunksDb: string;
   manifest: string;
   entitiesDir: string;
 };
@@ -28,20 +21,9 @@ export type StorePaths = {
 export function storePaths(workspace: string): StorePaths {
   return {
     workspace,
-    skillDocsDb: join(workspace, "memory_tree", "skill_docs.db"),
-    chunksDb: join(workspace, "memory_tree", "chunks.db"),
     manifest: join(workspace, "sync_manifest.json"),
     entitiesDir: join(workspace, "memory_tree", "content", "entities"),
   };
-}
-
-function openReadonly(path: string): Database.Database | null {
-  if (!existsSync(path)) return null;
-  try {
-    return new Database(path, { readonly: true, fileMustExist: true });
-  } catch {
-    return null;
-  }
 }
 
 // ── Skill documents (what sync ingested) ────────────────────────────────────
@@ -59,53 +41,43 @@ export type SkillDoc = {
 
 const SKILLDOC_NS_PREFIX = "skilldoc"; // ':' is sanitized to '_' by the KV store
 
-function rowToDoc(namespace: string, valueJson: string, updatedAt: number | null): SkillDoc | null {
-  let parsed: Record<string, unknown>;
-  try {
-    parsed = JSON.parse(valueJson);
-  } catch {
-    return null;
-  }
+function rowToDoc(namespace: string | null, stored: unknown, updatedAt: number): SkillDoc {
+  const value =
+    stored && typeof stored === "object" && !Array.isArray(stored)
+      ? (stored as Record<string, unknown>)
+      : {};
   const toolkit =
-    (typeof parsed.toolkit === "string" && parsed.toolkit) ||
-    namespace.slice(SKILLDOC_NS_PREFIX.length + 1) ||
+    (typeof value.toolkit === "string" && value.toolkit) ||
+    (namespace?.startsWith(`${SKILLDOC_NS_PREFIX}:`)
+      ? namespace.slice(SKILLDOC_NS_PREFIX.length + 1)
+      : "") ||
     "unknown";
   return {
     toolkit,
-    documentId: String(parsed.document_id ?? ""),
-    namespaceSkillId: String(parsed.namespace_skill_id ?? toolkit),
-    connectionId: String(parsed.connection_id ?? ""),
-    title: String(parsed.title ?? "(untitled)"),
-    content: String(parsed.content ?? ""),
+    documentId: String(value.document_id ?? ""),
+    namespaceSkillId: String(value.namespace_skill_id ?? toolkit),
+    connectionId: String(value.connection_id ?? ""),
+    title: String(value.title ?? "(untitled)"),
+    content: String(value.content ?? ""),
     metadata:
-      parsed.metadata && typeof parsed.metadata === "object"
-        ? (parsed.metadata as Record<string, unknown>)
+      value.metadata && typeof value.metadata === "object"
+        ? (value.metadata as Record<string, unknown>)
         : {},
     updatedAt,
   };
 }
 
-export function listSkillDocs(workspace: string): SkillDoc[] {
-  const db = openReadonly(storePaths(workspace).skillDocsDb);
-  if (!db) return [];
-  try {
-    const rows = db
-      .prepare(
-        "SELECT namespace, value_json, updated_at FROM kv_namespace ORDER BY updated_at DESC",
-      )
-      .all() as { namespace: string; value_json: string; updated_at: number }[];
-    return rows
-      .filter((r) => r.namespace.startsWith(SKILLDOC_NS_PREFIX))
-      .map((r) => rowToDoc(r.namespace, r.value_json, r.updated_at))
-      .filter((d): d is SkillDoc => d !== null);
-  } finally {
-    db.close();
-  }
+export async function listSkillDocs(workspace: string): Promise<SkillDoc[]> {
+  const snapshot = await readOwnerSnapshot(workspace);
+  return snapshot.skill_documents
+    .filter((row) => row.namespace?.startsWith(SKILLDOC_NS_PREFIX))
+    .map((row) => rowToDoc(row.namespace, row.value, row.updated_at))
+    .sort((a, b) => (b.updatedAt ?? 0) - (a.updatedAt ?? 0));
 }
 
-export function getSkillDoc(workspace: string, toolkit: string, documentId: string): SkillDoc | null {
+export async function getSkillDoc(workspace: string, toolkit: string, documentId: string): Promise<SkillDoc | null> {
   return (
-    listSkillDocs(workspace).find(
+    (await listSkillDocs(workspace)).find(
       (d) => d.toolkit === toolkit && d.documentId === documentId,
     ) ?? null
   );
@@ -185,49 +157,20 @@ export type Chunk = {
 
 export type ChunkView = { available: boolean; chunks: Chunk[]; total: number };
 
-export function listChunks(workspace: string, limit = 200): ChunkView {
-  const db = openReadonly(storePaths(workspace).chunksDb);
-  if (!db) return { available: false, chunks: [], total: 0 };
-  try {
-    const total = (
-      db.prepare("SELECT COUNT(*) AS n FROM mem_tree_chunks").get() as { n: number }
-    ).n;
-    const rows = db
-      .prepare(
-        `SELECT id, source_kind, source_id, path_scope, owner, tags_json,
-                substr(content, 1, 240) AS preview, token_count, timestamp_ms
-         FROM mem_tree_chunks
-         ORDER BY created_at_ms DESC
-         LIMIT ?`,
-      )
-      .all(limit) as Record<string, unknown>[];
-    const chunks: Chunk[] = rows.map((r) => ({
-      id: String(r.id),
-      sourceKind: (r.source_kind as string) ?? null,
-      sourceId: (r.source_id as string) ?? null,
-      pathScope: (r.path_scope as string) ?? null,
-      owner: (r.owner as string) ?? null,
-      tags: parseTags(r.tags_json),
-      preview: String(r.preview ?? ""),
-      tokenCount: (r.token_count as number) ?? null,
-      timestampMs: (r.timestamp_ms as number) ?? null,
-    }));
-    return { available: true, chunks, total };
-  } catch {
-    return { available: false, chunks: [], total: 0 };
-  } finally {
-    db.close();
-  }
-}
-
-function parseTags(raw: unknown): string[] {
-  if (typeof raw !== "string") return [];
-  try {
-    const parsed = JSON.parse(raw);
-    return Array.isArray(parsed) ? parsed.map(String) : [];
-  } catch {
-    return [];
-  }
+export async function listChunks(workspace: string, limit = 200): Promise<ChunkView> {
+  const snapshot = await readOwnerSnapshot(workspace, limit);
+  const chunks: Chunk[] = snapshot.chunks.map((row) => ({
+    id: row.id,
+    sourceKind: row.metadata.source_kind || null,
+    sourceId: row.metadata.source_id || null,
+    pathScope: null,
+    owner: row.metadata.owner || null,
+    tags: row.metadata.tags,
+    preview: row.content.slice(0, 240),
+    tokenCount: row.token_count,
+    timestampMs: row.metadata.timestamp,
+  }));
+  return { available: true, chunks, total: snapshot.chunk_total };
 }
 
 // ── Entities — markdown files under memory_tree/content/entities ─────────────
@@ -314,7 +257,7 @@ function firstLine(text: string, max = 48): string {
   return trimmed.length > max ? `${trimmed.slice(0, max - 1)}…` : trimmed || "(empty)";
 }
 
-export function memoryGraph(workspace: string): MemoryGraphData {
+export async function memoryGraph(workspace: string): Promise<MemoryGraphData> {
   const empty: MemoryGraphData = {
     available: false,
     nodes: [],
@@ -323,26 +266,10 @@ export function memoryGraph(workspace: string): MemoryGraphData {
     summaryCount: 0,
     chunkCount: 0,
   };
-  const db = openReadonly(storePaths(workspace).chunksDb);
-  if (!db) return empty;
-  try {
-    const trees = db
-      .prepare("SELECT id, kind, scope, root_id FROM mem_tree_trees")
-      .all() as { id: string; kind: string; scope: string; root_id: string | null }[];
-    const summaries = db
-      .prepare(
-        "SELECT id, tree_id, level, parent_id, child_ids_json, content FROM mem_tree_summaries WHERE deleted = 0",
-      )
-      .all() as {
-      id: string;
-      tree_id: string;
-      level: number;
-      parent_id: string | null;
-      child_ids_json: string;
-      content: string;
-    }[];
-
-    if (trees.length === 0 && summaries.length === 0) return empty;
+  const snapshot = await readOwnerSnapshot(workspace, 10_000);
+  const trees = snapshot.trees;
+  const summaries = snapshot.summaries;
+  if (trees.length === 0 && summaries.length === 0) return empty;
 
     const summaryIds = new Set(summaries.map((s) => s.id));
     const nodes: GraphNode[] = [];
@@ -358,7 +285,7 @@ export function memoryGraph(workspace: string): MemoryGraphData {
 
     const childChunkIds = new Set<string>();
     for (const s of summaries) {
-      const children = parseTags(s.child_ids_json); // reuse JSON-array parser
+      const children = s.child_ids;
       nodes.push({
         id: s.id,
         kind: "summary",
@@ -378,29 +305,15 @@ export function memoryGraph(workspace: string): MemoryGraphData {
       }
     }
 
-    if (childChunkIds.size > 0) {
-      const ids = [...childChunkIds];
-      const found = new Map<string, string>();
-      const CHUNK_BATCH = 400;
-      for (let i = 0; i < ids.length; i += CHUNK_BATCH) {
-        const batch = ids.slice(i, i + CHUNK_BATCH);
-        const placeholders = batch.map(() => "?").join(",");
-        const rows = db
-          .prepare(
-            `SELECT id, substr(content, 1, 160) AS preview FROM mem_tree_chunks WHERE id IN (${placeholders})`,
-          )
-          .all(...batch) as { id: string; preview: string }[];
-        for (const r of rows) found.set(r.id, r.preview);
-      }
-      for (const id of ids) {
-        const preview = found.get(id);
-        nodes.push({
-          id,
-          kind: "chunk",
-          label: preview ? firstLine(preview, 40) : id.slice(0, 12),
-          detail: preview ?? undefined,
-        });
-      }
+    const found = new Map(snapshot.graph_chunks.map((chunk) => [chunk.id, chunk.content]));
+    for (const id of childChunkIds) {
+      const preview = found.get(id);
+      nodes.push({
+        id,
+        kind: "chunk",
+        label: preview ? firstLine(preview, 40) : id.slice(0, 12),
+        detail: preview ?? undefined,
+      });
     }
 
     return {
@@ -411,11 +324,6 @@ export function memoryGraph(workspace: string): MemoryGraphData {
       summaryCount: summaries.length,
       chunkCount: childChunkIds.size,
     };
-  } catch {
-    return empty;
-  } finally {
-    db.close();
-  }
 }
 
 // ── Overview aggregate ──────────────────────────────────────────────────────
@@ -430,16 +338,15 @@ export type Overview = {
   manifest: Manifest | null;
 };
 
-export function overview(workspace: string): Overview {
+export async function overview(workspace: string): Promise<Overview> {
   const paths = storePaths(workspace);
-  const docs = listSkillDocs(workspace);
-  const chunks = listChunks(workspace, 1);
+  const [docs, chunks] = await Promise.all([listSkillDocs(workspace), listChunks(workspace, 1)]);
   const entities = listEntities(workspace);
   return {
     workspace,
     exists: {
-      skillDocs: existsSync(paths.skillDocsDb),
-      chunks: existsSync(paths.chunksDb),
+      skillDocs: docs.length > 0,
+      chunks: chunks.total > 0,
       manifest: existsSync(paths.manifest),
       entities: existsSync(paths.entitiesDir),
     },

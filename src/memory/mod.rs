@@ -81,6 +81,8 @@ pub mod goals;
 pub mod graph;
 pub mod health;
 pub mod ingest;
+/// Read-only snapshots for server-side inspection tools such as the local viewer.
+pub mod inspection;
 pub mod queue;
 pub mod retrieval;
 pub mod score;

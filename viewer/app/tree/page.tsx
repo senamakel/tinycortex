@@ -1,7 +1,7 @@
 import { listChunks, workspacePath } from "@/lib/memory";
 import { Empty, NoWorkspace, ts } from "@/lib/ui";
 
-export default function TreePage() {
+export default async function TreePage() {
   const ws = workspacePath();
   if (!ws) {
     return (
@@ -12,7 +12,7 @@ export default function TreePage() {
     );
   }
 
-  const { available, chunks, total } = listChunks(ws, 300);
+  const { available, chunks, total } = await listChunks(ws, 300);
 
   if (!available) {
     return (
@@ -20,7 +20,7 @@ export default function TreePage() {
         <h1>Memory tree</h1>
         <p className="subtitle">Ingested chunks from the summary tree.</p>
         <Empty>
-          No <code>memory_tree/chunks.db</code> in this workspace yet. Skill docs are
+          No chunks are visible in the configured storage scope yet. Skill docs are
           persisted on sync; the chunk/summary tree is produced by a full ingest pass.
         </Empty>
       </>

@@ -22,7 +22,7 @@ export default async function DocDetailPage({
     );
   }
 
-  const doc = getSkillDoc(ws, tk, documentId);
+  const doc = await getSkillDoc(ws, tk, documentId);
   if (!doc) {
     return (
       <>

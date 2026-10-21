@@ -148,6 +148,22 @@ impl MemoryConfig {
         Ok(config)
     }
 
+    /// Build an internal config for read-only owner inspection over handles
+    /// already opened and scoped by the host. This deliberately skips schema
+    /// preparation: inspection must never create collections or queues.
+    pub(crate) fn for_inspection(
+        workspace: impl Into<PathBuf>,
+        storage: Storage,
+    ) -> anyhow::Result<Self> {
+        let blocking = super::storage::Blocking::new().map_err(anyhow::Error::from)?;
+        let mut config = Self::new(workspace).with_storage(storage);
+        // This config is only constructed inside memory::inspection and is
+        // never returned to callers; its operations are read-only projections.
+        config.storage_prepared = true;
+        config.storage_blocking = Some(blocking);
+        Ok(config)
+    }
+
     /// Prepare every collection owned by this memory engine instance.
     ///
     /// Hosts call this after binding a storage scope and before exposing the
