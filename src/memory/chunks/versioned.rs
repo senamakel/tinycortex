@@ -198,8 +198,9 @@ pub(crate) async fn upsert_chunks_async(config: &MemoryConfig, chunks: &[Chunk])
     }
     for _ in 0..CAS_RETRIES {
         let snapshot = capture_head_async(config).await?;
-        let changes =
-            restore_deleted_chunk_lifecycles_async(config, &snapshot, chunks, &[]).await?;
+        let defaults = chunk_upsert_state_changes(chunks, &[]);
+        let changes = restore_deleted_chunk_lifecycles_async(config, &snapshot, chunks, &defaults)
+            .await?;
         match upsert_chunks_at_async(config, &snapshot, chunks, chunks, &changes).await {
             Ok(_) => return Ok(chunks.len()),
             Err(error) if is_storage_conflict(&error) => continue,
@@ -337,9 +338,10 @@ fn commit_operation(
             final_chunks.push(chunk.clone());
         }
     }
+    let mut changes_with_defaults = chunk_upsert_state_changes(chunks, changes);
     let mut final_changes = Vec::new();
     let mut change_positions = HashMap::new();
-    for change in changes {
+    for change in &changes_with_defaults {
         let key = format!("{}\0{}", change.collection, change.key);
         if let Some(position) = change_positions.get(&key).copied() {
             final_changes[position] = change.clone();
@@ -366,6 +368,29 @@ fn commit_operation(
     Err(last_conflict.unwrap_or_else(|| {
         anyhow::anyhow!("chunk version commit did not succeed within the retry budget")
     }))
+}
+
+fn chunk_upsert_state_changes(chunks: &[Chunk], changes: &[StateChange]) -> Vec<StateChange> {
+    let mut all = Vec::with_capacity(changes.len() + chunks.len() * 2);
+    for chunk in chunks {
+        // A plain upsert is a fresh admission into the logical chunk store.
+        // Replacing a row clears stale staged-file metadata and resets a prior
+        // dropped/deleted lifecycle value, matching SQLite's row replacement.
+        all.push(StateChange {
+            collection: CHUNK_CONTENT_POINTERS.to_owned(),
+            key: chunk.id.clone(),
+            value: None,
+        });
+        all.push(StateChange {
+            collection: CHUNK_LIFECYCLE.to_owned(),
+            key: chunk.id.clone(),
+            value: Some(serde_json::json!({
+                "status": super::store::CHUNK_STATUS_ADMITTED
+            })),
+        });
+    }
+    all.extend_from_slice(changes);
+    all
 }
 
 fn restore_deleted_chunk_lifecycles(
