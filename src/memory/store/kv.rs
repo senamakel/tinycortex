@@ -22,7 +22,7 @@ const KEY_PREFIX: &str = "tinycortex:kv:v1:";
 const PAGE_SIZE: usize = 256;
 const WRITE_RETRIES: usize = 8;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 struct Entry {
     kind: EntryKind,
     namespace: Option<String>,
@@ -220,6 +220,47 @@ impl KvStore {
         ))
     }
 
+    async fn import_entry(&self, entry: Entry) -> Result<(), String> {
+        let storage_key = Self::storage_key(entry.kind, entry.namespace.as_deref(), &entry.key);
+        for _ in 0..WRITE_RETRIES {
+            let current = self
+                .port
+                .get(&storage_key)
+                .await
+                .map_err(|error| format!("read before importing KV key '{}': {error}", entry.key))?;
+            if let Some(current) = current {
+                let current = Self::checked_entry(
+                    current,
+                    entry.kind,
+                    entry.namespace.as_deref(),
+                    &entry.key,
+                )?;
+                if current == entry {
+                    return Ok(());
+                }
+                return Err(format!(
+                    "legacy KV import conflicts with existing key '{}'",
+                    entry.key
+                ));
+            }
+            let value = serde_json::to_value(&entry)
+                .map_err(|error| format!("encode imported KV key '{}': {error}", entry.key))?;
+            match self
+                .port
+                .cas(&storage_key, value, Precondition::Absent)
+                .await
+            {
+                Ok(_) => return Ok(()),
+                Err(error) if error.kind() == ErrorKind::Conflict => continue,
+                Err(error) => return Err(format!("import KV key '{}': {error}", entry.key)),
+            }
+        }
+        Err(format!(
+            "legacy KV import contention retry limit reached for key '{}'",
+            entry.key
+        ))
+    }
+
     async fn get_value(
         &self,
         kind: EntryKind,
@@ -377,6 +418,102 @@ impl KvStore {
         let (namespace, key) = normalize_write_identity(namespace, key)?;
         self.put_entry(EntryKind::Namespace, Some(namespace), key, value.clone())
             .await
+    }
+
+    /// Import records read by a host from a legacy source database without
+    /// overwriting newer destination data. Reapplying a batch is safe; after
+    /// a crash, the host can retry the same records. The source reader belongs
+    /// to the host and is intentionally not part of this crate.
+    pub async fn import_legacy_records(
+        &self,
+        records: &[MemoryKvRecord],
+    ) -> Result<(), String> {
+        let mut planned = std::collections::BTreeMap::<String, Entry>::new();
+        for record in records {
+            if !record.updated_at.is_finite() {
+                return Err(format!(
+                    "legacy KV key '{}' has invalid timestamp",
+                    record.key
+                ));
+            }
+            let (kind, namespace) = match &record.namespace {
+                Some(namespace) => {
+                    if Self::normalize_namespace_write(namespace) != *namespace
+                        || Self::normalized_namespace_key(&record.key) != record.key
+                        || safety::has_likely_secret(namespace)
+                        || safety::has_likely_secret(&record.key)
+                    {
+                        return Err(format!(
+                            "legacy KV key '{}' has a noncanonical or unsafe identity",
+                            record.key
+                        ));
+                    }
+                    (EntryKind::Namespace, Some(namespace.clone()))
+                }
+                None => {
+                    if Self::normalized_global_key(&record.key) != record.key
+                        || safety::has_likely_secret(&record.key)
+                    {
+                        return Err(format!(
+                            "legacy KV key '{}' has a noncanonical or unsafe identity",
+                            record.key
+                        ));
+                    }
+                    (EntryKind::Global, None)
+                }
+            };
+            if safety::sanitize_json(&record.value).value != record.value {
+                return Err(format!(
+                    "legacy KV key '{}' contains unsanitized data",
+                    record.key
+                ));
+            }
+            let entry = Entry {
+                kind,
+                namespace,
+                key: record.key.clone(),
+                value: record.value.clone(),
+                updated_at: record.updated_at,
+            };
+            let identity = Self::storage_key(kind, entry.namespace.as_deref(), &entry.key);
+            if let Some(previous) = planned.insert(identity, entry.clone()) {
+                if previous != entry {
+                    return Err(format!(
+                        "legacy KV batch contains conflicting copies of key '{}'",
+                        record.key
+                    ));
+                }
+            }
+        }
+
+        // Preflight every destination before writing any new record. A later
+        // concurrent race can still leave a partial batch; retry is safe.
+        for entry in planned.values() {
+            let storage_key = Self::storage_key(entry.kind, entry.namespace.as_deref(), &entry.key);
+            if let Some(existing) = self
+                .port
+                .get(&storage_key)
+                .await
+                .map_err(|error| format!("preflight legacy KV key '{}': {error}", entry.key))?
+            {
+                let existing = Self::checked_entry(
+                    existing,
+                    entry.kind,
+                    entry.namespace.as_deref(),
+                    &entry.key,
+                )?;
+                if existing != *entry {
+                    return Err(format!(
+                        "legacy KV import conflicts with existing key '{}'",
+                        entry.key
+                    ));
+                }
+            }
+        }
+        for entry in planned.into_values() {
+            self.import_entry(entry).await?;
+        }
+        Ok(())
     }
 
     /// Read a namespace-scoped key; corrupt stored data returns an error.
