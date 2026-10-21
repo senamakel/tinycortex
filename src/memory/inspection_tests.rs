@@ -2,7 +2,144 @@ use super::*;
 use crate::memory::chunks::{upsert_chunks, SourceKind};
 use chrono::{TimeZone, Utc};
 use serde_json::json;
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc,
+};
 use tempfile::TempDir;
+use tinystoragedrivers_api::{DocumentStore, Storage};
+use tinystoragedrivers_types::{
+    Capabilities, CollectionSpec, Filter, Page, Precondition, Query, SearchHit, Sort, StorageError,
+    Version, Versioned,
+};
+
+#[derive(Debug)]
+struct EnsureRefusingDocuments {
+    inner: Arc<dyn DocumentStore>,
+    ensure_calls: Arc<AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl DocumentStore for EnsureRefusingDocuments {
+    fn capabilities(&self) -> Capabilities {
+        self.inner.capabilities()
+    }
+
+    async fn ensure_collection(
+        &self,
+        spec: &CollectionSpec,
+    ) -> tinystoragedrivers_types::Result<()> {
+        let _ = spec;
+        self.ensure_calls.fetch_add(1, Ordering::SeqCst);
+        Err(StorageError::backend(
+            "inspection must not prepare collections",
+        ))
+    }
+
+    async fn get(
+        &self,
+        collection: &str,
+        id: &str,
+    ) -> tinystoragedrivers_types::Result<Option<Versioned<serde_json::Value>>> {
+        self.inner.get(collection, id).await
+    }
+
+    async fn put(
+        &self,
+        collection: &str,
+        id: &str,
+        value: serde_json::Value,
+        precondition: Precondition,
+    ) -> tinystoragedrivers_types::Result<Version> {
+        let _ = (collection, id, value, precondition);
+        Err(StorageError::backend("inspection must not write documents"))
+    }
+
+    async fn delete(
+        &self,
+        collection: &str,
+        id: &str,
+        precondition: Precondition,
+    ) -> tinystoragedrivers_types::Result<bool> {
+        let _ = (collection, id, precondition);
+        Err(StorageError::backend(
+            "inspection must not delete documents",
+        ))
+    }
+
+    async fn query(
+        &self,
+        collection: &str,
+        query: &Query,
+    ) -> tinystoragedrivers_types::Result<Page<Versioned<serde_json::Value>>> {
+        self.inner.query(collection, query).await
+    }
+
+    async fn count(
+        &self,
+        collection: &str,
+        filter: &Filter,
+    ) -> tinystoragedrivers_types::Result<u64> {
+        self.inner.count(collection, filter).await
+    }
+
+    async fn delete_where(
+        &self,
+        collection: &str,
+        filter: &Filter,
+    ) -> tinystoragedrivers_types::Result<u64> {
+        let _ = (collection, filter);
+        Err(StorageError::backend(
+            "inspection must not delete documents",
+        ))
+    }
+
+    async fn claim(
+        &self,
+        collection: &str,
+        filter: &Filter,
+        sort: &[Sort],
+        patch: &serde_json::Value,
+    ) -> tinystoragedrivers_types::Result<Option<Versioned<serde_json::Value>>> {
+        let _ = (collection, filter, sort, patch);
+        Err(StorageError::backend("inspection must not claim documents"))
+    }
+
+    async fn search(
+        &self,
+        collection: &str,
+        text: &str,
+        limit: usize,
+    ) -> tinystoragedrivers_types::Result<Vec<SearchHit>> {
+        self.inner.search(collection, text, limit).await
+    }
+
+    async fn drop_collection(&self, collection: &str) -> tinystoragedrivers_types::Result<()> {
+        let _ = collection;
+        Err(StorageError::backend(
+            "inspection must not drop collections",
+        ))
+    }
+}
+
+fn refuse_document_writes(storage: &Storage) -> (Storage, Arc<AtomicUsize>) {
+    let ensure_calls = Arc::new(AtomicUsize::new(0));
+    let documents = Arc::new(EnsureRefusingDocuments {
+        inner: storage.documents().clone(),
+        ensure_calls: ensure_calls.clone(),
+    });
+    (
+        Storage::new(
+            documents,
+            storage.streams().clone(),
+            storage.kv().clone(),
+            storage.blobs().clone(),
+            storage.queues().clone(),
+            storage.secrets().clone(),
+        ),
+        ensure_calls,
+    )
+}
 
 #[test]
 fn snapshot_reads_owner_kv_and_chunk_records_from_explicit_storage() {
@@ -48,8 +185,9 @@ fn snapshot_reads_owner_kv_and_chunk_records_from_explicit_storage() {
         .enable_all()
         .build()
         .unwrap();
+    let (inspection_storage, ensure_calls) = refuse_document_writes(&storage);
     let snapshot = runtime
-        .block_on(read_snapshot(workspace.path(), storage, 50))
+        .block_on(read_snapshot(workspace.path(), inspection_storage, 50))
         .unwrap();
 
     assert_eq!(snapshot.skill_documents.len(), 1);
@@ -62,6 +200,7 @@ fn snapshot_reads_owner_kv_and_chunk_records_from_explicit_storage() {
     assert_eq!(snapshot.chunk_total, 1);
     assert!(snapshot.trees.is_empty());
     assert!(snapshot.summaries.is_empty());
+    assert_eq!(ensure_calls.load(Ordering::SeqCst), 0);
 }
 
 #[test]
