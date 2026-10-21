@@ -23,13 +23,10 @@
 //!
 //! ## Differences from OpenHuman
 //!
-//! This is the storage-layer slice only. Pieces that hard-depend on the
-//! summary-tree, async-queue, and embedding-backend subsystems (not yet
-//! ported) are abstracted away: the SQLite *schema* still declares every
-//! `mem_tree_*` table (it is pure DDL), but the Rust code here never calls
-//! into those modules. The chunk store owns the connection cache and the
-//! one-shot SQLite migrations; everything else is left to the modules that
-//! own those tables.
+//! This module owns chunk records and their source-ingest, embedding, and
+//! raw-content adjuncts in the host-supplied document store. Tree, queue, and
+//! entity relationships use the same versioned owner head where atomicity is
+//! required.
 
 use std::path::PathBuf;
 
@@ -154,27 +151,9 @@ mod embedding_plan_tests;
 
 // ── Shared internal constants / helpers ─────────────────────────────────────
 
-/// Sub-directory of the workspace holding the chunk SQLite database.
+/// Default subdirectory used for memory content files.
 pub(crate) const DB_DIR: &str = "memory_tree";
-/// File name of the chunk SQLite database (under [`DB_DIR`]).
-pub(crate) const DB_FILE: &str = "chunks.db";
-/// Busy-handler timeout for the chunk DB. 15s absorbs transient write-lock
-/// contention inside rusqlite instead of surfacing `SQLITE_BUSY` to callers.
-pub(crate) const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(15);
-
-/// `PRAGMA user_version` value once the one-shot legacy→sidecar embedding
-/// migration has run. `0` (fresh/legacy DB) triggers the copy on next open.
-pub(crate) const TREE_EMBEDDING_MIGRATION_VERSION: i64 = 1;
-/// `PRAGMA user_version` value once the global/topic-tree purge has run.
-pub(crate) const GLOBAL_TOPIC_PURGE_MIGRATION_VERSION: i64 = 2;
-
-/// Canonical chunk DB path for `config`'s workspace.
-pub(crate) fn db_path_for(config: &MemoryConfig) -> PathBuf {
-    config.workspace.join(DB_DIR).join(DB_FILE)
-}
-
-/// Root directory for on-disk chunk/summary content files associated with the
-/// chunk DB. Bodies that are too large for the SQLite preview column live here.
+/// Root directory for on-disk chunk and summary content files.
 pub(crate) fn content_root(config: &MemoryConfig) -> PathBuf {
     config
         .content_root
