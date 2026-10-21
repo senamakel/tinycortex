@@ -1,7 +1,7 @@
 #![allow(unused_imports)]
 //! Unit tests for the chunk store (`super`): upsert / list / delete.
 
-use super::embeddings::{active_embedding_dims, embedding_to_blob};
+use super::embeddings::embedding_to_blob;
 use super::types::{chunk_id, Chunk, Metadata, SourceKind, SourceRef, StagedChunk};
 use super::{
     clear_chunk_reembed_skipped, clear_reembed_skipped_for_signature, content_root, count_chunks,

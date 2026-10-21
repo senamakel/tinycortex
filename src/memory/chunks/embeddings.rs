@@ -16,11 +16,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::memory::config::MemoryConfig;
 
-/// The active embedding vector dimension for `config`.
-pub(crate) fn active_embedding_dims(config: &MemoryConfig) -> usize {
-    config.embedding.dim
-}
-
 /// Resolve the active embedding signature — the canonical key every per-model
 /// sidecar read/write is scoped by. Derived from the configured provider, model
 /// and dim so a provider/model/dimension switch becomes a query-time filter

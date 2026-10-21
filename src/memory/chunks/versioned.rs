@@ -247,34 +247,6 @@ pub(crate) fn upsert_staged_chunks(config: &MemoryConfig, staged: &[StagedChunk]
     commit_operation(config, &chunks, &changes)
 }
 
-/// Commit staged chunk content plus caller-provided domain records only when
-/// all declared state preconditions still match the captured commit head.
-pub(crate) fn commit_staged_chunks_if_state_matches(
-    config: &MemoryConfig,
-    staged: &[StagedChunk],
-    expected: &[StateChange],
-    changes: &[StateChange],
-) -> Result<bool> {
-    let mut chunks = Vec::with_capacity(staged.len());
-    let mut all_changes = Vec::with_capacity(staged.len() + changes.len());
-    for item in staged {
-        let mut chunk = item.chunk.clone();
-        chunk.content = chunk.content.chars().take(500).collect();
-        all_changes.push(StateChange {
-            collection: CHUNK_CONTENT_POINTERS.into(),
-            key: item.chunk.id.clone(),
-            value: Some(serde_json::to_value(ChunkContentPointer {
-                chunk_id: item.chunk.id.clone(),
-                content_path: item.content_path.clone(),
-                content_sha256: item.content_sha256.clone(),
-            })?),
-        });
-        chunks.push(chunk);
-    }
-    all_changes.extend_from_slice(changes);
-    commit_if_state_matches(config, expected, &chunks, &all_changes)
-}
-
 /// Async counterpart used by async host workflows that must also work on a
 /// current-thread Tokio runtime.
 pub(crate) async fn commit_staged_chunks_if_state_matches_async(
@@ -1478,7 +1450,7 @@ async fn state_change_matches_at(
     snapshot: &HeadSnapshot,
     condition: &StateChange,
 ) -> tinystoragedrivers_types::Result<bool> {
-    let mut actual =
+    let actual =
         read_state_at(documents, snapshot, &condition.collection, &condition.key).await?;
     if actual.is_none() && condition.collection == CHUNK_LIFECYCLE && condition.value.is_some() {
         let implicit = implicit_chunk_lifecycle_status(documents, snapshot, &condition.key)

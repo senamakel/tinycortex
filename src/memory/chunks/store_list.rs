@@ -153,7 +153,7 @@ fn matching_chunks_with_extra(
             collections.push(collection);
         }
     }
-    let (mut chunks, states) = super::versioned::list_chunk_snapshot(config, &collections)?;
+    let (chunks, states) = super::versioned::list_chunk_snapshot(config, &collections)?;
     filter_chunk_snapshot(chunks, states, query)
 }
 
