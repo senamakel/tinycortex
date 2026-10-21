@@ -132,9 +132,10 @@ async fn concurrent_legacy_audit_imports_share_the_captured_tail() {
         })
         .unwrap(),
     ];
-    let streams: Arc<dyn StreamStore> = Arc::new(InjectConcurrentImport {
+    let streams: Arc<dyn StreamStore> = Arc::new(AuditStreamFaults {
         inner: raw.streams().clone(),
-        pending: Arc::new(AtomicBool::new(true)),
+        inject_competitor: Arc::new(AtomicBool::new(true)),
+        lose_append_ack: Arc::new(AtomicBool::new(false)),
         rows: rows.clone(),
     });
     let storage = Storage::new(
@@ -171,6 +172,52 @@ async fn concurrent_legacy_audit_imports_share_the_captured_tail() {
 }
 
 #[tokio::test]
+async fn legacy_audit_import_retry_after_lost_append_ack_is_idempotent() {
+    let scope = tinystoragedrivers_types::Scope::new("test:audit-import-lost-ack").unwrap();
+    let raw = tinystoragedrivers_testkit::memory_storage(&scope);
+    let streams: Arc<dyn StreamStore> = Arc::new(AuditStreamFaults {
+        inner: raw.streams().clone(),
+        inject_competitor: Arc::new(AtomicBool::new(false)),
+        lose_append_ack: Arc::new(AtomicBool::new(true)),
+        rows: Vec::new(),
+    });
+    let storage = Storage::new(
+        raw.documents().clone(),
+        streams,
+        raw.kv().clone(),
+        raw.blobs().clone(),
+        raw.queues().clone(),
+        raw.secrets().clone(),
+    );
+    let config = crate::memory::config::MemoryConfig::open_with_storage("workspace", storage)
+        .await
+        .unwrap();
+    let entries = vec![
+        entry("first", Utc.timestamp_millis_opt(10).unwrap()),
+        entry("second", Utc.timestamp_millis_opt(9).unwrap()),
+    ];
+
+    assert!(
+        import_legacy_audit_entries_async(&config, "sha256:lost-ack", &entries)
+            .await
+            .is_err()
+    );
+    import_legacy_audit_entries_async(&config, "sha256:lost-ack", &entries)
+        .await
+        .unwrap();
+    assert_eq!(
+        config
+            .storage()
+            .unwrap()
+            .streams()
+            .len(LEGACY_AUDIT_STREAM)
+            .await
+            .unwrap(),
+        entries.len() as u64
+    );
+}
+
+#[tokio::test]
 async fn malformed_legacy_audit_protocol_rows_refuse_import() {
     let temp = tempfile::tempdir().unwrap();
     let config = crate::memory::chunks::test_support::host_config(temp.path());
@@ -192,14 +239,15 @@ async fn malformed_legacy_audit_protocol_rows_refuse_import() {
 }
 
 #[derive(Debug)]
-struct InjectConcurrentImport {
+struct AuditStreamFaults {
     inner: Arc<dyn StreamStore>,
-    pending: Arc<AtomicBool>,
+    inject_competitor: Arc<AtomicBool>,
+    lose_append_ack: Arc<AtomicBool>,
     rows: Vec<serde_json::Value>,
 }
 
 #[async_trait::async_trait]
-impl StreamStore for InjectConcurrentImport {
+impl StreamStore for AuditStreamFaults {
     fn capabilities(&self) -> Capabilities {
         self.inner.capabilities()
     }
@@ -226,9 +274,16 @@ impl StreamStore for InjectConcurrentImport {
         expected: u64,
         values: Vec<serde_json::Value>,
     ) -> tinystoragedrivers_types::Result<u64> {
-        self.inner
+        let appended = self
+            .inner
             .append_batch_if_offset(stream, expected, values)
-            .await
+            .await?;
+        if self.lose_append_ack.swap(false, Ordering::SeqCst) {
+            return Err(tinystoragedrivers_types::StorageError::backend(
+                "injected lost audit append acknowledgement",
+            ));
+        }
+        Ok(appended)
     }
 
     async fn read_window(
@@ -242,7 +297,7 @@ impl StreamStore for InjectConcurrentImport {
 
     async fn len(&self, stream: &str) -> tinystoragedrivers_types::Result<u64> {
         let captured = self.inner.len(stream).await?;
-        if stream == LEGACY_AUDIT_STREAM && self.pending.swap(false, Ordering::SeqCst) {
+        if stream == LEGACY_AUDIT_STREAM && self.inject_competitor.swap(false, Ordering::SeqCst) {
             self.inner
                 .append_batch_if_offset(stream, captured, self.rows.clone())
                 .await?;
