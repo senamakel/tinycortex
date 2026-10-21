@@ -234,6 +234,7 @@ fn committed_reembed_defer_keeps_backfill_hint_until_completion() {
             follow_ups: Vec::new(),
             expected: Vec::new(),
             mutations: Vec::new(),
+            document_projection: None,
         }),
     )
     .unwrap();
@@ -252,6 +253,7 @@ fn committed_reembed_defer_keeps_backfill_hint_until_completion() {
             follow_ups: Vec::new(),
             expected: Vec::new(),
             mutations: Vec::new(),
+            document_projection: None,
         }),
     )
     .unwrap();

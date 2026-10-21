@@ -18,6 +18,39 @@ fn test_config() -> (TempDir, MemoryConfig) {
     (tmp, cfg)
 }
 
+fn test_config_with_faults() -> (TempDir, MemoryConfig, tinystoragedrivers_testkit::FaultPlan) {
+    use tinystoragedrivers_api::Storage;
+    use tinystoragedrivers_testkit::Failing;
+    let tmp = TempDir::new().expect("tempdir");
+    let scope = tinystoragedrivers_types::Scope::new(&format!(
+        "test:tinycortex-purge-{}",
+        uuid::Uuid::new_v4()
+    ))
+    .expect("scope");
+    let raw = tinystoragedrivers_testkit::memory_storage(&scope);
+    let failing = Failing::new(raw.documents().clone());
+    let faults = failing.faults.clone();
+    let storage = Storage::new(
+        std::sync::Arc::new(failing),
+        raw.streams().clone(),
+        raw.kv().clone(),
+        raw.blobs().clone(),
+        raw.queues().clone(),
+        raw.secrets().clone(),
+    );
+    let workspace = tmp.path().to_path_buf();
+    let config = std::thread::spawn(move || {
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime")
+            .block_on(MemoryConfig::open_with_storage(workspace, storage))
+    })
+    .join()
+    .expect("storage setup thread")
+    .expect("open host storage");
+    (tmp, config, faults)
+}
+
 fn chunk_with(source_id: &str, seq: u32, ts_ms: i64, content: &str) -> Chunk {
     let ts = Utc.timestamp_millis_opt(ts_ms).unwrap();
     Chunk {
@@ -343,67 +376,57 @@ const PURGED_TABLES: [&str; 14] = [
     "mem_tree_ingested_sources",
 ];
 
-/// A purge that cannot finish must not half-finish. A child table with a
-/// restricting foreign key onto `mem_tree_chunks` makes the chunk delete — the
-/// thirteenth of fourteen statements — fail, so every table emptied before it
-/// has to come back.
+/// A failed host write cannot expose any part of a multi-collection purge.
 #[test]
-fn purge_all_rolls_back_when_one_delete_fails() {
-    let (_tmp, cfg) = test_config();
-    let chunk = chunk_with("slack:#eng", 0, 1_000, "body");
-    upsert_chunks(&cfg, std::slice::from_ref(&chunk)).unwrap();
-    seed_full_tier(&cfg, &chunk);
+fn purge_failure_keeps_the_captured_owner_state_visible() {
+    let (_tmp, cfg, faults) = test_config_with_faults();
+    let summary = super::versioned::StateChange {
+        collection: super::collections::SUMMARIES.into(),
+        key: "summary:purge-atomicity".into(),
+        value: Some(serde_json::json!({"id":"purge-atomicity"})),
+    };
+    let gate = super::versioned::StateChange {
+        collection: super::collections::INGESTED_SOURCES.into(),
+        key: "chat\0purge-atomicity".into(),
+        value: Some(serde_json::json!({"source_kind":"chat","source_id":"purge-atomicity"})),
+    };
+    assert!(super::versioned::commit_if_state_matches(
+        &cfg,
+        &[],
+        &[],
+        &[summary.clone(), gate.clone()],
+    )
+    .unwrap());
+    faults.fail_operation_nth(
+        "documents.put_with",
+        3,
+        tinystoragedrivers_types::ErrorKind::Backend,
+    );
 
-    let before: Vec<i64> = PURGED_TABLES
-        .iter()
-        .map(|table| count_rows(&cfg, table))
-        .collect();
-    assert!(before.iter().all(|count| *count == 1));
+    assert!(purge_all(&cfg).is_err());
+    assert_eq!(
+        super::versioned::read_state(&cfg, &summary.collection, &summary.key).unwrap(),
+        summary.value,
+        "a failed purge must leave summary state visible"
+    );
+    assert_eq!(
+        super::versioned::read_state(&cfg, &gate.collection, &gate.key).unwrap(),
+        gate.value,
+        "a failed purge must leave the source gate visible"
+    );
 
-    with_connection(&cfg, |conn| {
-        conn.execute_batch(
-            "CREATE TABLE purge_block (
-                chunk_id TEXT NOT NULL REFERENCES mem_tree_chunks(id)
-             );",
-        )?;
-        conn.execute(
-            "INSERT INTO purge_block (chunk_id) VALUES (?1)",
-            params![chunk.id],
-        )?;
-        Ok(())
-    })
-    .unwrap();
-
+    faults.clear();
+    assert_eq!(purge_all(&cfg).unwrap(), 2);
     assert!(
-        purge_all(&cfg).is_err(),
-        "the blocked chunk delete must surface as an error"
+        super::versioned::list_state(&cfg, super::collections::SUMMARIES)
+            .unwrap()
+            .is_empty()
     );
-    let after: Vec<i64> = PURGED_TABLES
-        .iter()
-        .map(|table| count_rows(&cfg, table))
-        .collect();
-    assert_eq!(
-        after, before,
-        "a failed purge must leave every table intact"
+    assert!(
+        super::versioned::list_state(&cfg, super::collections::INGESTED_SOURCES)
+            .unwrap()
+            .is_empty()
     );
-
-    with_connection(&cfg, |conn| {
-        conn.execute_batch("DROP TABLE purge_block;")?;
-        Ok(())
-    })
-    .unwrap();
-
-    assert_eq!(
-        purge_all(&cfg).unwrap(),
-        PURGED_TABLES.len(),
-        "the count is every row removed, and each table above holds exactly one"
-    );
-    for table in PURGED_TABLES {
-        assert_eq!(count_rows(&cfg, table), 0, "{table} must be empty");
-    }
-    assert_eq!(count_chunks(&cfg).unwrap(), 0);
-    // Idempotent: purging an already-empty store is not an error.
-    assert_eq!(purge_all(&cfg).unwrap(), 0);
 }
 
 #[test]

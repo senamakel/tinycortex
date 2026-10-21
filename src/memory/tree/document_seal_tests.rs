@@ -153,7 +153,8 @@ async fn test_setup() -> (TempDir, crate::memory::config::MemoryConfig, store::T
         TreeKind::Source,
         "document-seal-scope",
     )
-        .unwrap();
+    .await
+    .unwrap();
     let chunk = test_chunk();
     upsert_chunks_async(&config, std::slice::from_ref(&chunk))
         .await

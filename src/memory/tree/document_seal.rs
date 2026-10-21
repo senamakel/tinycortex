@@ -327,7 +327,13 @@ impl PlannedDocumentMutations {
     ) -> Result<()> {
         let mut by_key = BTreeMap::new();
         for change in changes {
-            by_key.insert((change.collection, change.key), change.value);
+            let key = (change.collection, change.key);
+            anyhow::ensure!(
+                by_key.insert(key.clone(), change.value).is_none(),
+                "document seal emitted duplicate mutation for {}:{}",
+                key.0,
+                key.1
+            );
         }
         for condition in expected {
             let value = by_key
@@ -380,6 +386,12 @@ impl PlannedDocumentMutations {
                     }
                     crate::memory::chunks::collections::SUMMARY_EMBEDDINGS => {
                         crate::memory::queue::JobStateCollection::SummaryEmbeddings
+                    }
+                    crate::memory::chunks::collections::SUMMARY_REEMBED_SKIPS => {
+                        crate::memory::queue::JobStateCollection::SummaryReembedSkips
+                    }
+                    crate::memory::chunks::collections::SUMMARY_CONTENT_POINTERS => {
+                        crate::memory::queue::JobStateCollection::SummaryContentPointers
                     }
                     crate::memory::chunks::collections::ENTITY_INDEX => {
                         crate::memory::queue::JobStateCollection::EntityIndex
