@@ -32,26 +32,16 @@
 //! own those tables.
 
 use std::path::PathBuf;
-use std::time::Duration;
 
 use crate::memory::config::MemoryConfig;
 
 pub(crate) mod collections;
-mod schema;
-
-#[path = "connection.rs"]
-mod connection;
-mod connection_breaker;
-#[path = "recovery.rs"]
-mod recovery;
 
 #[path = "embeddings.rs"]
 mod embeddings;
 #[path = "embeddings_query.rs"]
 mod embeddings_query;
 mod legacy_import;
-#[path = "migrations.rs"]
-mod migrations;
 #[path = "produce.rs"]
 mod produce;
 #[path = "produce_split.rs"]
@@ -79,9 +69,6 @@ pub(crate) mod versioned;
 use tinycortex_api::chunks as types;
 
 #[cfg(test)]
-#[path = "store_conn_tests.rs"]
-mod store_conn_tests;
-#[cfg(test)]
 #[path = "store_delete_tests.rs"]
 mod store_delete_tests;
 #[cfg(test)]
@@ -106,14 +93,12 @@ pub use types::{
 };
 
 pub use collections::collections;
-pub use connection::{shared_connection, with_connection};
 pub(crate) use embeddings::summary_reembed_skip_key;
 pub use embeddings::{
     clear_chunk_reembed_skipped, clear_reembed_skipped_for_signature,
     clear_summary_reembed_skipped, clear_summary_reembed_skipped_async, embedding_to_blob,
     mark_chunk_reembed_skipped, mark_summary_reembed_skipped, mark_summary_reembed_skipped_async,
     plan_chunk_embedding_for_queue, set_chunk_embedding, set_chunk_embedding_for_signature,
-    set_chunk_embedding_for_signature_tx, set_summary_embedding_for_signature_tx,
     tree_active_signature, REEMBED_SKIP_KEY_MAX_LEN,
 };
 pub use embeddings_query::{
@@ -132,24 +117,21 @@ pub use raw_refs::{
     get_chunk_content_path, get_chunk_content_pointers, get_chunk_raw_refs,
     get_chunk_raw_refs_async, get_summary_content_pointers, get_summary_content_pointers_async,
     list_chunk_raw_ref_paths_with_prefix, list_chunk_raw_ref_paths_with_prefix_async,
-    list_summaries_with_content_path, set_chunk_raw_refs, set_chunk_raw_refs_tx, RawRef,
-};
-pub use recovery::{
-    is_io_open_error, is_transient_cold_start, recover_corrupt_db, try_cleanup_stale_files,
+    list_summaries_with_content_path, set_chunk_raw_refs, RawRef,
 };
 pub(crate) use signature::signature_in_clause;
 pub use signature::{
     format_signature, parse_signature, signature_variants, signatures_equivalent, SignatureParts,
 };
 pub use store::{
-    claim_source_ingest, claim_source_ingest_tx, count_chunks, count_chunks_by_lifecycle_status,
+    claim_source_ingest, count_chunks, count_chunks_by_lifecycle_status,
     count_raw_paths_ingested_with_prefix, delete_source_ingest, extraction_coverage,
     extraction_coverage_async, filter_raw_paths_not_ingested, get_chunk, get_chunk_async,
     get_chunk_lifecycle_status, get_chunks_batch, get_chunks_batch_async, is_source_ingested,
     list_source_ids_with_prefix, mark_raw_paths_ingested, set_chunk_lifecycle_status,
     update_chunk_content_sha256, update_summary_content_sha256,
-    update_summary_content_sha256_async, upsert_chunks, upsert_chunks_async, upsert_chunks_tx,
-    upsert_staged_chunks, upsert_staged_chunks_tx, CHUNK_STATUS_ADMITTED, CHUNK_STATUS_BUFFERED,
+    update_summary_content_sha256_async, upsert_chunks, upsert_chunks_async,
+    upsert_staged_chunks, CHUNK_STATUS_ADMITTED, CHUNK_STATUS_BUFFERED,
     CHUNK_STATUS_DROPPED, CHUNK_STATUS_PENDING_EXTRACTION, CHUNK_STATUS_SEALED, RAW_FILE_GATE_KIND,
 };
 pub use store_delete::{
@@ -169,7 +151,6 @@ pub use store_list::{
 #[cfg(test)]
 #[path = "embedding_plan_tests.rs"]
 mod embedding_plan_tests;
-pub use store_sources::{get_chunk_lifecycle_status_tx, set_chunk_lifecycle_status_tx};
 
 // ── Shared internal constants / helpers ─────────────────────────────────────
 
