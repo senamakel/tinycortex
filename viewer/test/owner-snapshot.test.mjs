@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { parseOwnerSnapshot } from "../lib/inspector.ts";
+import { parseOwnerSnapshot } from "../lib/owner-snapshot.ts";
 
 const valid = {
   skill_documents: [{ namespace: "skilldoc:github", key: "doc-1", value: { title: "Guide" }, updated_at: 12 }],
