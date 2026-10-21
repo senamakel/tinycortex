@@ -330,6 +330,13 @@ async fn typed_import_preserves_job_history_and_recovers_running_work() {
     })
     .await
     .unwrap();
+    update_test_record_async(&cfg, "legacy-running", |record| {
+        record.status = JobStatus::Done.as_str().to_owned();
+        record.attempts = 4;
+        record.completed_at_ms = Some(1_800_000_000_001);
+    })
+    .await
+    .unwrap();
     let snapshot = crate::memory::chunks::versioned::capture_state_snapshot_async(&cfg)
         .await
         .unwrap();
