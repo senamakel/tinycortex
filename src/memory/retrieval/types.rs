@@ -213,6 +213,32 @@ pub(crate) fn hydrated_chunk_hit(
     hit
 }
 
+pub(crate) fn hydrated_chunk_hit_from_snapshot(
+    config: &crate::memory::MemoryConfig,
+    chunk: &Chunk,
+    tree_id: &str,
+    tree_scope: &str,
+    score: f32,
+    raw_refs: Option<&serde_json::Value>,
+    content_pointer: Option<&serde_json::Value>,
+) -> RetrievalHit {
+    let mut hit = hit_from_chunk(chunk, tree_id, tree_scope, score);
+    match crate::memory::store::content::read::read_chunk_body_from_snapshot(
+        config,
+        &chunk.id,
+        &chunk.content,
+        raw_refs,
+        content_pointer,
+    ) {
+        Ok(body) => hit.content = body,
+        Err(error) => log::warn!(
+            "[memory:retrieval] full chunk body unavailable; serving preview chunk_id={}: {error}",
+            chunk.id
+        ),
+    }
+    hit
+}
+
 /// Decide the placeholder [`TreeKind`] to report on a leaf hit. Leaves live
 /// under source trees regardless of the underlying [`SourceKind`], so we always
 /// return [`TreeKind::Source`]. Accepting the `SourceKind` argument keeps the

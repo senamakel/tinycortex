@@ -998,11 +998,10 @@ fn add_implicit_lifecycle_states(
     let lifecycle = states.entry(CHUNK_LIFECYCLE.to_owned()).or_default();
     let explicit = lifecycle
         .iter()
-        .map(|(key, _)| key.as_str())
+        .map(|(key, _)| key.clone())
         .collect::<HashSet<_>>();
     lifecycle.extend(defaults.iter().filter_map(|(key, status)| {
-        (!explicit.contains(key.as_str()))
-            .then(|| (key.clone(), serde_json::json!({"status": status})))
+        (!explicit.contains(key)).then(|| (key.clone(), serde_json::json!({"status": status})))
     }));
 }
 

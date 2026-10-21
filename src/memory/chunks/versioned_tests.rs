@@ -625,6 +625,7 @@ async fn corrupt_commit_cycle_is_rejected_instead_of_looping() {
         ancestors: vec!["chunk-write:cycle".into()],
         writes: Vec::new(),
         state_writes: Vec::new(),
+        default_lifecycle_status: None,
     };
     docs.put_with(
         OPERATIONS,
@@ -642,6 +643,7 @@ async fn corrupt_commit_cycle_is_rejected_instead_of_looping() {
         ancestors: Vec::new(),
         writes: Vec::new(),
         state_writes: Vec::new(),
+        default_lifecycle_status: None,
     };
     let error = manifest_is_ancestor(&*docs, cycle, &target, 1)
         .await
@@ -668,6 +670,7 @@ async fn stale_writer_cannot_publish_over_a_newer_head() {
         &winner_batch,
         &normalized_winner,
         &[],
+        None,
     )
     .unwrap();
     let error = upsert_chunks_at(
@@ -676,6 +679,7 @@ async fn stale_writer_cannot_publish_over_a_newer_head() {
         &loser_batch,
         &normalized_loser,
         &[],
+        None,
     )
     .unwrap_err();
 

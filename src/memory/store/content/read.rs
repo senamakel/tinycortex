@@ -171,6 +171,51 @@ pub fn read_chunk_body(config: &MemoryConfig, chunk_id: &str) -> anyhow::Result<
     Ok(result.body)
 }
 
+/// Read a chunk using sidecar values captured with its list snapshot.
+///
+/// This avoids one owner-state read per result while retaining the same raw
+/// reference, staged-file, and inline-preview precedence as [`read_chunk_body`].
+pub(crate) fn read_chunk_body_from_snapshot(
+    config: &MemoryConfig,
+    chunk_id: &str,
+    inline_content: &str,
+    raw_refs: Option<&serde_json::Value>,
+    content_pointer: Option<&serde_json::Value>,
+) -> anyhow::Result<String> {
+    if let Some(value) = raw_refs {
+        let refs: Vec<RawRef> = serde_json::from_value(value.clone())
+            .map_err(|error| anyhow::anyhow!("deserialize raw refs: {error}"))?;
+        if !refs.is_empty() {
+            return read_chunk_body_from_raw(config, &refs);
+        }
+    }
+
+    if let Some(value) = content_pointer {
+        let pointer: ChunkContentPointer = serde_json::from_value(value.clone())?;
+        if pointer.chunk_id == chunk_id && !pointer.content_path.is_empty() {
+            let abs_path =
+                resolve_within_content_root(&content_root(config), &pointer.content_path)?;
+            let result = read_chunk_file(&abs_path)?;
+            if result.sha256 != pointer.content_sha256 {
+                log::warn!(
+                    "[memory:content] repairing stale chunk checksum token chunk_id={chunk_id}"
+                );
+                if let Err(error) = update_chunk_content_sha256(config, chunk_id, &result.sha256) {
+                    log::warn!(
+                        "[memory:content] chunk checksum repair failed chunk_id={chunk_id}: {error}"
+                    );
+                }
+            }
+            return Ok(result.body);
+        }
+    }
+
+    if inline_content.is_empty() {
+        anyhow::bail!("{LEGACY_EMPTY_CHUNK_CONTENT_REASON_PREFIX}{chunk_id}");
+    }
+    Ok(inline_content.to_owned())
+}
+
 /// Fallback reader for pre-content-store chunk rows.
 ///
 /// Its error text prefixes are part of the reembed-backfill contract:

@@ -21,12 +21,16 @@ use std::collections::{HashMap, HashSet};
 
 use anyhow::Result;
 
-use crate::memory::chunks::{list_chunks, Chunk, ListChunksQuery, Metadata, SourceKind};
+use crate::memory::chunks::{
+    list_chunks_with_content_state, Chunk, ListChunksQuery, Metadata, SourceKind,
+};
 use crate::memory::config::MemoryConfig;
 use crate::memory::tree::store::{get_tree_by_scope, list_summaries_in_window};
 use crate::memory::tree::{SummaryNode, TreeKind};
 
-use super::types::{hydrated_chunk_hit, hydrated_summary_hit, QueryResponse, RetrievalHit};
+use super::types::{
+    hydrated_chunk_hit_from_snapshot, hydrated_summary_hit, QueryResponse, RetrievalHit,
+};
 
 /// Page size used while scanning the complete in-window chunk set. Pagination
 /// bounds each materialization without silently dropping later sources.
@@ -134,8 +138,12 @@ fn collect_cover(
     let restrict_summaries = source_id.is_some() || source_scope.is_some();
     let page_size = config.retrieval.limits.window_chunk_page_size;
     let mut chunks = Vec::new();
+    let mut content_state = HashMap::<
+        String,
+        HashMap<String, serde_json::Value>,
+    >::new();
     loop {
-        let page = list_chunks(
+        let (page, page_state) = list_chunks_with_content_state(
             config,
             &ListChunksQuery {
                 source_id: source_id.map(str::to_owned),
@@ -150,6 +158,10 @@ fn collect_cover(
             },
         )?;
         let page_len = page.len();
+        for (collection, rows) in page_state {
+            let destination = content_state.entry(collection).or_default();
+            destination.extend(rows);
+        }
         chunks.extend(page);
         if page_len < page_size {
             break;
@@ -174,6 +186,7 @@ fn collect_cover(
             until_ms,
             src_chunks,
             restrict_summaries,
+            &content_state,
             &mut hits,
         )?;
     }
@@ -189,6 +202,7 @@ fn cover_one_source(
     until_ms: i64,
     chunks: Vec<Chunk>,
     exact_source: bool,
+    content_state: &HashMap<String, HashMap<String, serde_json::Value>>,
     out: &mut Vec<RetrievalHit>,
 ) -> Result<()> {
     let tree = get_tree_by_scope(config, TreeKind::Source, source)?;
@@ -215,7 +229,21 @@ fn cover_one_source(
         if plan.covered_chunk_ids.contains(&chunk.id) || suppressed_chunk_ids.contains(&chunk.id) {
             continue;
         }
-        out.push(hydrated_chunk_hit(config, chunk, &tree_id, source, 0.0));
+        let raw_refs = content_state
+            .get(crate::memory::chunks::collections::RAW_REFS)
+            .and_then(|rows| rows.get(&chunk.id));
+        let content_pointer = content_state
+            .get(crate::memory::chunks::collections::CHUNK_CONTENT_POINTERS)
+            .and_then(|rows| rows.get(&chunk.id));
+        out.push(hydrated_chunk_hit_from_snapshot(
+            config,
+            chunk,
+            &tree_id,
+            source,
+            0.0,
+            raw_refs,
+            content_pointer,
+        ));
     }
     Ok(())
 }
