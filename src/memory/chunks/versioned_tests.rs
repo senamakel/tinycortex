@@ -364,9 +364,14 @@ async fn plain_upsert_keeps_default_lifecycle_implicit() {
     let (listed, states) = list_chunk_snapshot(&config, &[CHUNK_LIFECYCLE]).unwrap();
     assert_eq!(listed.len(), chunks.len());
     assert!(
-        states[CHUNK_LIFECYCLE].is_empty(),
+        chunks.iter().all(|chunk| {
+            read_state(&config, CHUNK_LIFECYCLE, &chunk.id)
+                .unwrap()
+                .is_none()
+        }),
         "fresh plain upsert should not materialize one default lifecycle row per chunk"
     );
+    assert_eq!(states[CHUNK_LIFECYCLE].len(), chunks.len());
     assert_eq!(
         super::super::store::get_chunk_lifecycle_status(&config, &chunks[0].id).unwrap(),
         Some(super::super::store::CHUNK_STATUS_ADMITTED.to_owned())
