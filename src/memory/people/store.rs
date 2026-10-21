@@ -51,7 +51,7 @@ fn global_slot() -> &'static RwLock<Option<GlobalPeopleStore>> {
     GLOBAL.get_or_init(Default::default)
 }
 
-/// Open or return the configured people store for a workspace.
+/// Create a people store bound to the supplied prepared host configuration.
 ///
 /// The configuration must have been opened with [`MemoryConfig::open_with_storage`]
 /// or otherwise have completed `prepare_storage`. This function never creates

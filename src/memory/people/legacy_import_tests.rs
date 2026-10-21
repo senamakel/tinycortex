@@ -1,4 +1,5 @@
 use super::*;
+use crate::memory::people::{store, types::PersonId};
 
 fn person(id: PersonId, name: &str) -> Person {
     let created_at = Utc.timestamp_opt(1_700_000_000, 0).single().unwrap();
@@ -101,4 +102,60 @@ async fn legacy_import_rejects_duplicate_handle_owners_before_writing_anything()
             .unwrap()
             .is_empty()
     );
+}
+
+#[tokio::test]
+async fn failed_legacy_import_commit_exposes_no_partial_person_alias_or_interaction() {
+    use std::sync::Arc;
+    use tinystoragedrivers_api::Storage;
+    use tinystoragedrivers_testkit::Failing;
+    use tinystoragedrivers_types::{ErrorKind, Scope};
+
+    let workspace = tempfile::tempdir().unwrap();
+    let raw = tinystoragedrivers_testkit::memory_storage(
+        &Scope::new("test:people-import-failed-commit").unwrap(),
+    );
+    let failing = Failing::new(raw.documents().clone());
+    let faults = failing.faults.clone();
+    let storage = Storage::new(
+        Arc::new(failing),
+        raw.streams().clone(),
+        raw.kv().clone(),
+        raw.blobs().clone(),
+        raw.queues().clone(),
+        raw.secrets().clone(),
+    );
+    let config = MemoryConfig::open_with_storage(workspace.path(), storage)
+        .await
+        .unwrap();
+    let person_id = PersonId::new();
+    let batch = LegacyPeopleBatch {
+        people: vec![LegacyPersonRecord {
+            person: person(person_id, "Atomic import"),
+            aliases: vec![LegacyHandleAlias {
+                handle: Handle::Email("atomic-import@example.com".into()),
+                created_at: 1_550_000_000,
+            }],
+            interactions: vec![LegacyInteraction {
+                source_id: "source-row:1".into(),
+                interaction: Interaction {
+                    person_id,
+                    ts: Utc.timestamp_opt(1_600_000_000, 0).single().unwrap(),
+                    is_outbound: false,
+                    length: 10,
+                },
+            }],
+        }],
+    };
+    faults.fail_operation_nth("documents.put_with", 1, ErrorKind::Unavailable);
+
+    assert!(import_legacy_people(&config, &batch).await.is_err());
+
+    faults.clear();
+    for collection in [PEOPLE, PEOPLE_HANDLES, PEOPLE_INTERACTIONS] {
+        assert!(versioned::list_state_async(&config, collection)
+            .await
+            .unwrap()
+            .is_empty());
+    }
 }

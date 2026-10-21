@@ -13,9 +13,9 @@ use serde_json::Value;
 use crate::memory::chunks::versioned::{self, StateChange};
 use crate::memory::config::MemoryConfig;
 use crate::memory::people::store::{
-    self, HandleRecord, InteractionRecord, PEOPLE, PEOPLE_HANDLES, PEOPLE_INTERACTIONS,
+    HandleRecord, InteractionRecord, PEOPLE, PEOPLE_HANDLES, PEOPLE_INTERACTIONS,
 };
-use crate::memory::people::types::{Handle, Interaction, Person, PersonId};
+use crate::memory::people::types::{Handle, Interaction, Person};
 
 const IMPORT_RETRIES: usize = 8;
 
