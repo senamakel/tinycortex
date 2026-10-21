@@ -448,6 +448,54 @@ async fn insert_batch_multiple() {
 }
 
 #[tokio::test]
+async fn empty_logical_id_roundtrips_in_empty_namespace() {
+    let store = fake_store(2);
+    store
+        .insert_with_vector_async("", "", "empty identity", &[1.0, 0.0], json!({"kept": true}))
+        .await
+        .unwrap();
+
+    let results = store
+        .search_by_vector_async("", &[1.0, 0.0], 1)
+        .await
+        .unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].id, "");
+    assert_eq!(results[0].namespace, "");
+    assert_eq!(results[0].metadata, json!({"kept": true}));
+    assert!(store.delete_async("", "").await.unwrap());
+    assert!(store
+        .search_by_vector_async("", &[1.0, 0.0], 1)
+        .await
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
+async fn duplicate_batch_ids_keep_the_last_entry() {
+    let store = fake_store(2);
+    store
+        .insert_batch(
+            "notes",
+            &[
+                ("same", "first", json!({"version": 1})),
+                ("same", "last", json!({"version": 2})),
+            ],
+        )
+        .await
+        .unwrap();
+
+    let result = store
+        .search_by_vector_async("notes", &text_to_vec("last", 2), 1)
+        .await
+        .unwrap();
+    assert_eq!(result.len(), 1);
+    assert_eq!(result[0].id, "same");
+    assert_eq!(result[0].text, "last");
+    assert_eq!(result[0].metadata, json!({"version": 2}));
+}
+
+#[tokio::test]
 async fn insert_batch_empty() {
     let store = fake_store(4);
     store.insert_batch("ns", &[]).await.unwrap();
