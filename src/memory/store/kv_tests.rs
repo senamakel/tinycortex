@@ -19,7 +19,10 @@ async fn global_and_namespace_values_roundtrip_without_identity_collisions() {
         .await
         .unwrap();
 
-    assert_eq!(kv.get_global_async("same").await.unwrap(), Some(json!(null)));
+    assert_eq!(
+        kv.get_global_async("same").await.unwrap(),
+        Some(json!(null))
+    );
     assert_eq!(
         kv.get_namespace_async("global", "same").await.unwrap(),
         Some(json!(7))
@@ -70,8 +73,14 @@ async fn records_for_scope_keeps_namespace_records_ahead_of_global_ties() {
     // Both writes happen within one clock tick in the deterministic memory
     // driver test. If clock resolution differs, the API still sorts by time.
     scoped.sort_by(|left, right| left.updated_at.total_cmp(&right.updated_at));
-    let local = scoped.iter().position(|record| record.namespace.is_some()).unwrap();
-    let global = scoped.iter().position(|record| record.namespace.is_none()).unwrap();
+    let local = scoped
+        .iter()
+        .position(|record| record.namespace.is_some())
+        .unwrap();
+    let global = scoped
+        .iter()
+        .position(|record| record.namespace.is_none())
+        .unwrap();
     if scoped[local].updated_at == scoped[global].updated_at {
         let merged = kv.records_for_scope_async("scope").await.unwrap();
         assert!(merged[0].namespace.is_some());
@@ -107,12 +116,18 @@ async fn secret_keys_are_rejected_and_values_are_sanitized() {
     assert!(error.contains("cannot contain secrets"));
     kv.set_global_async(
         "notes",
-        &json!(format!("my key is {}", ["sk-", "abcdefghijklmnopqrstuvwxyz1234"].concat())),
+        &json!(format!(
+            "my key is {}",
+            ["sk-", "abcdefghijklmnopqrstuvwxyz1234"].concat()
+        )),
     )
     .await
     .unwrap();
     let stored = kv.get_global_async("notes").await.unwrap().unwrap();
-    assert!(!stored.as_str().unwrap().contains(&["sk-", "abcdefghijklmnopqrstuvwxyz1234"].concat()));
+    assert!(!stored
+        .as_str()
+        .unwrap()
+        .contains(&["sk-", "abcdefghijklmnopqrstuvwxyz1234"].concat()));
 }
 
 #[test]

@@ -14,8 +14,8 @@ use tinystoragedrivers_api::KvStore as KvPort;
 use tinystoragedrivers_types::{Cursor, ErrorKind, Precondition, Versioned};
 
 use crate::memory::config::MemoryConfig;
-use crate::memory::store::safety;
 use crate::memory::storage::Blocking;
+use crate::memory::store::safety;
 use crate::memory::types::MemoryKvRecord;
 
 const KEY_PREFIX: &str = "tinycortex:kv:v1:";
@@ -126,16 +126,14 @@ impl KvStore {
     }
 
     fn storage_key(kind: EntryKind, namespace: Option<&str>, key: &str) -> String {
-        let identity = serde_json::to_vec(&(kind, namespace, key))
-            .expect("serializing a tuple of strings cannot fail");
-        let digest = Sha256::digest(identity);
-        let mut encoded = String::with_capacity(KEY_PREFIX.len() + digest.len() * 2);
-        encoded.push_str(KEY_PREFIX);
-        for byte in digest {
-            use std::fmt::Write as _;
-            write!(&mut encoded, "{byte:02x}").expect("writing to String cannot fail");
+        match kind {
+            EntryKind::Global => format!("{KEY_PREFIX}g:{}", digest_hex(key.as_bytes())),
+            EntryKind::Namespace => format!(
+                "{KEY_PREFIX}n:{}:{}",
+                digest_hex(namespace.unwrap_or_default().as_bytes()),
+                digest_hex(key.as_bytes())
+            ),
         }
-        encoded
     }
 
     fn checked_entry(
@@ -194,7 +192,11 @@ impl KvStore {
                 Self::checked_entry(current.clone(), kind, namespace.as_deref(), &key)?;
                 match self
                     .port
-                    .cas(&storage_key, encoded.clone(), Precondition::Version(current.version))
+                    .cas(
+                        &storage_key,
+                        encoded.clone(),
+                        Precondition::Version(current.version),
+                    )
                     .await
                 {
                     Ok(_) => return Ok(()),
@@ -213,7 +215,9 @@ impl KvStore {
                 }
             }
         }
-        Err(format!("write KV key '{key}': contention retry limit reached"))
+        Err(format!(
+            "write KV key '{key}': contention retry limit reached"
+        ))
     }
 
     async fn get_value(
@@ -254,18 +258,24 @@ impl KvStore {
                 Err(error) => return Err(format!("delete KV key '{key}': {error}")),
             }
         }
-        Err(format!("delete KV key '{key}': contention retry limit reached"))
+        Err(format!(
+            "delete KV key '{key}': contention retry limit reached"
+        ))
     }
 
     async fn list_entries(&self, namespace: Option<&str>) -> Result<Vec<Entry>, String> {
-        // The actual digest keys share KEY_PREFIX; list that bounded family and
-        // select by the identity envelope. Drivers return stable key order.
+        // The namespace digest is a prefix, so unrelated namespaces are never
+        // decoded as part of this listing. Drivers return stable key order.
+        let prefix = match namespace {
+            Some(namespace) => format!("{KEY_PREFIX}n:{}:", digest_hex(namespace.as_bytes())),
+            None => format!("{KEY_PREFIX}g:"),
+        };
         let mut cursor = None;
         let mut entries = Vec::new();
         loop {
             let page = self
                 .port
-                .list(KEY_PREFIX, cursor, PAGE_SIZE)
+                .list(&prefix, cursor, PAGE_SIZE)
                 .await
                 .map_err(|error| format!("list KV entries: {error}"))?;
             for record in page.items {
@@ -282,7 +292,10 @@ impl KvStore {
                     let expected_key =
                         Self::storage_key(entry.kind, entry.namespace.as_deref(), &entry.key);
                     if record.id != expected_key {
-                        return Err(format!("KV identity mismatch while listing key '{}'", entry.key));
+                        return Err(format!(
+                            "KV identity mismatch while listing key '{}'",
+                            entry.key
+                        ));
                     }
                     entries.push(entry);
                 }
@@ -311,7 +324,11 @@ impl KvStore {
         }
         let store = self.clone();
         self.blocking
-            .run(async move { store.put_entry(EntryKind::Global, None, key, value.clone()).await })
+            .run(async move {
+                store
+                    .put_entry(EntryKind::Global, None, key, value.clone())
+                    .await
+            })
             .map_err(|error| error.to_string())?
     }
 
@@ -321,7 +338,8 @@ impl KvStore {
         if safety::has_likely_secret(&key) {
             return Err("kv key cannot contain secrets".to_string());
         }
-        self.put_entry(EntryKind::Global, None, key, value.clone()).await
+        self.put_entry(EntryKind::Global, None, key, value.clone())
+            .await
     }
 
     /// Read a global key; corrupt stored data returns an error.
@@ -383,7 +401,8 @@ impl KvStore {
         key: &str,
     ) -> Result<Option<Value>, String> {
         let namespace = Self::sanitize_namespace(namespace);
-        self.get_value(EntryKind::Namespace, Some(&namespace), key).await
+        self.get_value(EntryKind::Namespace, Some(&namespace), key)
+            .await
     }
 
     /// Delete a global key; returns whether a record existed.
@@ -414,11 +433,7 @@ impl KvStore {
     }
 
     /// Async form of [`Self::delete_namespace`].
-    pub async fn delete_namespace_async(
-        &self,
-        namespace: &str,
-        key: &str,
-    ) -> Result<bool, String> {
+    pub async fn delete_namespace_async(&self, namespace: &str, key: &str) -> Result<bool, String> {
         let namespace = Self::sanitize_namespace(namespace);
         self.delete_key(EntryKind::Namespace, Some(&namespace), key)
             .await
@@ -484,9 +499,12 @@ impl KvStore {
         namespace: &str,
     ) -> Result<Vec<MemoryKvRecord>, String> {
         let namespace = Self::sanitize_namespace(namespace);
-        self.list_entries(Some(&namespace))
-            .await
-            .map(|entries| entries.into_iter().map(|entry| record(entry, Some(&namespace))).collect())
+        self.list_entries(Some(&namespace)).await.map(|entries| {
+            entries
+                .into_iter()
+                .map(|entry| record(entry, Some(&namespace)))
+                .collect()
+        })
     }
 
     /// Return all global records newest-first.
@@ -499,9 +517,12 @@ impl KvStore {
 
     /// Async form of [`Self::records_global`].
     pub async fn records_global_async(&self) -> Result<Vec<MemoryKvRecord>, String> {
-        self.list_entries(None)
-            .await
-            .map(|entries| entries.into_iter().map(|entry| record(entry, None)).collect())
+        self.list_entries(None).await.map(|entries| {
+            entries
+                .into_iter()
+                .map(|entry| record(entry, None))
+                .collect()
+        })
     }
 }
 
@@ -513,6 +534,16 @@ fn normalize_write_identity(namespace: &str, key: &str) -> Result<(String, Strin
         KvStore::normalize_namespace_write(namespace),
         KvStore::normalized_namespace_key(key),
     ))
+}
+
+fn digest_hex(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    let mut encoded = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        use std::fmt::Write as _;
+        write!(&mut encoded, "{byte:02x}").expect("writing to String cannot fail");
+    }
+    encoded
 }
 
 fn list_value(entry: Entry) -> Value {
