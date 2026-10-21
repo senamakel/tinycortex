@@ -124,8 +124,8 @@ sha2 = "0.10"
 thiserror = "2"
 # Host-supplied storage contracts. The engine owns these ports, not their
 # implementations; production opens them from the host's scoped bundle.
-tinystoragedrivers-api = { git = "https://github.com/senamakel/tinystoragedrivers", tag = "v2.0.1" }
-tinystoragedrivers-types = { git = "https://github.com/senamakel/tinystoragedrivers", tag = "v2.0.1" }
+tinystoragedrivers-api = { git = "https://github.com/senamakel/tinystoragedrivers", tag = "v2.0.2" }
+tinystoragedrivers-types = { git = "https://github.com/senamakel/tinystoragedrivers", tag = "v2.0.2" }
 # Provider-neutral inference contracts. Pinned until TinyInference is
 # published; embedding hosts may patch this exact git source so the host and
 # TinyCortex share one `EmbeddingModel` trait identity without pulling in an
@@ -189,7 +189,7 @@ block2 = { version = "0.6", optional = true }
 [dev-dependencies]
 dotenvy = "0.15"
 tempfile = "3"
-tinystoragedrivers-testkit = { git = "https://github.com/senamakel/tinystoragedrivers", tag = "v2.0.1" }
+tinystoragedrivers-testkit = { git = "https://github.com/senamakel/tinystoragedrivers", tag = "v2.0.2" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "net"] }
 wiremock = "0.6"
 
