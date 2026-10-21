@@ -63,7 +63,7 @@ sync = ["dep:reqwest", "dep:tracing", "tokio", "tokio/time", "tokio/process", "t
 # Persona distillation surface (`memory::persona`): ingests local coding-agent
 # history, instruction files, and git commits into a durable persona memory
 # layer (doc 06). Adds NO new dependencies — readers reuse `serde_json`,
-# `walkdir`, `rusqlite`, `sha2` from core; the git-history reader additionally
+# `walkdir`, and `sha2` from core; the git-history reader additionally
 # requires the `git-diff` feature. A live run also wants `providers-http` for
 # the OpenRouter reference provider, but the pipeline depends only on the
 # `ChatProvider` / `Summariser` / `EmbeddingBackend` traits.
@@ -115,7 +115,6 @@ chrono = { version = "0.4", features = ["serde"] }
 parking_lot = "0.12"
 rand = "0.10"
 regex = "1"
-rusqlite = { version = "0.40", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 schemars = "1"
@@ -140,9 +139,9 @@ uuid = { version = "1", features = ["serde", "v4"] }
 walkdir = "2"
 
 # ── Optional, feature-gated dependencies ────────────────────────────────────
-# Native-linking deps are pinned to OpenHuman's versions so the host and the
-# crate link one bundled SQLite and one libgit2. Keep in lockstep with the host
-# root Cargo.toml when either side bumps.
+# Native-linking production dependencies are pinned to OpenHuman's versions so
+# the host and crate link one libgit2. Keep in lockstep with the host root
+# Cargo.toml when either side bumps. Bundled SQLite is dev-only for import tests.
 # git2 links libgit2 (heavy native build) — only for the `git-diff` feature.
 git2 = { version = "0.21", default-features = false, features = [
     "vendored-libgit2",
@@ -187,6 +186,9 @@ block2 = { version = "0.6", optional = true }
 
 [dev-dependencies]
 dotenvy = "0.15"
+# SQLite is only used by legacy workspace import integration tests. Keep its
+# bundled native library out of every consumer's normal dependency graph.
+rusqlite = { version = "0.40", features = ["bundled"] }
 tempfile = "3"
 tinystoragedrivers-testkit = { git = "https://github.com/senamakel/tinystoragedrivers", tag = "v2.0.2" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "net"] }
