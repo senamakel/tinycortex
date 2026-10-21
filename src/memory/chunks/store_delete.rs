@@ -670,7 +670,7 @@ fn purge_row_counts_toward_legacy_total(collection: &str, key: &str) -> bool {
     match collection {
         c::TREES => key.starts_with("tree:"),
         c::ENTITY_INDEX => key.starts_with("occ:"),
-        c::CHUNK_CONTENT_POINTERS | c::RAW_REFS | c::INGEST_OUTBOX => false,
+        c::CHUNK_CONTENT_POINTERS | c::CHUNK_LIFECYCLE | c::RAW_REFS | c::INGEST_OUTBOX => false,
         c::SUMMARY_CONTENT_POINTERS => false,
         _ => true,
     }

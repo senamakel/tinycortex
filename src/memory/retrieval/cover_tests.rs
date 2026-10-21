@@ -163,6 +163,35 @@ fn test_config_with_state_query_counter() -> (
     (tmp, config, state_queries)
 }
 
+fn install_full_chunk_pointer(
+    config: &crate::memory::config::MemoryConfig,
+    content_root: &std::path::Path,
+    chunk: &crate::memory::chunks::Chunk,
+    full_body: &str,
+) -> String {
+    let mut full_chunk = chunk.clone();
+    full_chunk.content = full_body.to_string();
+    let mut staged = crate::memory::store::content::stage_chunks(
+        content_root,
+        std::slice::from_ref(&full_chunk),
+    )
+    .unwrap();
+    let body_sha256 = staged[0].content_sha256.clone();
+    staged[0].chunk.content = chunk.content.clone();
+    crate::memory::chunks::upsert_staged_chunks(config, &staged).unwrap();
+    body_sha256
+}
+
+fn cover_one_chunk(config: &crate::memory::config::MemoryConfig, chunk: &Chunk) -> RetrievalHit {
+    let timestamp_ms = chunk.metadata.timestamp.timestamp_millis();
+    cover_window(config, timestamp_ms - 1, timestamp_ms + 1, None, None, 1)
+        .unwrap()
+        .hits
+        .into_iter()
+        .next()
+        .unwrap()
+}
+
 fn summary(id: &str, parent: Option<&str>, level: u32, children: &[&str]) -> SummaryNode {
     summary_node(id, "t1", level, parent, children, id, Utc::now())
 }
@@ -380,6 +409,131 @@ fn cover_hydrates_legacy_previews_with_page_bounded_state_queries() {
         queries <= 18,
         "state-version queries should scale with 4 pages, not 13 chunks; got {queries}"
     );
+}
+
+#[test]
+fn cover_prefers_raw_refs_over_pointer_and_inline_preview() {
+    let (tmp, mut cfg) = test_config();
+    let content_root = tmp.path().join("content");
+    cfg.content_root = Some(content_root.clone());
+    let ts = Utc.timestamp_millis_opt(1_700_000_000_000).unwrap();
+    let chunk = sample_chunk_at("precedence", 0, "inline preview", ts);
+    install_full_chunk_pointer(&cfg, &content_root, &chunk, "pointer body");
+
+    let raw_path = content_root.join("raw/source/item.md");
+    std::fs::create_dir_all(raw_path.parent().unwrap()).unwrap();
+    std::fs::write(&raw_path, "raw archive body").unwrap();
+    crate::memory::chunks::set_chunk_raw_refs(
+        &cfg,
+        &chunk.id,
+        &[crate::memory::chunks::RawRef {
+            path: "raw/source/item.md".into(),
+            start: 0,
+            end: None,
+        }],
+    )
+    .unwrap();
+
+    let hit = cover_one_chunk(&cfg, &chunk);
+    assert_eq!(hit.content, "raw archive body");
+}
+
+#[tokio::test]
+async fn async_cover_reads_pointer_body_and_repairs_its_body_checksum() {
+    let (tmp, mut cfg) = test_config();
+    let content_root = tmp.path().join("content");
+    cfg.content_root = Some(content_root.clone());
+    let ts = Utc.timestamp_millis_opt(1_700_000_000_000).unwrap();
+    let chunk = sample_chunk_at("pointer", 0, "inline preview", ts);
+    let expected_sha256 = install_full_chunk_pointer(
+        &cfg,
+        &content_root,
+        &chunk,
+        "full pointer body with semantic checksum",
+    );
+    crate::memory::chunks::update_chunk_content_sha256(&cfg, &chunk.id, "stale-frontmatter-hash")
+        .unwrap();
+
+    let response = cover_window_async(
+        &cfg,
+        ts.timestamp_millis() - 1,
+        ts.timestamp_millis() + 1,
+        None,
+        None,
+        1,
+    )
+    .await
+    .unwrap();
+    assert_eq!(response.hits.len(), 1);
+    assert_eq!(
+        response.hits[0].content,
+        "full pointer body with semantic checksum"
+    );
+
+    let read_cfg = cfg.clone();
+    let chunk_id = chunk.id.clone();
+    let (_, repaired_sha256) = std::thread::spawn(move || {
+        crate::memory::chunks::get_chunk_content_pointers(&read_cfg, &chunk_id)
+            .unwrap()
+            .unwrap()
+    })
+    .join()
+    .unwrap();
+    assert_eq!(repaired_sha256, expected_sha256);
+}
+
+#[test]
+fn cover_fails_closed_to_preview_for_corrupt_refs_and_unsafe_pointer_path() {
+    let (tmp, mut cfg) = test_config();
+    let content_root = tmp.path().join("content");
+    cfg.content_root = Some(content_root);
+    let ts = Utc.timestamp_millis_opt(1_700_000_000_000).unwrap();
+    let corrupt_refs = sample_chunk_at("corrupt-content", 0, "safe refs preview", ts);
+    let unsafe_pointer = sample_chunk_at("corrupt-content", 1, "safe pointer preview", ts);
+    insert_chunks(&cfg, &[corrupt_refs.clone(), unsafe_pointer.clone()]);
+
+    for (collection, chunk, value) in [
+        (
+            crate::memory::chunks::collections::RAW_REFS,
+            &corrupt_refs,
+            serde_json::json!("not-an-array-of-raw-refs"),
+        ),
+        (
+            crate::memory::chunks::collections::CHUNK_CONTENT_POINTERS,
+            &unsafe_pointer,
+            serde_json::json!({
+                "chunk_id": unsafe_pointer.id,
+                "content_path": "../../outside.md",
+                "content_sha256": "unused"
+            }),
+        ),
+    ] {
+        crate::memory::chunks::versioned::write_state(
+            &cfg,
+            crate::memory::chunks::versioned::StateChange {
+                collection: collection.to_string(),
+                key: chunk.id.clone(),
+                value: Some(value),
+            },
+        )
+        .unwrap();
+    }
+
+    let response = cover_window(
+        &cfg,
+        ts.timestamp_millis() - 1,
+        ts.timestamp_millis() + 1,
+        None,
+        None,
+        2,
+    )
+    .unwrap();
+    let contents = response
+        .hits
+        .into_iter()
+        .map(|hit| hit.content)
+        .collect::<HashSet<_>>();
+    assert_eq!(contents, ["safe refs preview", "safe pointer preview"]);
 }
 
 #[tokio::test]

@@ -124,9 +124,7 @@ fn delete_chunk_by_id_takes_one_chunk_and_leaves_the_source() {
 fn deleting_a_chunk_tombstones_lifecycle_and_removes_versioned_sidecars() {
     let (_tmp, cfg) = test_config();
     let chunk = chunk_with("delete-sidecars", 0, 3_000, "sidecar body");
-    upsert_chunks_async(&cfg, std::slice::from_ref(&chunk))
-        .await
-        .unwrap();
+    upsert_chunks(&cfg, std::slice::from_ref(&chunk)).unwrap();
     let signature = "delete-sidecars-model";
     super::set_chunk_embedding_for_signature(&cfg, &chunk.id, signature, &[0.1, 0.2]).unwrap();
     super::set_chunk_raw_refs(
