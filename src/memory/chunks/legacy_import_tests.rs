@@ -303,6 +303,9 @@ async fn typed_import_rejects_malformed_existing_content_pointer_without_mutatio
     let config = crate::memory::chunks::test_support::host_config(tmp.path());
     let mut batch = fixture_batch();
     let chunk_id = batch.chunks[0].chunk.id.clone();
+    // The malformed destination pointer must be rejected even when this
+    // source batch has no replacement pointer for the same chunk.
+    batch.chunks[0].content = None;
     batch.chunks[0].score.as_mut().unwrap().chunk_id = chunk_id.clone();
     let pointer = StateChange {
         collection: super::super::collections::CHUNK_CONTENT_POINTERS.to_owned(),
