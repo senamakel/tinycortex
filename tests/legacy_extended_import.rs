@@ -473,6 +473,10 @@ fn assert_score_eq(actual: &ScoreRow, expected: &ScoreRow) {
         actual.signals.entity_density,
         expected.signals.entity_density
     );
+    assert_eq!(
+        actual.signals.llm_importance,
+        expected.signals.llm_importance
+    );
     assert_eq!(actual.dropped, expected.dropped);
     assert_eq!(actual.reason, expected.reason);
     assert_eq!(actual.computed_at_ms, expected.computed_at_ms);
