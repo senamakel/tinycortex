@@ -41,6 +41,7 @@ pub use summaries::{
 // ── Buffers ─────────────────────────────────────────────────────────────────
 pub(crate) use buffers::{
     append_buffer_item, append_buffer_item_async, consume_snapshot_tx, get_buffer_async,
+    stage_buffer_item_async,
 };
 pub use buffers::{
     clear_buffer_tx, get_buffer, get_buffer_conn, list_stale_buffers, list_stale_buffers_async,

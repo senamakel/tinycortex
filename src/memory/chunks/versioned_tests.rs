@@ -9,6 +9,7 @@ struct LoseHeadAck {
     inner: std::sync::Arc<dyn tinystoragedrivers_api::DocumentStore>,
     lose_next_head_ack: AtomicBool,
     get_calls: std::sync::Arc<AtomicUsize>,
+    chunk_version_queries: std::sync::Arc<AtomicUsize>,
 }
 
 #[async_trait::async_trait]
@@ -89,6 +90,9 @@ impl tinystoragedrivers_api::DocumentStore for LoseHeadAck {
     ) -> tinystoragedrivers_types::Result<
         tinystoragedrivers_types::Page<tinystoragedrivers_types::Versioned<serde_json::Value>>,
     > {
+        if collection == CHUNK_VERSIONS {
+            self.chunk_version_queries.fetch_add(1, Ordering::SeqCst);
+        }
         self.inner.query(collection, query).await
     }
 
@@ -179,6 +183,7 @@ async fn config_with_lost_head_ack() -> MemoryConfig {
         inner: raw.documents().clone(),
         lose_next_head_ack: AtomicBool::new(true),
         get_calls: std::sync::Arc::new(AtomicUsize::new(0)),
+        chunk_version_queries: std::sync::Arc::new(AtomicUsize::new(0)),
     });
     let storage = Storage::new(
         documents,
@@ -202,6 +207,7 @@ async fn config_with_get_counter() -> (MemoryConfig, std::sync::Arc<AtomicUsize>
         inner: raw.documents().clone(),
         lose_next_head_ack: AtomicBool::new(false),
         get_calls: get_calls.clone(),
+        chunk_version_queries: std::sync::Arc::new(AtomicUsize::new(0)),
     });
     let storage = Storage::new(
         documents,
@@ -217,6 +223,53 @@ async fn config_with_get_counter() -> (MemoryConfig, std::sync::Arc<AtomicUsize>
             .unwrap(),
         get_calls,
     )
+}
+
+async fn config_with_chunk_version_query_counter() -> (MemoryConfig, std::sync::Arc<AtomicUsize>) {
+    use tinystoragedrivers_api::Storage;
+    let scope = Scope::new("test:chunk-list-query-count").unwrap();
+    let raw = tinystoragedrivers_testkit::memory_storage(&scope);
+    let query_calls = std::sync::Arc::new(AtomicUsize::new(0));
+    let documents = std::sync::Arc::new(LoseHeadAck {
+        inner: raw.documents().clone(),
+        lose_next_head_ack: AtomicBool::new(false),
+        get_calls: std::sync::Arc::new(AtomicUsize::new(0)),
+        chunk_version_queries: query_calls.clone(),
+    });
+    let storage = Storage::new(
+        documents,
+        raw.streams().clone(),
+        raw.kv().clone(),
+        raw.blobs().clone(),
+        raw.queues().clone(),
+        raw.secrets().clone(),
+    );
+    (
+        MemoryConfig::open_with_storage("workspace", storage)
+            .await
+            .unwrap(),
+        query_calls,
+    )
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn listing_chunks_resolves_versions_in_bounded_queries() {
+    let (config, version_queries) = config_with_chunk_version_query_counter().await;
+    let chunks = (0..64)
+        .map(|index| chunk(&format!("chunk-{index:04}"), "listing fixture"))
+        .collect::<Vec<_>>();
+    super::super::store::upsert_chunks(&config, &chunks).unwrap();
+
+    let listed = super::list_chunks(&config).unwrap();
+
+    assert_eq!(listed.len(), chunks.len());
+    assert!(chunks.iter().all(|chunk| listed.contains(chunk)));
+    assert!(
+        version_queries.load(Ordering::SeqCst) <= 4,
+        "listing {} chunks issued {} per-version queries",
+        chunks.len(),
+        version_queries.load(Ordering::SeqCst)
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

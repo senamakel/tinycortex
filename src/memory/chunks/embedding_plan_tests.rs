@@ -59,11 +59,13 @@ impl QueueDelegates for ReembedDelegate {
         config: &crate::memory::config::MemoryConfig,
         signature: &str,
     ) -> Result<DelegateOutput<ReembedProgress>> {
-        let mut output =
+        let output =
             plan_chunk_embedding_for_queue(config, &self.chunk_id, signature, &[0.25, -0.5, 0.75])
                 .await?;
-        output.result = ReembedProgress::Covered;
-        Ok(output)
+        Ok(DelegateOutput {
+            result: ReembedProgress::Covered,
+            mutations: output.mutations,
+        })
     }
 
     fn active_signature(&self, _: &crate::memory::config::MemoryConfig) -> String {
