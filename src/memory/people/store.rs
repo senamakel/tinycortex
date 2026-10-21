@@ -137,12 +137,8 @@ impl PeopleStore {
         let (kind, value) = handle.as_key();
         let alias_key = handle_key(kind, value);
         for _ in 0..WRITE_RETRIES {
-            if let Some(existing) = versioned::read_state_async(
-                &self.config,
-                PEOPLE_HANDLES,
-                &alias_key,
-            )
-            .await?
+            if let Some(existing) =
+                versioned::read_state_async(&self.config, PEOPLE_HANDLES, &alias_key).await?
             {
                 return Ok((decode_handle(&alias_key, existing)?.person_id, false));
             }
@@ -202,12 +198,16 @@ impl PeopleStore {
         let (kind, value) = handle.as_key();
         let key = handle_key(kind, value);
         for _ in 0..WRITE_RETRIES {
-            if let Some(existing) = versioned::read_state_async(&self.config, PEOPLE_HANDLES, &key).await? {
+            if let Some(existing) =
+                versioned::read_state_async(&self.config, PEOPLE_HANDLES, &key).await?
+            {
                 decode_handle(&key, existing)?;
                 return Ok(());
             }
             let person_key = person_id.to_string();
-            let Some(person) = versioned::read_state_async(&self.config, PEOPLE, &person_key).await? else {
+            let Some(person) =
+                versioned::read_state_async(&self.config, PEOPLE, &person_key).await?
+            else {
                 bail!("person {person_id} does not exist")
             };
             let expected = [
@@ -291,7 +291,9 @@ impl PeopleStore {
             ..interaction
         };
         for _ in 0..WRITE_RETRIES {
-            let Some(person) = versioned::read_state_async(&self.config, PEOPLE, &owner_key).await? else {
+            let Some(person) =
+                versioned::read_state_async(&self.config, PEOPLE, &owner_key).await?
+            else {
                 bail!("person {} does not exist", interaction.person_id)
             };
             let id = uuid::Uuid::new_v4().to_string();
@@ -456,7 +458,11 @@ fn decode_handle(key: &str, value: Value) -> Result<HandleRecord> {
 fn seconds_precision(value: DateTime<Utc>) -> DateTime<Utc> {
     Utc.timestamp_opt(value.timestamp(), 0)
         .single()
-        .unwrap_or_else(|| Utc.timestamp_opt(0, 0).single().expect("Unix epoch is valid"))
+        .unwrap_or_else(|| {
+            Utc.timestamp_opt(0, 0)
+                .single()
+                .expect("Unix epoch is valid")
+        })
 }
 
 #[cfg(test)]
