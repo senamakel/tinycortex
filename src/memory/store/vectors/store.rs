@@ -613,7 +613,6 @@ fn make_record_at(
     metadata: Value,
     now: f64,
 ) -> anyhow::Result<VectorRecord> {
-    anyhow::ensure!(!id.is_empty(), "vector id must not be empty");
     let metadata_json = serde_json::to_string(&metadata)?;
     Ok(VectorRecord {
         namespace: namespace.to_owned(),

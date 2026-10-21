@@ -469,6 +469,37 @@ async fn empty_logical_id_roundtrips_in_empty_namespace() {
         .await
         .unwrap()
         .is_empty());
+
+    let imported = LegacyVectorRecord {
+        namespace: "".to_owned(),
+        id: "".to_owned(),
+        text: "imported empty identity".to_owned(),
+        dimensions: 2,
+        embedding_le: vec_to_bytes(&[1.0, 0.0]),
+        metadata_json: "null".to_owned(),
+        created_at: 1.0,
+        updated_at: 2.0,
+    };
+    assert_eq!(
+        store
+            .import_legacy_records(
+                &LegacyVectorMetadata {
+                    provider_name: "legacy".to_owned(),
+                    dimensions: 2,
+                },
+                &[imported],
+            )
+            .await
+            .unwrap(),
+        1
+    );
+    let imported = store
+        .search_by_vector_async("", &[1.0, 0.0], 1)
+        .await
+        .unwrap();
+    assert_eq!(imported.len(), 1);
+    assert_eq!(imported[0].id, "");
+    assert_eq!(imported[0].text, "imported empty identity");
 }
 
 #[tokio::test]
