@@ -526,9 +526,11 @@ fn validate_batch(batch: &LegacyImportBatch) -> Result<()> {
                 record.chunk.id
             );
         }
-        if let Some(embedding) = &record.embedding {
+        let mut model_signatures = HashSet::new();
+        for embedding in &record.embeddings {
             anyhow::ensure!(
                 !embedding.model_signature.trim().is_empty()
+                    && model_signatures.insert(embedding.model_signature.as_str())
                     && !embedding.vector.is_empty()
                     && embedding.vector.iter().all(|value| value.is_finite()),
                 "invalid legacy embedding for chunk {}",
@@ -564,6 +566,22 @@ fn validate_batch(batch: &LegacyImportBatch) -> Result<()> {
             tree_ids.contains(summary.tree_id.as_str()),
             "legacy summary {} has no imported owning tree",
             summary.id
+        );
+    }
+    let summary_ids: HashSet<_> = batch.summaries.iter().map(|summary| summary.id.as_str()).collect();
+    let mut summary_embedding_keys = HashSet::new();
+    for embedding in &batch.summary_embeddings {
+        anyhow::ensure!(
+            summary_ids.contains(embedding.summary_id.as_str()),
+            "legacy summary embedding has no imported summary"
+        );
+        anyhow::ensure!(
+            !embedding.model_signature.trim().is_empty()
+                && !embedding.vector.is_empty()
+                && embedding.vector.iter().all(|value| value.is_finite())
+                && summary_embedding_keys
+                    .insert((embedding.summary_id.as_str(), embedding.model_signature.as_str())),
+            "invalid or duplicate legacy summary embedding"
         );
     }
     for content in &batch.summary_content {
