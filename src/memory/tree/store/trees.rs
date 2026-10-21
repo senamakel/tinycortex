@@ -2,10 +2,11 @@
 
 use std::collections::HashMap;
 
+use anyhow::Result;
+use chrono::Utc;
+
 use super::types::{Tree, TreeInsertConflict, TreeKind, TreeStatus};
 use crate::memory::config::MemoryConfig;
-use anyhow::{Context, Result};
-use chrono::{DateTime, Utc};
 
 /// Insert a new tree row. Fails if `(kind, scope)` already exists; callers that
 /// want "get or create" semantics should go through the registry.
