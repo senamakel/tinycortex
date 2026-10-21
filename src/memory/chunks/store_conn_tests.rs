@@ -13,14 +13,14 @@ use super::connection::{
 use super::embeddings::{active_embedding_dims, embedding_to_blob};
 use super::migrations::purge_global_topic_trees;
 use super::recovery::{is_transient_cold_start, try_cleanup_stale_files};
-use super::types::{chunk_id, Chunk, Metadata, SourceKind, SourceRef};
+use super::types::{chunk_id, Chunk, Metadata, SourceKind, SourceRef, StagedChunk};
 use super::{
     claim_source_ingest_tx, clear_chunk_reembed_skipped, clear_reembed_skipped_for_signature,
     content_root, count_chunks, db_path_for, delete_chunks_by_owner, delete_chunks_by_source,
     extraction_coverage, get_chunk, get_chunk_embedding, get_chunk_embedding_for_signature,
     get_chunk_embeddings_for_signature_batch, get_chunks_batch, is_source_ingested, list_chunks,
     mark_chunk_reembed_skipped, set_chunk_embedding, set_chunk_embedding_for_signature,
-    tree_active_signature, upsert_chunks, ListChunksQuery, DB_DIR,
+    tree_active_signature, upsert_chunks, upsert_staged_chunks, ListChunksQuery, DB_DIR,
     GLOBAL_TOPIC_PURGE_MIGRATION_VERSION,
 };
 use crate::memory::config::MemoryConfig;

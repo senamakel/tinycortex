@@ -325,11 +325,9 @@ async fn failed_queue_hint_publication_keeps_committed_intent_recoverable() {
         SourceKind::Document,
         "notion:abc"
     ))
-    .unwrap()
     .unwrap());
     let read_cfg = cfg.clone();
     let persisted_chunks = on_plain_thread(move || count_chunks(&read_cfg))
-        .unwrap()
         .unwrap() as usize;
     assert!(persisted_chunks > 0, "the committed source has chunks");
     assert_eq!(
@@ -386,7 +384,6 @@ async fn failed_queue_hint_publication_keeps_committed_intent_recoverable() {
         SourceKind::Document,
         "notion:abc"
     ))
-    .unwrap()
     .unwrap());
 }
 
@@ -444,7 +441,6 @@ async fn ingest_head_failure_does_not_publish_or_expose_its_outbox_intent() {
         SourceKind::Document,
         "notion:uncommitted",
     ))
-    .unwrap()
     .unwrap());
 }
 
