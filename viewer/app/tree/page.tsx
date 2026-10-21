@@ -1,7 +1,7 @@
 import { listChunks, workspacePath } from "@/lib/memory";
 import { Empty, NoWorkspace, ts } from "@/lib/ui";
 
-export default function TreePage() {
+export default async function TreePage() {
   const ws = workspacePath();
   if (!ws) {
     return (
@@ -12,7 +12,7 @@ export default function TreePage() {
     );
   }
 
-  const { available, chunks, total } = listChunks(ws, 300);
+  const { available, chunks, total } = await listChunks(ws, 300);
 
   if (!available) {
     return (

@@ -11,10 +11,10 @@ export const metadata: Metadata = {
 // Always read fresh from disk — this is a live debug tool over local files.
 export const dynamic = "force-dynamic";
 
-export default function RootLayout({ children }: { children: React.ReactNode }) {
+export default async function RootLayout({ children }: { children: React.ReactNode }) {
   const ws = workspacePath();
-  const docs = ws ? listSkillDocs(ws) : [];
-  const chunks = ws ? listChunks(ws, 1) : { total: 0 };
+  const docs = ws ? await listSkillDocs(ws) : [];
+  const chunks = ws ? await listChunks(ws, 1) : { total: 0 };
   const entities = ws ? listEntities(ws) : [];
 
   return (

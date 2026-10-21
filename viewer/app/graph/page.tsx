@@ -2,7 +2,7 @@ import { memoryGraph, workspacePath } from "@/lib/memory";
 import { Empty, NoWorkspace } from "@/lib/ui";
 import { ForceGraph } from "./ForceGraph";
 
-export default function GraphPage() {
+export default async function GraphPage() {
   const ws = workspacePath();
   if (!ws) {
     return (
@@ -13,7 +13,7 @@ export default function GraphPage() {
     );
   }
 
-  const graph = memoryGraph(ws);
+  const graph = await memoryGraph(ws);
   if (!graph.available || graph.nodes.length === 0) {
     return (
       <>

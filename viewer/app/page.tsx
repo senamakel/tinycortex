@@ -2,7 +2,7 @@ import Link from "next/link";
 import { overview, workspacePath } from "@/lib/memory";
 import { Bool, NoWorkspace } from "@/lib/ui";
 
-export default function OverviewPage() {
+export default async function OverviewPage() {
   const ws = workspacePath();
   if (!ws) {
     return (
@@ -14,7 +14,7 @@ export default function OverviewPage() {
     );
   }
 
-  const o = overview(ws);
+  const o = await overview(ws);
   return (
     <>
       <h1>Overview</h1>
