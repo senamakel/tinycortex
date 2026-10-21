@@ -235,14 +235,10 @@ impl ConversationStore {
                 "conversation writes require ConditionalStreamAppend storage capability".into(),
             ));
         }
-        let value = serde_json::to_value(event)
-            .map_err(|error| AppendFailure::Other(error.to_string()))?;
+        let value =
+            serde_json::to_value(event).map_err(|error| AppendFailure::Other(error.to_string()))?;
         streams
-            .append_batch_if_offset(
-                &Self::stream_name(thread_id),
-                expected_offset,
-                vec![value],
-            )
+            .append_batch_if_offset(&Self::stream_name(thread_id), expected_offset, vec![value])
             .await
             .map_err(|error| {
                 if error.kind() == ErrorKind::Conflict {
