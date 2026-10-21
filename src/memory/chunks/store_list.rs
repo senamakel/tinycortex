@@ -2,7 +2,7 @@
 //! what it matched, the detail view of the same page, and the per-source
 //! rollup over the same scope.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 
 use super::store::CHUNK_STATUS_DROPPED;
 use super::types::{Chunk, SourceKind};
@@ -72,10 +72,10 @@ pub struct ListChunksQuery {
     pub entity_kinds: Vec<String>,
     /// Substring the stored `content` column must contain, matched literally
     /// — `%` and `_` in the value are text, not wildcards — and
-    /// case-insensitively for ASCII, which is what SQLite's `LIKE` does.
+    /// case-insensitively for ASCII to preserve the previous SQLite behavior.
     ///
-    /// This searches the SQLite column, which for a staged chunk holds only a
-    /// ≤500-character preview of a body that lives in the content vault. A
+    /// This searches the stored preview, which for a staged chunk holds only
+    /// the first 500 characters of a body that lives in the content vault. A
     /// match is therefore proof the text is in the chunk; a miss is not proof
     /// it is absent.
     pub content_contains: Option<String>,
@@ -86,8 +86,8 @@ pub struct ListChunksQuery {
 /// source allowlisting applied before the page limit.
 ///
 /// # Errors
-/// Returns an error when the host read fails or an entity predicate is
-/// requested before the host entity-index port is available.
+/// Returns an error when the host read fails or the entity index contains a
+/// malformed occurrence record.
 pub fn list_chunks(config: &MemoryConfig, query: &ListChunksQuery) -> Result<Vec<Chunk>> {
     let (mut chunks, _) = matching_chunks(config, query, false)?;
     let offset = query.offset.unwrap_or(0).min(chunks.len());
@@ -103,12 +103,12 @@ fn matching_chunks(
     Vec<Chunk>,
     std::collections::HashMap<String, Vec<(String, serde_json::Value)>>,
 )> {
-    if !query.entity_ids.is_empty() || !query.entity_kinds.is_empty() {
-        anyhow::bail!("entity-filtered chunk listing requires the host entity-index port");
-    }
     let mut collections = Vec::new();
     if query.exclude_dropped || include_details {
         collections.push(super::collections::CHUNK_LIFECYCLE);
+    }
+    if !query.entity_ids.is_empty() || !query.entity_kinds.is_empty() {
+        collections.push(super::collections::ENTITY_INDEX);
     }
     if include_details {
         collections.push(super::collections::CHUNK_EMBEDDINGS);
@@ -121,6 +121,33 @@ fn matching_chunks(
         .flatten()
         .cloned()
         .collect::<std::collections::HashMap<_, _>>();
+    let mut indexed_entities = std::collections::HashMap::<
+        String,
+        Vec<crate::memory::store::entity_index::transaction::EntityOccurrence>,
+    >::new();
+    if let Some(rows) = states.get(super::collections::ENTITY_INDEX) {
+        for (key, value) in rows.iter().filter(|(key, _)| key.starts_with("occ:")) {
+            let occurrence: crate::memory::store::entity_index::transaction::EntityOccurrence =
+                serde_json::from_value(value.clone())
+                    .context("decode entity-index occurrence for chunk filter")?;
+            anyhow::ensure!(
+                crate::memory::store::entity_index::transaction::occurrence_key(
+                    &occurrence.entity_id,
+                    &occurrence.node_id,
+                ) == *key,
+                "entity-index occurrence key does not match its record"
+            );
+            indexed_entities
+                .entry(occurrence.node_id.clone())
+                .or_default()
+                .push(occurrence);
+        }
+    }
+    let requested_entity_ids = query.entity_ids.iter().collect::<std::collections::HashSet<_>>();
+    let requested_entity_kinds = query
+        .entity_kinds
+        .iter()
+        .collect::<std::collections::HashSet<_>>();
     chunks.retain(|chunk| {
         if query
             .source_kind
@@ -144,6 +171,18 @@ fn matching_chunks(
                 && !query.source_kinds.contains(&chunk.metadata.source_kind))
             || (!query.source_ids.is_empty()
                 && !query.source_ids.contains(&chunk.metadata.source_id))
+        {
+            return false;
+        }
+        let occurrences = indexed_entities.get(&chunk.id).map(Vec::as_slice).unwrap_or(&[]);
+        if (!query.entity_ids.is_empty()
+            && !occurrences
+                .iter()
+                .any(|occurrence| requested_entity_ids.contains(&occurrence.entity_id)))
+            || (!query.entity_kinds.is_empty()
+                && !occurrences
+                    .iter()
+                    .any(|occurrence| requested_entity_kinds.contains(&occurrence.entity_kind)))
         {
             return false;
         }
@@ -214,20 +253,11 @@ pub struct ChunkDetailRow {
     pub content_path: Option<String>,
     /// Lifecycle state — `admitted`, `sealed`, `dropped`, …
     ///
-    /// `Option` for the decode, not for the column. The column arrived as an
-    /// additive `ALTER TABLE` and is declared `TEXT NOT NULL DEFAULT
-    /// 'admitted'` (`connection.rs`), so SQLite backfilled every pre-existing
-    /// row and rejects a writer that omits it — a NULL cannot be produced by
-    /// this schema. What the `Option` buys is that a row which somehow read
-    /// back empty does not fail the whole page, and that the contract type
-    /// this maps onto can be answered by a driver with no lifecycle concept at
-    /// all.
+    /// The value is optional because the lifecycle status is a sparse owner
+    /// sidecar; an absent record means no explicit lifecycle status.
     ///
-    /// This matters for `exclude_dropped`, which filters with
-    /// `lifecycle_status != 'dropped'`: under SQLite a NULL there would compare
-    /// NULL and silently drop the row from the page *and* from the count. It
-    /// does not need a `COALESCE` guard, and the reason is the `NOT NULL` above
-    /// rather than luck.
+    /// This matters for `exclude_dropped`: chunks with no lifecycle sidecar
+    /// remain visible, while an explicit `dropped` status excludes them.
     pub lifecycle_status: Option<String>,
     /// Whether an embedding vector exists for this chunk in **any** signature.
     ///
@@ -251,7 +281,7 @@ pub struct ChunkDetailRow {
 /// about each row and nothing about which rows it gets.
 ///
 /// # Errors
-/// Returns an error when SQLite preparation, execution, or row decoding fails.
+/// Returns an error when the host read fails or an entity occurrence is malformed.
 pub fn list_chunk_details(
     config: &MemoryConfig,
     query: &ListChunksQuery,
@@ -312,7 +342,7 @@ pub fn list_chunk_details(
 /// row in the table, no filters — and is not a substitute for this.
 ///
 /// # Errors
-/// Returns an error when SQLite preparation or execution fails.
+/// Returns an error when the host read fails or an entity occurrence is malformed.
 pub fn count_chunks_matching(config: &MemoryConfig, query: &ListChunksQuery) -> Result<u64> {
     Ok(matching_chunks(config, query, false)?.0.len() as u64)
 }
@@ -347,9 +377,8 @@ pub struct SourceTotal {
 /// sources swap places for no reason.
 ///
 /// # Errors
-/// Returns an error when SQLite preparation or execution fails, or when a
-/// stored `source_kind` is not one this build knows (a hand-edited DB — the
-/// same condition that already fails [`list_chunks`]).
+/// Returns an error when the host read fails, an entity occurrence is
+/// malformed, or a stored `source_kind` is not one this build knows.
 pub fn source_totals(
     config: &MemoryConfig,
     limit: Option<usize>,
