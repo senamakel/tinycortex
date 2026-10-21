@@ -744,8 +744,15 @@ fn validate_batch(batch: &LegacyImportBatch) -> Result<()> {
                 && chunk_skip_keys.insert((skip.chunk_id.as_str(), skip.model_signature.as_str())),
             "invalid or duplicate legacy chunk re-embed skip"
         );
-        super::embeddings::validate_reembed_skip_key("chunk_id", &skip.chunk_id)?;
-        super::embeddings::validate_reembed_skip_key("model_signature", &skip.model_signature)?;
+        anyhow::ensure!(
+            super::embeddings::validate_reembed_skip_key("chunk_id", &skip.chunk_id)?
+                == skip.chunk_id
+                && super::embeddings::validate_reembed_skip_key(
+                    "model_signature",
+                    &skip.model_signature
+                )? == skip.model_signature,
+            "legacy chunk re-embed skip has a noncanonical key"
+        );
     }
     let mut summary_skip_keys = HashSet::new();
     for skip in &batch.summary_reembed_skips {
@@ -756,8 +763,15 @@ fn validate_batch(batch: &LegacyImportBatch) -> Result<()> {
                     .insert((skip.summary_id.as_str(), skip.model_signature.as_str())),
             "invalid or duplicate legacy summary re-embed skip"
         );
-        super::embeddings::validate_reembed_skip_key("summary_id", &skip.summary_id)?;
-        super::embeddings::validate_reembed_skip_key("model_signature", &skip.model_signature)?;
+        anyhow::ensure!(
+            super::embeddings::validate_reembed_skip_key("summary_id", &skip.summary_id)?
+                == skip.summary_id
+                && super::embeddings::validate_reembed_skip_key(
+                    "model_signature",
+                    &skip.model_signature
+                )? == skip.model_signature,
+            "legacy summary re-embed skip has a noncanonical key"
+        );
     }
     let valid_nodes: HashSet<_> = chunk_ids
         .iter()

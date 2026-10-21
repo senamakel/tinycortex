@@ -383,6 +383,26 @@ async fn typed_import_preserves_buffer_hotness_and_skip_history_idempotently() {
 }
 
 #[tokio::test]
+async fn typed_import_rejects_noncanonical_reembed_skip_keys_before_writes() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let config = crate::memory::chunks::test_support::host_config(tmp.path());
+    let mut batch = fixture_batch();
+    batch.chunks[0].score.as_mut().unwrap().chunk_id = batch.chunks[0].chunk.id.clone();
+    batch.chunk_reembed_skips[0].model_signature = " fixture/model@3 ".into();
+    let before = super::super::versioned::capture_state_snapshot_async(&config)
+        .await
+        .unwrap();
+
+    assert!(import_legacy_batch(&config, &batch).await.is_err());
+    assert_eq!(
+        super::super::versioned::capture_state_snapshot_async(&config)
+            .await
+            .unwrap(),
+        before
+    );
+}
+
+#[tokio::test]
 async fn typed_import_rejects_path_escape_before_writes() {
     let tmp = tempfile::TempDir::new().unwrap();
     let config = crate::memory::chunks::test_support::host_config(tmp.path());
