@@ -150,6 +150,75 @@ async fn a_deferred_job_can_be_reclaimed_before_queue_dedupe_expires() {
 }
 
 #[tokio::test]
+async fn typed_import_jobs_stage_dedupe_atomically_before_hint_publication() {
+    let (_tmp, cfg) = test_config();
+    let mut job = NewJob::extract_chunk(&ExtractChunkPayload {
+        chunk_id: "legacy-import-chunk".into(),
+    })
+    .unwrap();
+    job.id = Some("legacy-import-job".into());
+
+    let snapshot = crate::memory::chunks::versioned::capture_state_snapshot_async(&cfg)
+        .await
+        .unwrap();
+    let staged = stage_import_jobs_at_snapshot(&cfg, &snapshot, &[job.clone()])
+        .await
+        .unwrap();
+    assert_eq!(staged.publish.len(), 1);
+    assert!(get_job_async(&cfg, "legacy-import-job")
+        .await
+        .unwrap()
+        .is_none());
+
+    // A conflicting dedupe owner rejects the import plan before either the
+    // job row or its hint can be published.
+    let mut conflict = job.clone();
+    conflict.id = Some("different-import-job".into());
+    let active = staged.changes.clone();
+    crate::memory::chunks::versioned::commit_if_state_matches_async(
+        &cfg,
+        &staged.expected,
+        &[],
+        &active,
+    )
+    .await
+    .unwrap();
+    let conflict_snapshot = crate::memory::chunks::versioned::capture_state_snapshot_async(&cfg)
+        .await
+        .unwrap();
+    assert!(stage_import_jobs_at_snapshot(&cfg, &conflict_snapshot, &[conflict])
+        .await
+        .is_err());
+    assert!(get_job_async(&cfg, "different-import-job")
+        .await
+        .unwrap()
+        .is_none());
+
+    let snapshot = crate::memory::chunks::versioned::capture_state_snapshot_async(&cfg)
+        .await
+        .unwrap();
+    let staged = stage_import_jobs_at_snapshot(&cfg, &snapshot, &[job])
+        .await
+        .unwrap();
+    assert!(crate::memory::chunks::versioned::commit_if_state_matches_async(
+        &cfg,
+        &staged.expected,
+        &[],
+        &staged.changes,
+    )
+    .await
+    .unwrap());
+    publish_import_job_hints_async(&cfg, &staged.publish)
+        .await
+        .unwrap();
+    assert_eq!(get_job_async(&cfg, "legacy-import-job")
+        .await
+        .unwrap()
+        .unwrap()
+        .status, JobStatus::Ready);
+}
+
+#[tokio::test]
 async fn a_redelivered_hint_reclaims_an_expired_worker_lease() {
     use tinystoragedrivers_types::{QueueSpec, Retry};
 
