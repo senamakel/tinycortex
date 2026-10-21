@@ -69,6 +69,21 @@ async fn opaque_cursor_identity_and_json_are_preserved_exactly() {
 }
 
 #[tokio::test]
+async fn raw_state_kv_preserves_pii_in_cursor_text() {
+    let dir = TempDir::new().unwrap();
+    let config = crate::memory::chunks::test_support::host_config(dir.path());
+    let store = KvStateStore::from_config(&config).unwrap();
+    let key = "transcript:/home/alice@example.com/.agent/sessions/run.jsonl";
+    let value = serde_json::json!({
+        "cursor": "Imported transcript belongs to alice@example.com"
+    });
+
+    store.set(NAMESPACE, key, &value).await.unwrap();
+
+    assert_eq!(store.get(NAMESPACE, key).await.unwrap(), Some(value));
+}
+
+#[tokio::test]
 async fn legacy_cursor_import_is_idempotent_and_refuses_conflicts_before_writes() {
     let dir = TempDir::new().unwrap();
     let config = crate::memory::chunks::test_support::host_config(dir.path());
