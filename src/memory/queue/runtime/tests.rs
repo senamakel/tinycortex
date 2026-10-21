@@ -1,4 +1,5 @@
 use std::time::Duration;
+use std::{fs, sync::Arc};
 
 use super::*;
 use crate::memory::config::MemoryConfig;
@@ -9,6 +10,9 @@ use crate::memory::queue::test_support::RecordingDelegates;
 use crate::memory::queue::types::{FlushStalePayload, JobStatus, NewJob};
 use tempfile::TempDir;
 use tokio::time::sleep;
+use tinystoragedrivers_api::Storage;
+use tinystoragedrivers_testkit::{memory_storage, Failing};
+use tinystoragedrivers_types::{ErrorKind, Scope, StorageError};
 
 fn test_config() -> (TempDir, MemoryConfig) {
     let tmp = TempDir::new().unwrap();
@@ -20,9 +24,8 @@ fn test_config() -> (TempDir, MemoryConfig) {
 fn fast_worker_opts() -> WorkerLoopConfig {
     WorkerLoopConfig {
         idle_backoff: Duration::from_millis(2),
-        busy_backoff: Duration::from_millis(2),
-        io_backoff: Duration::from_millis(2),
-        disk_full_backoff: Duration::from_millis(2),
+        conflict_backoff: Duration::from_millis(2),
+        unavailable_backoff: Duration::from_millis(2),
         host_io_backoff: Duration::from_millis(2),
         error_backoff: Duration::from_millis(2),
     }
@@ -136,19 +139,6 @@ async fn scheduler_tick_recovers_an_expired_running_job() {
 }
 
 #[test]
-fn backoff_classifies_corruption_as_fatal() {
-    let opts = WorkerLoopConfig::default();
-    let corrupt = anyhow::Error::from(rusqlite::Error::SqliteFailure(
-        rusqlite::ffi::Error {
-            code: rusqlite::ErrorCode::DatabaseCorrupt,
-            extended_code: 11,
-        },
-        Some("database disk image is malformed".into()),
-    ));
-    assert!(backoff_for(&corrupt, &opts).is_none());
-}
-
-#[test]
 fn backoff_classifies_host_io_error_as_long_backoff() {
     let opts = WorkerLoopConfig::default();
     // EIO (raw OS error 5): a persistent host-filesystem failure surfaced as a
@@ -160,51 +150,70 @@ fn backoff_classifies_host_io_error_as_long_backoff() {
 }
 
 #[test]
-fn backoff_classifies_busy_as_transient() {
+fn backoff_classifies_typed_storage_failures() {
     let opts = WorkerLoopConfig::default();
-    let busy = anyhow::Error::from(rusqlite::Error::SqliteFailure(
-        rusqlite::ffi::Error {
-            code: rusqlite::ErrorCode::DatabaseBusy,
-            extended_code: 5,
-        },
-        Some("database is locked".into()),
-    ));
-    assert_eq!(backoff_for(&busy, &opts), Some(opts.busy_backoff));
-}
-
-#[test]
-fn backoff_classifies_disk_full_io_and_generic_errors() {
-    let opts = WorkerLoopConfig::default();
-    let sqlite = |code, extended_code, message: &str| {
-        anyhow::Error::from(rusqlite::Error::SqliteFailure(
-            rusqlite::ffi::Error {
-                code,
-                extended_code,
-            },
-            Some(message.into()),
-        ))
-    };
+    let conflict = anyhow::Error::new(StorageError::conflict("stale version"));
+    let unavailable = anyhow::Error::new(StorageError::unavailable("temporarily offline"));
+    let backend = anyhow::Error::new(StorageError::backend("storage failure"));
+    assert_eq!(backoff_for(&conflict, &opts), Some(opts.conflict_backoff));
     assert_eq!(
-        backoff_for(
-            &sqlite(
-                rusqlite::ErrorCode::DiskFull,
-                13,
-                "database or disk is full"
-            ),
-            &opts
-        ),
-        Some(opts.disk_full_backoff)
+        backoff_for(&unavailable, &opts),
+        Some(opts.unavailable_backoff)
     );
-    assert_eq!(
-        backoff_for(
-            &sqlite(rusqlite::ErrorCode::SystemIoFailure, 10, "disk I/O error"),
-            &opts
-        ),
-        Some(opts.io_backoff)
-    );
+    assert_eq!(backoff_for(&backend, &opts), None);
     assert_eq!(
         backoff_for(&anyhow::anyhow!("other"), &opts),
         Some(opts.error_backoff)
+    );
+}
+
+#[tokio::test]
+async fn scheduler_returns_typed_backend_failure_without_renaming_workspace_files() {
+    let tmp = TempDir::new().unwrap();
+    let workspace = tmp.path();
+    let legacy_dir = workspace.join("memory_tree");
+    fs::create_dir_all(&legacy_dir).unwrap();
+    let legacy_db = legacy_dir.join("chunks.db");
+    fs::write(&legacy_db, b"legacy source bytes").unwrap();
+
+    let scope = Scope::new(&format!("test:queue-scheduler-{}", uuid::Uuid::new_v4())).unwrap();
+    let base = memory_storage(&scope);
+    let documents = Failing::new(Arc::clone(base.documents()));
+    let faults = documents.faults.clone();
+    let storage = Storage::new(
+        Arc::new(documents),
+        Arc::clone(base.streams()),
+        Arc::clone(base.kv()),
+        Arc::clone(base.blobs()),
+        Arc::clone(base.queues()),
+        Arc::clone(base.secrets()),
+    );
+    let _cfg = crate::memory::config::MemoryConfig::open_with_storage(workspace, storage)
+        .await
+        .unwrap();
+    faults.fail_operation_nth("documents.query", 1, ErrorKind::Backend);
+    let cfg = _cfg;
+
+    let error = run_scheduler(
+        &cfg,
+        &SchedulerLoopConfig {
+            tick: Duration::from_millis(1),
+        },
+        &Shutdown::new(),
+    )
+    .await
+    .expect_err("generic host storage failures must reach the host");
+    assert_eq!(
+        error.downcast_ref::<StorageError>().map(StorageError::kind),
+        Some(ErrorKind::Backend)
+    );
+    assert_eq!(fs::read(&legacy_db).unwrap(), b"legacy source bytes");
+    assert_eq!(
+        fs::read_dir(&legacy_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>(),
+        vec![std::ffi::OsString::from("chunks.db")]
     );
 }
 
