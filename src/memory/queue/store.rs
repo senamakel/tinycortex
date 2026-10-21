@@ -248,6 +248,29 @@ pub(crate) async fn stage_import_jobs_at_snapshot(
             "typed queue import job {id} has a zero attempt budget"
         );
         anyhow::ensure!(
+            job.created_at_ms >= 0,
+            "typed queue import job {id} has a negative creation timestamp"
+        );
+        if let Some(started_at_ms) = job.started_at_ms {
+            anyhow::ensure!(
+                started_at_ms >= job.created_at_ms,
+                "typed queue import job {id} started before it was created"
+            );
+        }
+        if let Some(completed_at_ms) = job.completed_at_ms {
+            anyhow::ensure!(
+                completed_at_ms >= job.created_at_ms
+                    && job
+                        .started_at_ms
+                        .map_or(true, |started| completed_at_ms >= started),
+                "typed queue import job {id} completed before its creation or start"
+            );
+        }
+        anyhow::ensure!(
+            job.status != JobStatus::Running || job.completed_at_ms.is_none(),
+            "typed queue import running job {id} has a completion timestamp"
+        );
+        anyhow::ensure!(
             seen_ids.insert(id.to_owned()),
             "typed queue import contains duplicate job ID {id}"
         );
