@@ -92,7 +92,7 @@ async fn legacy_cursor_import_is_idempotent_and_refuses_conflicts_before_writes(
     );
 
     store
-        .set(NAMESPACE, &imported[1].key, serde_json::json!("advanced"))
+        .set(NAMESPACE, &imported[1].key, &serde_json::json!("advanced"))
         .await
         .unwrap();
     let late_import = vec![

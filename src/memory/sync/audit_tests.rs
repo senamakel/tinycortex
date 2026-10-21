@@ -1,4 +1,5 @@
 use super::*;
+use chrono::TimeZone;
 
 fn entry(id: &str, timestamp: DateTime<Utc>) -> SyncAuditEntry {
     SyncAuditEntry {
