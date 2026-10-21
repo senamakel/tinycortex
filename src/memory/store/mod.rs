@@ -7,17 +7,16 @@
 //! - [`content`]       — markdown content store (YAML front-matter, atomic
 //!   writes, `content_path`/`content_sha256` pointers, Obsidian-vault paths).
 //! - [`vectors`]       — SQLite-backed packed-`f32` cosine vector DB.
-//! - [`kv`]            — global + namespace JSON key-value store.
+//! - [`kv`]            — host-port global + namespace JSON key-value store.
 //! - [`entity_index`] — entity occurrence index over tree nodes.
 //! - [`safety`]       — secret / PII detection guard used by KV writes.
 //!
 //! ## Concurrency contract
 //!
-//! [`KvStore`], [`VectorStore`], and [`EntityIndex`] each hold their SQLite
-//! connection behind a `parking_lot::Mutex`, so calls into one instance
-//! serialize cleanly. Their SQLite connections use a 15-second busy timeout,
-//! allowing independent handles to the same database file to tolerate brief
-//! write contention instead of failing immediately with `SQLITE_BUSY`.
+//! Host-backed stores attach to the `MemoryConfig` storage bundle. The KV
+//! adapter uses optimistic compare-and-swap and does not own a database
+//! connection. Other primitives may retain their own storage implementation
+//! until their ports are migrated.
 
 /// Markdown content store: source-of-truth files with YAML front matter,
 /// atomic writes, and `content_path`/`content_sha256` provenance pointers.

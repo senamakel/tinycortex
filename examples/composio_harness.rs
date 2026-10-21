@@ -78,6 +78,7 @@ use tinycortex::memory::sync::{
     SkillDocSink, SkillDocument, SlackSyncPipeline, SyncContext, SyncEvent, SyncEventSink,
     SyncPipeline, SyncState, SyncStateStore,
 };
+use tinystoragedrivers_types::Scope;
 
 const DEFAULT_BASE_URL: &str = "https://backend.composio.dev/api/v3";
 const DEFAULT_MAX_ITEMS: u32 = 25;
@@ -520,9 +521,10 @@ async fn persist_to_workspace(
     workspace: &str,
     captures: &Arc<Captures>,
     reports: &[ToolkitReport],
+    config: &MemoryConfig,
 ) -> anyhow::Result<()> {
     let root = std::path::Path::new(workspace);
-    let sink = KvSkillDocSink::open_in_workspace(root)?;
+    let sink = KvSkillDocSink::from_config(config)?;
     let docs = captures.documents.lock().unwrap().clone();
     let stored = docs.len();
     for doc in docs {
@@ -560,8 +562,7 @@ async fn persist_to_workspace(
     std::fs::write(&manifest_path, serde_json::to_vec_pretty(&manifest)?)?;
 
     println!(
-        "\nPersisted {stored} document(s) to {} and a run manifest to {}.",
-        root.join(tinycortex::memory::sync::SKILL_DOCS_DB).display(),
+        "\nStored {stored} document(s) through the attached KV port and wrote a run manifest to {}.",
         manifest_path.display()
     );
     Ok(())
@@ -731,7 +732,10 @@ async fn run() -> anyhow::Result<()> {
     println!("\n── Phase 2: memory sync ({max_items} item cap/toolkit) ───────");
     let api_secret = SecretString::new(api_key);
     let tmp = std::env::temp_dir().join("tinycortex-composio-harness");
-    let mut config = MemoryConfig::new(tmp.to_string_lossy().into_owned());
+    let scope = Scope::new(&format!("demo:composio-{}", uuid::Uuid::new_v4()))?;
+    let storage = tinystoragedrivers_testkit::memory_storage(&scope);
+    let mut config =
+        MemoryConfig::open_with_storage(tmp.to_string_lossy().into_owned(), storage).await?;
     config.sync.budget.max_items = Some(max_items);
 
     let captures = Arc::new(Captures::default());
@@ -781,7 +785,7 @@ async fn run() -> anyhow::Result<()> {
     );
 
     if let Some(workspace) = workspace.as_deref() {
-        if let Err(error) = persist_to_workspace(workspace, &captures, &reports).await {
+        if let Err(error) = persist_to_workspace(workspace, &captures, &reports, &config).await {
             eprintln!("warning: could not persist to workspace {workspace}: {error}");
         }
     }
