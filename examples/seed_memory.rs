@@ -18,10 +18,11 @@
 
 use chrono::{TimeZone, Utc};
 use serde_json::json;
+use tinystoragedrivers_types::Scope;
 
 use tinycortex::memory::chunks::{chunk_id, upsert_chunks, Chunk, Metadata, SourceKind, SourceRef};
 use tinycortex::memory::config::MemoryConfig;
-use tinycortex::memory::sync::{KvSkillDocSink, SkillDocSink, SkillDocument, SKILL_DOCS_DB};
+use tinycortex::memory::sync::{KvSkillDocSink, SkillDocSink, SkillDocument};
 use tinycortex::memory::tree::{ConcatSummariser, LeafRef, TreeFactory};
 
 // ── Skill documents (the "skill docs" + "sync runs" views) ──────────────────
@@ -42,7 +43,7 @@ fn doc(toolkit: &str, id: &str, title: &str, content: &str) -> SkillDocument {
     }
 }
 
-async fn seed_skill_docs(root: &std::path::Path) -> anyhow::Result<usize> {
+async fn seed_skill_docs(config: &MemoryConfig) -> anyhow::Result<usize> {
     let docs = [
         doc(
             "gmail",
@@ -81,7 +82,7 @@ async fn seed_skill_docs(root: &std::path::Path) -> anyhow::Result<usize> {
         ),
     ];
 
-    let sink = KvSkillDocSink::open_in_workspace(root)?;
+    let sink = KvSkillDocSink::from_config(config)?;
     for document in docs.iter().cloned() {
         sink.store(document).await?;
     }
@@ -178,8 +179,7 @@ async fn seed_tree(
     Ok(())
 }
 
-async fn seed_trees(root: &std::path::Path) -> anyhow::Result<()> {
-    let cfg = MemoryConfig::new(root);
+async fn seed_trees(cfg: &MemoryConfig) -> anyhow::Result<()> {
 
     let gmail: &[Message] = &[
         (
@@ -297,8 +297,8 @@ async fn seed_trees(root: &std::path::Path) -> anyhow::Result<()> {
         ),
     ];
 
-    seed_tree(&cfg, SourceKind::Email, "gmail:inbox", "alice", gmail).await?;
-    seed_tree(&cfg, SourceKind::Chat, "github:tinycortex", "bot", github).await?;
+    seed_tree(cfg, SourceKind::Email, "gmail:inbox", "alice", gmail).await?;
+    seed_tree(cfg, SourceKind::Chat, "github:tinycortex", "bot", github).await?;
     Ok(())
 }
 
@@ -315,12 +315,17 @@ async fn main() -> anyhow::Result<()> {
         });
     let root = std::path::Path::new(&workspace);
 
-    let doc_count = seed_skill_docs(root).await?;
-    seed_trees(root).await?;
+    // This example uses the testkit as an explicit in-process host driver.
+    // Embedding hosts should attach their selected durable backend instead.
+    let scope = Scope::new(&format!("demo:tinycortex-{}", uuid::Uuid::new_v4()))?;
+    let storage = tinystoragedrivers_testkit::memory_storage(&scope);
+    let config = MemoryConfig::open_with_storage(root, storage).await?;
+
+    let doc_count = seed_skill_docs(&config).await?;
+    seed_trees(&config).await?;
 
     println!(
-        "Seeded {doc_count} skill documents to {} and built a memory tree in {}.",
-        root.join(SKILL_DOCS_DB).display(),
+        "Seeded {doc_count} skill documents in the example's memory backend and built a memory tree in {}.",
         root.join("memory_tree/chunks.db").display()
     );
     println!("Point the viewer at it:  TINYCORTEX_WORKSPACE={workspace} npm run dev");
