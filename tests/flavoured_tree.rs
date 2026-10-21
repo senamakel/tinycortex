@@ -7,11 +7,13 @@
 use chrono::{TimeZone, Utc};
 use tempfile::TempDir;
 
-use tinycortex::memory::chunks::{chunk_id, upsert_chunks, Chunk, Metadata, SourceKind, SourceRef};
+use tinycortex::memory::chunks::{
+    chunk_id, upsert_chunks_async, Chunk, Metadata, SourceKind, SourceRef,
+};
 use tinycortex::memory::config::MemoryConfig;
 use tinycortex::memory::tree::bucket_seal::LeafRef;
 use tinycortex::memory::tree::factory::TreeFactory;
-use tinycortex::memory::tree::flavoured::{compile_flavoured_root, flavoured_root_abs_path};
+use tinycortex::memory::tree::flavoured::{compile_flavoured_root_async, flavoured_root_abs_path};
 use tinycortex::memory::tree::store::TreeKind;
 use tinycortex::memory::tree::summarise::ConcatSummariser;
 
@@ -27,7 +29,7 @@ const EVIDENCE: &[&str] = &[
     "prefer verbs. delete 'really', 'very', 'just'",
 ];
 
-fn seed_leaf(cfg: &MemoryConfig, seq: u32, content: &str) -> LeafRef {
+async fn seed_leaf(cfg: &MemoryConfig, seq: u32, content: &str) -> LeafRef {
     let ts = Utc
         .timestamp_millis_opt(1_700_000_000_000 + seq as i64)
         .unwrap();
@@ -49,7 +51,9 @@ fn seed_leaf(cfg: &MemoryConfig, seq: u32, content: &str) -> LeafRef {
         created_at: ts,
         partial_message: false,
     };
-    upsert_chunks(cfg, std::slice::from_ref(&chunk)).unwrap();
+    upsert_chunks_async(cfg, std::slice::from_ref(&chunk))
+        .await
+        .unwrap();
     LeafRef {
         chunk_id: chunk.id,
         token_count: 1, // under budget — force-sealed via seal_now
@@ -64,23 +68,29 @@ fn seed_leaf(cfg: &MemoryConfig, seq: u32, content: &str) -> LeafRef {
 #[tokio::test]
 async fn flavoured_tree_compiles_prompt_ready_root() {
     let tmp = TempDir::new().unwrap();
-    let cfg = MemoryConfig::new(tmp.path());
+    let scope = tinystoragedrivers_types::Scope::new("tinycortex-flavoured-test").unwrap();
+    let cfg = MemoryConfig::open_with_storage(
+        tmp.path(),
+        tinystoragedrivers_testkit::memory_storage(&scope),
+    )
+    .await
+    .unwrap();
     let summariser = ConcatSummariser::new();
 
     let factory = TreeFactory::flavoured("tweet-style", ASK);
     for (i, evidence) in EVIDENCE.iter().enumerate() {
-        let leaf = seed_leaf(&cfg, i as u32, evidence);
+        let leaf = seed_leaf(&cfg, i as u32, evidence).await;
         factory.insert_leaf(&cfg, &leaf, &summariser).await.unwrap();
     }
     // Force-seal the under-budget L0 buffer (the "compile the profile now" path).
     factory.seal_now(&cfg, &summariser).await.unwrap();
 
-    let tree = factory.get_or_create(&cfg).unwrap();
+    let tree = factory.get_or_create_async(&cfg).await.unwrap();
     assert_eq!(tree.kind, TreeKind::Flavoured);
     assert_eq!(tree.ask.as_deref(), Some(ASK));
     assert!(tree.root_id.is_some(), "seal must produce a root");
 
-    let md = compile_flavoured_root(&cfg, &tree.id).unwrap();
+    let md = compile_flavoured_root_async(&cfg, &tree.id).await.unwrap();
 
     // 1. Compiled root exists on the fixed, host-readable path.
     let abs = flavoured_root_abs_path(&cfg, "tweet-style");
