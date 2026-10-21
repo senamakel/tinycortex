@@ -270,7 +270,7 @@ pub fn list_summaries_with_content_path(
         crate::memory::chunks::collections::SUMMARY_CONTENT_POINTERS,
     )? {
         let pointer: SummaryContentPointer = serde_json::from_value(value)?;
-        if pointer.content_path.is_empty() {
+        if pointer.content_path.is_empty() || pointer.content_sha256.is_empty() {
             continue;
         }
         if summaries.get(&pointer.summary_id).is_some_and(|value| {
