@@ -1,14 +1,9 @@
-// Server-only data access over a local TinyCortex memory workspace.
-//
-// Everything here runs on the Node server (never shipped to the browser): it
-// opens the workspace's SQLite stores read-only and reads the JSON/markdown
-// artifacts a sync run leaves behind. Each reader tolerates a missing store so
-// a partially-populated workspace still renders.
+// Server-only projection of TinyCortex owner storage plus host-owned artifacts.
 
 import "server-only";
-import Database from "better-sqlite3";
 import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
+import { readOwnerSnapshot } from "@/lib/inspector";
 
 // ── Workspace resolution ────────────────────────────────────────────────────
 
@@ -19,8 +14,6 @@ export function workspacePath(): string | null {
 
 export type StorePaths = {
   workspace: string;
-  skillDocsDb: string;
-  chunksDb: string;
   manifest: string;
   entitiesDir: string;
 };
@@ -28,20 +21,9 @@ export type StorePaths = {
 export function storePaths(workspace: string): StorePaths {
   return {
     workspace,
-    skillDocsDb: join(workspace, "memory_tree", "skill_docs.db"),
-    chunksDb: join(workspace, "memory_tree", "chunks.db"),
     manifest: join(workspace, "sync_manifest.json"),
     entitiesDir: join(workspace, "memory_tree", "content", "entities"),
   };
-}
-
-function openReadonly(path: string): Database.Database | null {
-  if (!existsSync(path)) return null;
-  try {
-    return new Database(path, { readonly: true, fileMustExist: true });
-  } catch {
-    return null;
-  }
 }
 
 // ── Skill documents (what sync ingested) ────────────────────────────────────
