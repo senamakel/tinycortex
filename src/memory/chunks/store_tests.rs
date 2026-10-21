@@ -333,7 +333,7 @@ fn delete_chunks_by_source_removes_chunks_side_rows_and_ingest_gate() {
             .unwrap();
         super::set_chunk_embedding_for_signature(&cfg, &chunk.id, "test/model@3", &[1.0, 2.0, 3.0])
             .unwrap();
-        super::mark_chunk_reembed_skipped(&cfg, &chunk.id, "test/model@3", "terminal", 1_700_000_000_000)
+        super::mark_chunk_reembed_skipped(&cfg, &chunk.id, "test/model@3", "terminal")
             .unwrap();
     }
     assert!(crate::memory::chunks::store_sources::claim_source_ingest(
@@ -357,8 +357,13 @@ fn delete_chunks_by_source_removes_chunks_side_rows_and_ingest_gate() {
     assert_eq!(crate::memory::score::store_query::count_entity_index(&cfg).unwrap(), 1);
     assert_eq!(crate::memory::chunks::get_chunk_embedding_for_signature(&cfg, &other.id, "test/model@3").unwrap(), Some(vec![1.0, 2.0, 3.0]));
     assert!(crate::memory::chunks::get_chunk_embedding_for_signature(&cfg, &target_a.id, "test/model@3").unwrap().is_none());
-    assert!(crate::memory::chunks::is_chunk_reembed_skipped(&cfg, &other.id, "test/model@3").unwrap());
-    assert!(!crate::memory::chunks::is_chunk_reembed_skipped(&cfg, &target_a.id, "test/model@3").unwrap());
+    let skips = crate::memory::chunks::versioned::list_state(
+        &cfg,
+        crate::memory::chunks::collections::CHUNK_REEMBED_SKIPS,
+    )
+    .unwrap();
+    assert_eq!(skips.len(), 1);
+    assert_eq!(skips[0].1["chunk_id"], other.id);
 }
 
 #[test]
