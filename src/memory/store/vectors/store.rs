@@ -1,57 +1,62 @@
-//! Local vector store backed by SQLite.
+//! Host-owned document persistence and brute-force cosine search for vectors.
 //!
-//! Provides a self-contained vector database for storing, searching, and
-//! managing text embeddings. Uses SQLite for persistence and brute-force
-//! cosine similarity for retrieval (fast enough for on-device workloads up
-//! to ~100K vectors).
-//!
-//! The store only persists and searches packed `f32` vectors; all model calls
-//! go through the injected [`EmbeddingBackend`]. Ported faithfully from
-//! OpenHuman's `memory_store::vectors::store`.
-//!
-//! # Usage
-//!
-//! ```ignore
-//! let backend = Arc::new(InertEmbedding::new(768));
-//! let store = VectorStore::open(db_path, backend)?;
-//!
-//! store.insert("doc-1", "notes", "The quick brown fox", json!({})).await?;
-//! let results = store.search("notes", "fast animal", 5).await?;
-//! ```
+//! Each vector is one document in a prepared TinyCortex collection. Embedding
+//! bytes are stored exactly as little-endian `f32` bytes (represented as a JSON
+//! byte array), and metadata remains raw JSON text until after top-K selection.
 
-use std::path::Path;
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use anyhow::Context;
-use parking_lot::Mutex;
-use rusqlite::{Connection, OptionalExtension};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use sha2::{Digest, Sha256};
+use tinystoragedrivers_api::{DocumentStore, DocumentStoreExt};
+use tinystoragedrivers_types::{Filter, Precondition, Query, Versioned, WriteOp};
 
+use crate::memory::{config::MemoryConfig, storage::Blocking};
 use super::embedding::EmbeddingBackend;
 
-/// SQL to create the vector store schema.
-const INIT_SQL: &str = "
-    PRAGMA journal_mode = WAL;
-    PRAGMA synchronous = NORMAL;
-    PRAGMA busy_timeout = 15000;
+/// Collection containing one record per `(namespace, id)` vector.
+pub const VECTOR_RECORDS: &str = "memory_vectors";
+/// Collection containing the embedding backend compatibility record.
+pub const VECTOR_METADATA: &str = "memory_vector_metadata";
+const VECTOR_META_ID: &str = "embedding-config";
+const QUERY_PAGE_SIZE: usize = 512;
 
-    CREATE TABLE IF NOT EXISTS vectors (
-        id         TEXT    NOT NULL,
-        namespace  TEXT    NOT NULL,
-        text       TEXT    NOT NULL,
-        embedding  BLOB    NOT NULL,
-        metadata   TEXT    NOT NULL DEFAULT '{}',
-        created_at REAL    NOT NULL,
-        updated_at REAL    NOT NULL,
-        PRIMARY KEY (namespace, id)
-    );
-    CREATE INDEX IF NOT EXISTS idx_vectors_ns ON vectors(namespace);
+/// Collections owned by vector persistence. Hosts prepare these before use.
+#[must_use]
+pub fn collections() -> Vec<tinystoragedrivers_types::CollectionSpec> {
+    use tinystoragedrivers_types::{CollectionSpec, IndexSpec};
+    vec![
+        CollectionSpec::new(VECTOR_RECORDS)
+            .index(IndexSpec::new("by_namespace", ["namespace"])),
+        CollectionSpec::new(VECTOR_METADATA),
+    ]
+}
 
-    CREATE TABLE IF NOT EXISTS store_meta (
-        key        TEXT    PRIMARY KEY,
-        value      TEXT    NOT NULL,
-        updated_at REAL    NOT NULL
-    );
-";
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VectorRecord {
+    namespace: String,
+    id: String,
+    text: String,
+    dimensions: usize,
+    embedding_le: Vec<u8>,
+    /// Keep this raw so invalid legacy metadata can fall back to JSON null
+    /// after top-K, without making one malformed candidate break the search.
+    metadata_json: String,
+    created_at: f64,
+    updated_at: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VectorMetadata {
+    backend_name: String,
+    backend_signature: String,
+    dimensions: usize,
+}
 
 /// A single search result from the vector store.
 #[derive(Debug, Clone)]
@@ -62,53 +67,45 @@ pub struct SearchResult {
     pub namespace: String,
     /// The original text.
     pub text: String,
-    /// Cosine similarity score (0.0 – 1.0).
+    /// Cosine similarity score (`-1.0` through `1.0`).
     pub score: f64,
-    /// Arbitrary JSON metadata attached at insert time.
+    /// Arbitrary JSON metadata attached at insert time. Invalid stored JSON is
+    /// returned as `Null`, matching the historical behavior.
     pub metadata: serde_json::Value,
 }
 
-/// SQLite-backed local vector store.
+/// Vector store over host-supplied, prepared document storage.
 ///
-/// Thread-safe: the inner connection is behind a `parking_lot::Mutex` and the
-/// struct is `Send + Sync`. Embedding calls are async and run through the
-/// configured [`EmbeddingBackend`].
+/// The store never opens a database or creates an in-memory production
+/// fallback. `MemoryConfig::prepare_storage` declares its collections, and
+/// this constructor validates the persisted embedding identity and dimension.
 pub struct VectorStore {
-    pub(crate) conn: Arc<Mutex<Connection>>,
+    documents: Arc<dyn DocumentStore>,
+    blocking: Blocking,
     backend: Arc<dyn EmbeddingBackend>,
 }
 
 impl VectorStore {
-    /// Opens (or creates) a vector store at the given SQLite database path.
-    ///
-    /// On first open the backend name and dimensions are persisted to a
-    /// `store_meta` table. On subsequent opens the stored dimensions are
-    /// compared against the runtime backend and an error is returned if they
-    /// mismatch. Metadata read errors and malformed stored dimensions fail
-    /// closed rather than being treated as a first open.
-    pub fn open(db_path: &Path, backend: Arc<dyn EmbeddingBackend>) -> anyhow::Result<Self> {
-        if let Some(parent) = db_path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-
-        let conn = Connection::open(db_path)?;
-        conn.execute_batch(INIT_SQL)?;
-
-        Self::check_or_store_meta(&conn, &*backend)?;
-
+    /// Attach the vector store to a host-prepared memory configuration.
+    pub fn from_config(
+        config: &MemoryConfig,
+        backend: Arc<dyn EmbeddingBackend>,
+    ) -> anyhow::Result<Self> {
+        let documents = Arc::clone(config.storage()?.documents());
+        let blocking = config.storage_blocking()?.clone();
+        let expected = VectorMetadata {
+            backend_name: backend.name().to_owned(),
+            backend_signature: backend.signature(),
+            dimensions: backend.dimensions(),
+        };
+        let docs = Arc::clone(&documents);
+        let stored_expected = expected.clone();
+        blocking
+            .run(async move { check_or_store_metadata(docs.as_ref(), stored_expected).await })
+            .map_err(anyhow::Error::from)??;
         Ok(Self {
-            conn: Arc::new(Mutex::new(conn)),
-            backend,
-        })
-    }
-
-    /// Opens an in-memory vector store (useful for tests).
-    pub fn open_in_memory(backend: Arc<dyn EmbeddingBackend>) -> anyhow::Result<Self> {
-        let conn = Connection::open_in_memory()?;
-        conn.execute_batch(INIT_SQL)?;
-        Self::check_or_store_meta(&conn, &*backend)?;
-        Ok(Self {
-            conn: Arc::new(Mutex::new(conn)),
+            documents,
+            blocking,
             backend,
         })
     }
@@ -118,62 +115,7 @@ impl VectorStore {
         self.backend.as_ref()
     }
 
-    /// Persist or validate the embedding configuration in `store_meta`.
-    ///
-    /// Missing metadata initializes the store. Query failures, malformed
-    /// stored dimensions, and runtime/stored dimension mismatches are returned
-    /// as errors so the compatibility guard fails closed.
-    fn check_or_store_meta(
-        conn: &Connection,
-        backend: &dyn EmbeddingBackend,
-    ) -> anyhow::Result<()> {
-        let now = now_ts();
-        let stored_dims: Option<String> = conn
-            .query_row(
-                "SELECT value FROM store_meta WHERE key = 'embed_dims'",
-                [],
-                |row| row.get(0),
-            )
-            .optional()?;
-
-        match stored_dims {
-            None => {
-                // First open — persist metadata.
-                let stmts: &[(&str, &str)] = &[
-                    ("embed_provider", backend.name()),
-                    ("embed_dims", &backend.dimensions().to_string()),
-                ];
-                for (key, value) in stmts {
-                    conn.execute(
-                        "INSERT OR REPLACE INTO store_meta (key, value, updated_at) VALUES (?1, ?2, ?3)",
-                        rusqlite::params![key, value, now],
-                    )?;
-                }
-            }
-            Some(dims_str) => {
-                let stored: usize = dims_str.parse().with_context(|| {
-                    format!("invalid vector store embed_dims metadata: {dims_str}")
-                })?;
-                let runtime = backend.dimensions();
-                if stored != runtime {
-                    anyhow::bail!(
-                        "vector store dimension mismatch: database was created with \
-                         {stored}-dim embeddings but the current backend ({}) uses \
-                         {runtime} dims. Delete the database or reconfigure the backend.",
-                        backend.name()
-                    );
-                }
-            }
-        }
-
-        Ok(())
-    }
-
-    // ── Write operations ─────────────────────────────────────
-
-    /// Inserts or updates a text entry. The text is embedded automatically.
-    ///
-    /// If an entry with the same `(namespace, id)` already exists it is replaced.
+    /// Inserts or updates a text entry after embedding it.
     pub async fn insert(
         &self,
         id: &str,
@@ -182,13 +124,11 @@ impl VectorStore {
         metadata: serde_json::Value,
     ) -> anyhow::Result<()> {
         let embedding = self.backend.embed_one(text).await?;
-        self.insert_with_vector(id, namespace, text, &embedding, metadata)
+        self.insert_with_vector_async(id, namespace, text, &embedding, metadata)
+            .await
     }
 
-    /// Inserts with a pre-computed embedding vector (skips the embed call).
-    ///
-    /// The vector length is checked against the active backend dimensions and
-    /// a mismatch is rejected before any row is written.
+    /// Inserts with a pre-computed embedding vector.
     pub fn insert_with_vector(
         &self,
         id: &str,
@@ -197,72 +137,67 @@ impl VectorStore {
         embedding: &[f32],
         metadata: serde_json::Value,
     ) -> anyhow::Result<()> {
-        anyhow::ensure!(
-            embedding.len() == self.backend.dimensions(),
-            "embedding dimension mismatch: expected {}, got {}",
-            self.backend.dimensions(),
-            embedding.len()
-        );
-        let blob = vec_to_bytes(embedding);
-        let meta_str = serde_json::to_string(&metadata)?;
-        let now = now_ts();
-
-        let conn = self.conn.lock();
-        conn.execute(
-            "INSERT OR REPLACE INTO vectors (id, namespace, text, embedding, metadata, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            rusqlite::params![id, namespace, text, blob, meta_str, now, now],
-        )?;
-
-        Ok(())
+        validate_embedding(embedding, self.backend.dimensions())?;
+        let documents = Arc::clone(&self.documents);
+        let record = make_record(id, namespace, text, embedding, metadata)?;
+        self.blocking
+            .run(async move { put_record(documents.as_ref(), record).await })
+            .map_err(anyhow::Error::from)?
     }
 
-    /// Bulk-insert multiple entries. Each text is embedded automatically.
+    /// Async counterpart to [`Self::insert_with_vector`] for current-thread
+    /// runtimes.
+    pub async fn insert_with_vector_async(
+        &self,
+        id: &str,
+        namespace: &str,
+        text: &str,
+        embedding: &[f32],
+        metadata: serde_json::Value,
+    ) -> anyhow::Result<()> {
+        validate_embedding(embedding, self.backend.dimensions())?;
+        let record = make_record(id, namespace, text, embedding, metadata)?;
+        put_record(self.documents.as_ref(), record).await
+    }
+
+    /// Bulk-insert entries atomically. The backend must return one embedding
+    /// per input and the host document driver must support atomic batches.
     pub async fn insert_batch(
         &self,
         namespace: &str,
-        entries: &[(&str, &str, serde_json::Value)], // (id, text, metadata)
+        entries: &[(&str, &str, serde_json::Value)],
     ) -> anyhow::Result<()> {
         if entries.is_empty() {
             return Ok(());
         }
-
-        let texts: Vec<&str> = entries.iter().map(|(_, text, _)| *text).collect();
+        let texts = entries.iter().map(|(_, text, _)| *text).collect::<Vec<_>>();
         let embeddings = self.backend.embed(&texts).await?;
-
-        if embeddings.len() != entries.len() {
-            anyhow::bail!(
-                "embedding count mismatch: got {} embeddings for {} entries",
-                embeddings.len(),
-                entries.len()
-            );
-        }
-
+        anyhow::ensure!(
+            embeddings.len() == entries.len(),
+            "embedding count mismatch: got {} embeddings for {} entries",
+            embeddings.len(),
+            entries.len()
+        );
+        let mut ops = Vec::with_capacity(entries.len());
         let now = now_ts();
-        let conn = self.conn.lock();
-        let tx = conn.unchecked_transaction()?;
-
-        for ((id, text, metadata), embedding) in entries.iter().zip(embeddings.iter()) {
-            let blob = vec_to_bytes(embedding);
-            let meta_str = serde_json::to_string(metadata)?;
-            tx.execute(
-                "INSERT OR REPLACE INTO vectors (id, namespace, text, embedding, metadata, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                rusqlite::params![id, namespace, text, blob, meta_str, now, now],
-            )?;
+        for ((id, text, metadata), embedding) in entries.iter().zip(embeddings) {
+            validate_embedding(&embedding, self.backend.dimensions())?;
+            let record = make_record_at(id, namespace, text, &embedding, metadata.clone(), now)?;
+            ops.push(WriteOp::Put {
+                collection: VECTOR_RECORDS.to_owned(),
+                id: vector_document_id(namespace, id),
+                doc: serde_json::to_value(record)?,
+                precondition: Precondition::None,
+            });
         }
-
-        tx.commit()?;
-
+        self.documents
+            .atomic_batch(ops)
+            .await
+            .map_err(anyhow::Error::from)?;
         Ok(())
     }
 
-    // ── Search ───────────────────────────────────────────────
-
-    /// Searches for the `limit` most similar entries to `query` within a namespace.
-    ///
-    /// The query is embedded via the configured backend and compared against
-    /// all stored vectors using cosine similarity.
+    /// Searches by embedding text, using the configured backend.
     pub async fn search(
         &self,
         namespace: &str,
@@ -270,7 +205,7 @@ impl VectorStore {
         limit: usize,
     ) -> anyhow::Result<Vec<SearchResult>> {
         let query_vec = self.backend.embed_one(query).await?;
-        self.search_by_vector(namespace, &query_vec, limit)
+        self.search_by_vector_async(namespace, &query_vec, limit).await
     }
 
     /// Searches using a pre-computed query vector.
@@ -283,150 +218,321 @@ impl VectorStore {
         if limit == 0 {
             return Ok(Vec::new());
         }
+        let documents = Arc::clone(&self.documents);
+        let namespace = namespace.to_owned();
+        let query_vec = query_vec.to_vec();
+        self.blocking
+            .run(async move {
+                search_documents(documents.as_ref(), &namespace, &query_vec, limit).await
+            })
+            .map_err(anyhow::Error::from)?
+    }
 
-        let conn = self.conn.lock();
-        let mut stmt = conn.prepare(
-            "SELECT id, namespace, text, embedding, metadata FROM vectors WHERE namespace = ?1",
-        )?;
-
-        let rows: Vec<(String, String, String, Vec<u8>, String)> = stmt
-            .query_map(rusqlite::params![namespace], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, Vec<u8>>(3)?,
-                    row.get::<_, String>(4)?,
-                ))
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-
-        // Score-only intermediate: keep metadata as the raw JSON string instead
-        // of parsing it here. We scan every vector in the namespace but return
-        // only `limit` rows, so parsing the metadata of all N candidates would
-        // throw away all but `limit` parses. Defer the parse until after the
-        // truncation below, where it runs `limit` times instead of N.
-        struct ScoredRow {
-            score: f64,
-            id: String,
-            namespace: String,
-            text: String,
-            meta_str: String,
+    /// Async counterpart to [`Self::search_by_vector`] for current-thread
+    /// runtimes.
+    pub async fn search_by_vector_async(
+        &self,
+        namespace: &str,
+        query_vec: &[f32],
+        limit: usize,
+    ) -> anyhow::Result<Vec<SearchResult>> {
+        if limit == 0 {
+            return Ok(Vec::new());
         }
-
-        let mut scored: Vec<ScoredRow> = rows
-            .into_iter()
-            .map(|(id, namespace, text, blob, meta_str)| {
-                let stored_vec = bytes_to_vec(&blob)?;
-                let score = cosine_similarity(query_vec, &stored_vec);
-                Ok(ScoredRow {
-                    score,
-                    id,
-                    namespace,
-                    text,
-                    meta_str,
-                })
-            })
-            .collect::<anyhow::Result<Vec<_>>>()?;
-
-        // Sort descending by score.
-        scored.sort_by(|a, b| {
-            b.score
-                .partial_cmp(&a.score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        scored.truncate(limit);
-
-        // Parse metadata only for the rows that survived truncation. Invalid
-        // JSON falls back to Null.
-        let results: Vec<SearchResult> = scored
-            .into_iter()
-            .map(|row| {
-                let metadata =
-                    serde_json::from_str(&row.meta_str).unwrap_or(serde_json::Value::Null);
-                SearchResult {
-                    id: row.id,
-                    namespace: row.namespace,
-                    text: row.text,
-                    score: row.score,
-                    metadata,
-                }
-            })
-            .collect();
-
-        Ok(results)
+        search_documents(self.documents.as_ref(), namespace, query_vec, limit).await
     }
 
-    // ── Delete / management ──────────────────────────────────
-
-    /// Deletes a single entry by ID within a namespace.
-    ///
-    /// Returns `true` if a row was actually deleted.
+    /// Deletes an entry by ID within a namespace; returns whether it existed.
     pub fn delete(&self, namespace: &str, id: &str) -> anyhow::Result<bool> {
-        let conn = self.conn.lock();
-        let affected = conn.execute(
-            "DELETE FROM vectors WHERE namespace = ?1 AND id = ?2",
-            rusqlite::params![namespace, id],
-        )?;
-        Ok(affected > 0)
+        let documents = Arc::clone(&self.documents);
+        let namespace = namespace.to_owned();
+        let id = id.to_owned();
+        self.blocking
+            .run(async move { delete_record(documents.as_ref(), &namespace, &id).await })
+            .map_err(anyhow::Error::from)?
     }
 
-    /// Deletes all entries in a namespace.
-    ///
-    /// Returns the number of deleted rows.
+    /// Deletes all vectors in a namespace and returns the number removed.
     pub fn clear_namespace(&self, namespace: &str) -> anyhow::Result<usize> {
-        let conn = self.conn.lock();
-        let affected = conn.execute(
-            "DELETE FROM vectors WHERE namespace = ?1",
-            rusqlite::params![namespace],
-        )?;
-        Ok(affected)
+        let documents = Arc::clone(&self.documents);
+        let namespace = namespace.to_owned();
+        self.blocking
+            .run(async move {
+                let removed = documents
+                    .delete_where(VECTOR_RECORDS, &Filter::eq("namespace", namespace))
+                    .await?;
+                usize::try_from(removed).context("vector count did not fit in usize")
+            })
+            .map_err(anyhow::Error::from)?
+            .map_err(anyhow::Error::from)
     }
 
-    /// Returns the number of entries in a namespace (or all if `None`).
+    /// Returns the number of vectors in one namespace (or all namespaces).
     pub fn count(&self, namespace: Option<&str>) -> anyhow::Result<usize> {
-        let conn = self.conn.lock();
-        // SQLite COUNT(*) is an i64; rusqlite (>= 0.33) no longer implements
-        // FromSql for usize, so read as i64 and convert. Overflow is impossible
-        // in practice but handled rather than silently truncated.
-        let count: i64 = match namespace {
-            Some(ns) => conn.query_row(
-                "SELECT COUNT(*) FROM vectors WHERE namespace = ?1",
-                rusqlite::params![ns],
-                |row| row.get(0),
-            )?,
-            None => conn.query_row("SELECT COUNT(*) FROM vectors", [], |row| row.get(0))?,
-        };
-        usize::try_from(count).context("vector count did not fit in usize")
+        let documents = Arc::clone(&self.documents);
+        let filter = namespace.map_or(Filter::All, |namespace| {
+            Filter::eq("namespace", namespace.to_owned())
+        });
+        self.blocking
+            .run(async move {
+                let count = documents.count(VECTOR_RECORDS, &filter).await?;
+                usize::try_from(count).context("vector count did not fit in usize")
+            })
+            .map_err(anyhow::Error::from)?
+            .map_err(anyhow::Error::from)
     }
 
-    /// Lists all distinct namespaces.
+    /// Lists namespaces in lexical order.
     pub fn list_namespaces(&self) -> anyhow::Result<Vec<String>> {
-        let conn = self.conn.lock();
-        let mut stmt = conn.prepare("SELECT DISTINCT namespace FROM vectors ORDER BY namespace")?;
-        let namespaces: Vec<String> = stmt
-            .query_map([], |row| row.get(0))?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok(namespaces)
+        let documents = Arc::clone(&self.documents);
+        self.blocking
+            .run(async move {
+                let rows = query_all(documents.as_ref(), Filter::All).await?;
+                let mut namespaces = BTreeSet::new();
+                for row in rows {
+                    let record = decode_record(row)?;
+                    namespaces.insert(record.namespace);
+                }
+                Ok(namespaces.into_iter().collect())
+            })
+            .map_err(anyhow::Error::from)?
     }
 }
 
-// ── Vector math utilities ────────────────────────────────────
+async fn check_or_store_metadata(
+    documents: &dyn DocumentStore,
+    expected: VectorMetadata,
+) -> tinystoragedrivers_types::Result<()> {
+    match documents.get_as::<VectorMetadata>(VECTOR_METADATA, VECTOR_META_ID).await? {
+        Some(stored) => validate_metadata(&stored.doc, &expected),
+        None => match documents
+            .put_as(
+                VECTOR_METADATA,
+                VECTOR_META_ID,
+                &expected,
+                Precondition::Absent,
+            )
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(error) if error.kind() == tinystoragedrivers_types::ErrorKind::Conflict => {
+                let stored = documents
+                    .get_as::<VectorMetadata>(VECTOR_METADATA, VECTOR_META_ID)
+                    .await?
+                    .ok_or_else(|| {
+                        tinystoragedrivers_types::StorageError::conflict(
+                            "vector metadata changed during initialization",
+                        )
+                    })?;
+                validate_metadata(&stored.doc, &expected)
+            }
+            Err(error) => Err(error),
+        },
+    }
+}
 
-/// Serializes a float vector to little-endian bytes for SQLite BLOB storage.
-pub fn vec_to_bytes(v: &[f32]) -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(v.len() * 4);
-    for &f in v {
-        bytes.extend_from_slice(&f.to_le_bytes());
+fn validate_metadata(
+    stored: &VectorMetadata,
+    expected: &VectorMetadata,
+) -> tinystoragedrivers_types::Result<()> {
+    if stored.dimensions != expected.dimensions {
+        return Err(tinystoragedrivers_types::StorageError::invalid_input(format!(
+            "vector store dimension mismatch: database was created with {}-dim embeddings but the current backend ({}) uses {} dims",
+            stored.dimensions, expected.backend_name, expected.dimensions
+        )));
+    }
+    if stored.backend_signature != expected.backend_signature
+        || stored.backend_name != expected.backend_name
+    {
+        return Err(tinystoragedrivers_types::StorageError::invalid_input(format!(
+            "vector store backend mismatch: database uses {} but the current backend is {}",
+            stored.backend_signature, expected.backend_signature
+        )));
+    }
+    Ok(())
+}
+
+fn validate_embedding(embedding: &[f32], dimensions: usize) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        embedding.len() == dimensions,
+        "embedding dimension mismatch: expected {dimensions}, got {}",
+        embedding.len()
+    );
+    Ok(())
+}
+
+fn make_record(
+    id: &str,
+    namespace: &str,
+    text: &str,
+    embedding: &[f32],
+    metadata: Value,
+) -> anyhow::Result<VectorRecord> {
+    make_record_at(id, namespace, text, embedding, metadata, now_ts())
+}
+
+fn make_record_at(
+    id: &str,
+    namespace: &str,
+    text: &str,
+    embedding: &[f32],
+    metadata: Value,
+    now: f64,
+) -> anyhow::Result<VectorRecord> {
+    anyhow::ensure!(!id.is_empty(), "vector id must not be empty");
+    let metadata_json = serde_json::to_string(&metadata)?;
+    Ok(VectorRecord {
+        namespace: namespace.to_owned(),
+        id: id.to_owned(),
+        text: text.to_owned(),
+        dimensions: embedding.len(),
+        embedding_le: vec_to_bytes(embedding),
+        metadata_json,
+        created_at: now,
+        updated_at: now,
+    })
+}
+
+async fn put_record(documents: &dyn DocumentStore, record: VectorRecord) -> anyhow::Result<()> {
+    documents
+        .put_as(
+            VECTOR_RECORDS,
+            &vector_document_id(&record.namespace, &record.id),
+            &record,
+            Precondition::None,
+        )
+        .await
+        .map_err(anyhow::Error::from)?;
+    Ok(())
+}
+
+async fn delete_record(
+    documents: &dyn DocumentStore,
+    namespace: &str,
+    id: &str,
+) -> anyhow::Result<bool> {
+    let document_id = vector_document_id(namespace, id);
+    let Some(stored) = documents.get(VECTOR_RECORDS, &document_id).await? else {
+        return Ok(false);
+    };
+    let record = decode_record(stored.clone())?;
+    anyhow::ensure!(
+        record.namespace == namespace && record.id == id,
+        "vector document identity mismatch"
+    );
+    documents
+        .delete(VECTOR_RECORDS, &document_id, Precondition::Version(stored.version))
+        .await
+        .map_err(anyhow::Error::from)
+}
+
+async fn query_all(
+    documents: &dyn DocumentStore,
+    filter: Filter,
+) -> tinystoragedrivers_types::Result<Vec<Versioned<Value>>> {
+    let mut query = Query::filter(filter).limit(QUERY_PAGE_SIZE);
+    let mut all = Vec::new();
+    let mut cursor_seen = BTreeSet::new();
+    loop {
+        let page = documents.query(VECTOR_RECORDS, &query).await?;
+        all.extend(page.items);
+        match page.next {
+            Some(cursor) => {
+                if !cursor_seen.insert(cursor.0.clone()) {
+                    return Err(tinystoragedrivers_types::StorageError::backend(
+                        "vector query returned a repeated cursor",
+                    ));
+                }
+                query = query.after(cursor);
+            }
+            None => break,
+        }
+    }
+    Ok(all)
+}
+
+async fn search_documents(
+    documents: &dyn DocumentStore,
+    namespace: &str,
+    query_vec: &[f32],
+    limit: usize,
+) -> anyhow::Result<Vec<SearchResult>> {
+    let rows = query_all(
+        documents,
+        Filter::eq("namespace", namespace.to_owned()),
+    )
+    .await?;
+    struct ScoredRow {
+        score: f64,
+        record: VectorRecord,
+    }
+    let mut scored = Vec::with_capacity(rows.len());
+    for row in rows {
+        let record = decode_record(row)?;
+        anyhow::ensure!(
+            record.namespace == namespace,
+            "vector document namespace mismatch"
+        );
+        let vector = bytes_to_vec(&record.embedding_le)?;
+        anyhow::ensure!(
+            vector.len() == record.dimensions,
+            "stored vector dimension does not match its payload"
+        );
+        let score = cosine_similarity(query_vec, &vector);
+        scored.push(ScoredRow { score, record });
+    }
+    scored.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            // SQL's historical query had no ORDER BY, so ties were
+            // unspecified. Use logical id as a deterministic tie-breaker.
+            .then_with(|| a.record.id.cmp(&b.record.id))
+    });
+    scored.truncate(limit);
+    Ok(scored
+        .into_iter()
+        .map(|row| SearchResult {
+            id: row.record.id,
+            namespace: row.record.namespace,
+            text: row.record.text,
+            score: row.score,
+            metadata: serde_json::from_str(&row.record.metadata_json)
+                .unwrap_or(serde_json::Value::Null),
+        })
+        .collect())
+}
+
+fn decode_record(row: Versioned<Value>) -> anyhow::Result<VectorRecord> {
+    let record: VectorRecord = serde_json::from_value(row.doc).context("invalid vector record")?;
+    anyhow::ensure!(
+        vector_document_id(&record.namespace, &record.id) == row.id,
+        "vector document identity does not match its key"
+    );
+    Ok(record)
+}
+
+fn vector_document_id(namespace: &str, id: &str) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"tinycortex-vector-v1\0");
+    digest.update((namespace.len() as u64).to_be_bytes());
+    digest.update(namespace.as_bytes());
+    digest.update((id.len() as u64).to_be_bytes());
+    digest.update(id.as_bytes());
+    format!("vector-{:x}", digest.finalize())
+}
+
+/// Serializes a float vector to its exact little-endian byte representation.
+pub fn vec_to_bytes(vector: &[f32]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(vector.len() * 4);
+    for value in vector {
+        bytes.extend_from_slice(&value.to_le_bytes());
     }
     bytes
 }
 
-/// Deserializes little-endian bytes back to a float vector.
-///
-/// Returns an error when the blob length is not divisible by four rather than
-/// silently truncating corrupt trailing bytes.
-#[allow(clippy::manual_is_multiple_of)] // Keep compatibility below Rust 1.87.
+/// Deserializes little-endian bytes, rejecting a corrupt partial trailing word.
+#[allow(clippy::manual_is_multiple_of)]
 pub fn bytes_to_vec(bytes: &[u8]) -> anyhow::Result<Vec<f32>> {
     anyhow::ensure!(
         bytes.len() % 4 == 0,
@@ -441,11 +547,7 @@ pub fn bytes_to_vec(bytes: &[u8]) -> anyhow::Result<Vec<f32>> {
         .collect())
 }
 
-/// Computes cosine similarity between two vectors. Returns 0.0 for
-/// mismatched lengths, empty vectors, or zero-magnitude vectors.
-///
-/// The raw cosine value is clamped only for floating-point drift, preserving
-/// its mathematical `[-1.0, 1.0]` range.
+/// Computes cosine similarity using `f64` accumulation and clamps drift.
 pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f64 {
     if a.len() != b.len() || a.is_empty() {
         return 0.0;
@@ -453,7 +555,7 @@ pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f64 {
     let mut dot = 0.0_f64;
     let mut norm_a = 0.0_f64;
     let mut norm_b = 0.0_f64;
-    for (x, y) in a.iter().zip(b.iter()) {
+    for (x, y) in a.iter().zip(b) {
         let x = f64::from(*x);
         let y = f64::from(*y);
         dot += x * y;
@@ -471,7 +573,7 @@ fn now_ts() -> f64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs_f64())
+        .map(|duration| duration.as_secs_f64())
         .unwrap_or(0.0)
 }
 

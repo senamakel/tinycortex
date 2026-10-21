@@ -163,7 +163,10 @@ impl MemoryConfig {
             .storage
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("TinyCortex requires host-supplied storage"))?;
-        for spec in crate::memory::chunks::collections() {
+        for spec in crate::memory::chunks::collections()
+            .into_iter()
+            .chain(crate::memory::store::vectors::collections())
+        {
             storage
                 .documents()
                 .ensure_collection(&spec)
