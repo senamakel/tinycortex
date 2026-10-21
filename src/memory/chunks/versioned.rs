@@ -550,9 +550,10 @@ fn upsert_chunks_at(
     chunks: &[Chunk],
     final_chunks: &[Chunk],
     changes: &[StateChange],
+    default_lifecycle_status: Option<&str>,
 ) -> Result<usize> {
     let (revision, ancestors) = next_revision(config, snapshot)?;
-    let operation = make_manifest(snapshot, revision, ancestors, final_chunks, changes)?;
+    let operation = make_manifest(snapshot, revision, ancestors, final_chunks, changes, default_lifecycle_status)?;
     let expected_parent = snapshot.clone();
     let final_chunks = final_chunks.to_vec();
     let changes = changes.to_vec();
@@ -616,9 +617,10 @@ async fn upsert_chunks_at_async(
     chunks: &[Chunk],
     final_chunks: &[Chunk],
     changes: &[StateChange],
+    default_lifecycle_status: Option<&str>,
 ) -> Result<usize> {
     let (revision, ancestors) = next_revision_async(config, snapshot).await?;
-    let operation = make_manifest(snapshot, revision, ancestors, final_chunks, changes)?;
+    let operation = make_manifest(snapshot, revision, ancestors, final_chunks, changes, default_lifecycle_status)?;
     let expected_parent = snapshot.clone();
     let final_chunks = final_chunks.to_vec();
     let changes = changes.to_vec();
