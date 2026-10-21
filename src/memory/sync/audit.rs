@@ -4,10 +4,20 @@ use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use tinystoragedrivers_types::{Capability, ErrorKind};
 
 use crate::memory::config::MemoryConfig;
 
 const AUDIT_STREAM: &str = "tinycortex:sync-audit:v1";
+const LEGACY_AUDIT_STREAM: &str = "tinycortex:sync-audit:legacy-import:v1";
+const IMPORT_RETRIES: usize = 8;
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+struct LegacyAuditRecord {
+    source_id: String,
+    ordinal: u64,
+    entry: SyncAuditEntry,
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SyncAuditEntry {
@@ -68,6 +78,70 @@ pub async fn append_audit_entry_async(
     Ok(())
 }
 
+/// Import one host-decoded legacy JSONL snapshot into a dedicated stream.
+/// `source_id` should be a stable digest of the unchanged source bytes.
+/// Conditional append makes retries after a lost response idempotent; drivers
+/// without that capability fail explicitly instead of risking duplicate rows.
+pub async fn import_legacy_audit_entries_async(
+    config: &MemoryConfig,
+    source_id: &str,
+    entries: &[SyncAuditEntry],
+) -> anyhow::Result<()> {
+    anyhow::ensure!(!source_id.trim().is_empty(), "legacy audit source id is empty");
+    if entries.is_empty() {
+        return Ok(());
+    }
+    let streams = Arc::clone(config.storage()?.streams());
+    anyhow::ensure!(
+        streams
+            .capabilities()
+            .contains(Capability::ConditionalStreamAppend),
+        "legacy audit import requires conditional stream append"
+    );
+    let values = entries
+        .iter()
+        .enumerate()
+        .map(|(ordinal, entry)| {
+            serde_json::to_value(LegacyAuditRecord {
+                source_id: source_id.to_owned(),
+                ordinal: ordinal as u64,
+                entry: entry.clone(),
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    for _ in 0..IMPORT_RETRIES {
+        let existing = read_legacy_records(&*streams).await?;
+        let for_source = existing
+            .iter()
+            .filter(|record| record.source_id == source_id)
+            .cloned()
+            .collect::<Vec<_>>();
+        if !for_source.is_empty() {
+            anyhow::ensure!(
+                for_source.len() == entries.len()
+                    && for_source.iter().enumerate().all(|(ordinal, record)| {
+                        record.ordinal == ordinal as u64
+                            && record.entry == entries[ordinal]
+                    }),
+                "legacy audit source id already refers to different records"
+            );
+            return Ok(());
+        }
+
+        let expected = streams.len(LEGACY_AUDIT_STREAM).await?;
+        match streams
+            .append_batch_if_offset(LEGACY_AUDIT_STREAM, expected, values.clone())
+            .await
+        {
+            Ok(_) => return Ok(()),
+            Err(error) if error.kind() == ErrorKind::Conflict => continue,
+            Err(error) => return Err(error.into()),
+        }
+    }
+    anyhow::bail!("legacy audit stream changed too often to import safely")
+}
+
 pub fn read_audit_log(config: &MemoryConfig) -> anyhow::Result<Vec<SyncAuditEntry>> {
     let blocking = config.storage_blocking()?.clone();
     let streams = Arc::clone(config.storage()?.streams());
@@ -83,27 +157,65 @@ pub async fn read_audit_log_async(config: &MemoryConfig) -> anyhow::Result<Vec<S
 async fn read_entries(
     streams: &dyn tinystoragedrivers_api::StreamStore,
 ) -> anyhow::Result<Vec<SyncAuditEntry>> {
-    let len = streams.len(AUDIT_STREAM).await?;
-    let mut offset = 0_u64;
+    let mut entries = read_legacy_records(streams)
+        .await?
+        .into_iter()
+        .map(|record| record.entry)
+        .collect::<Vec<_>>();
+    entries.extend(read_live_entries(streams).await?);
+    entries.reverse();
+    Ok(entries)
+}
+
+async fn read_legacy_records(
+    streams: &dyn tinystoragedrivers_api::StreamStore,
+) -> anyhow::Result<Vec<LegacyAuditRecord>> {
+    let mut records = Vec::new();
+    for value in read_stream(streams, LEGACY_AUDIT_STREAM).await? {
+        match serde_json::from_value::<LegacyAuditRecord>(value) {
+            Ok(record) => records.push(record),
+            Err(error) => {
+                tracing::warn!(%error, "[memory_sync:audit] malformed imported record skipped");
+            }
+        }
+    }
+    Ok(records)
+}
+
+async fn read_live_entries(
+    streams: &dyn tinystoragedrivers_api::StreamStore,
+) -> anyhow::Result<Vec<SyncAuditEntry>> {
     let mut entries = Vec::new();
+    for value in read_stream(streams, AUDIT_STREAM).await? {
+        match serde_json::from_value::<SyncAuditEntry>(value) {
+            Ok(entry) => entries.push(entry),
+            Err(error) => {
+                tracing::warn!(%error, "[memory_sync:audit] malformed audit record skipped");
+            }
+        }
+    }
+    Ok(entries)
+}
+
+async fn read_stream(
+    streams: &dyn tinystoragedrivers_api::StreamStore,
+    name: &str,
+) -> anyhow::Result<Vec<serde_json::Value>> {
+    let len = streams.len(name).await?;
+    let mut offset = 0_u64;
+    let mut values = Vec::new();
     while offset < len {
-        let page = streams.read_window(AUDIT_STREAM, offset, 512).await?;
+        let page = streams.read_window(name, offset, 512).await?;
         anyhow::ensure!(
             !page.is_empty(),
             "audit stream ended before its reported length"
         );
         for record in page {
             offset = record.offset.saturating_add(1);
-            match serde_json::from_value::<SyncAuditEntry>(record.value) {
-                Ok(entry) => entries.push(entry),
-                Err(error) => {
-                    tracing::warn!(%error, "[memory_sync:audit] malformed audit record skipped");
-                }
-            }
+            values.push(record.value);
         }
     }
-    entries.reverse();
-    Ok(entries)
+    Ok(values)
 }
 
 pub fn estimate_cost_usd(input_tokens: u64, output_tokens: u64) -> f64 {

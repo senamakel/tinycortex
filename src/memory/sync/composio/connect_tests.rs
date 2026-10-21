@@ -176,6 +176,29 @@ async fn entity_store_concurrent_initializers_reuse_the_winning_id() {
 }
 
 #[tokio::test]
+async fn legacy_entity_import_is_idempotent_and_conflicts_before_any_write() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = crate::memory::chunks::test_support::host_config(dir.path());
+    let store = EntityStore::from_config(&config).unwrap();
+    let entries = vec![
+        ("gmail".to_owned(), "entity@example.test".to_owned()),
+        ("slack".to_owned(), "slack-user".to_owned()),
+    ];
+
+    store.import_legacy_entities(&entries).await.unwrap();
+    store.import_legacy_entities(&entries).await.unwrap();
+    assert_eq!(store.get("gmail").await.unwrap().as_deref(), Some("entity@example.test"));
+
+    store.set("slack", "advanced-slack-user").await.unwrap();
+    let conflicting = vec![
+        ("new-toolkit".to_owned(), "must-not-publish".to_owned()),
+        entries[1].clone(),
+    ];
+    assert!(store.import_legacy_entities(&conflicting).await.is_err());
+    assert_eq!(store.get("new-toolkit").await.unwrap(), None);
+}
+
+#[tokio::test]
 async fn list_auth_configs_sends_filter_and_decodes_success() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))

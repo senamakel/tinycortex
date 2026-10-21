@@ -100,6 +100,28 @@ async fn add_rejects_duplicate_id() {
 }
 
 #[tokio::test]
+async fn legacy_source_import_is_idempotent_and_conflicts_before_config_write() {
+    let (_temp, registry, port) = registry();
+    let existing = folder_entry("existing");
+    registry.add(existing.clone()).await.unwrap();
+
+    let mut changed_existing = existing.clone();
+    changed_existing.label = "different".into();
+    let imports = vec![folder_entry("new-source"), changed_existing];
+    assert!(registry.import_legacy_entries(&imports).await.is_err());
+    assert_eq!(registry.list().await.unwrap().len(), 1);
+    assert_eq!(
+        registry.get("existing").await.unwrap().unwrap().label,
+        existing.label
+    );
+
+    let entry = folder_entry("legacy-source");
+    assert_eq!(registry.import_legacy_entries(std::slice::from_ref(&entry)).await.unwrap(), 1);
+    assert_eq!(registry.import_legacy_entries(std::slice::from_ref(&entry)).await.unwrap(), 0);
+    assert!(port.state.lock().unwrap().1.iter().any(|source| source.id == "legacy-source"));
+}
+
+#[tokio::test]
 async fn add_rejects_invalid_entry_without_mutating_host_config() {
     let (_temp, registry, _) = registry();
     let mut bad = folder_entry("src_bad");

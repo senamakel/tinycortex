@@ -67,3 +67,50 @@ async fn opaque_cursor_identity_and_json_are_preserved_exactly() {
 
     assert_eq!(store.get(NAMESPACE, key).await.unwrap(), Some(value));
 }
+
+#[tokio::test]
+async fn legacy_cursor_import_is_idempotent_and_refuses_conflicts_before_writes() {
+    let dir = TempDir::new().unwrap();
+    let config = crate::memory::chunks::test_support::host_config(dir.path());
+    let store = KvStateStore::from_config(&config).unwrap();
+    let imported = vec![
+        LegacyPersonaStateEntry {
+            key: "file:/home/alice@example.test/.agent/session.jsonl".into(),
+            value: serde_json::json!({"mtime_ms": 17, "len": 29}),
+        },
+        LegacyPersonaStateEntry {
+            key: "git_history:/work/repo".into(),
+            value: serde_json::json!("abc123"),
+        },
+    ];
+
+    store.import_legacy_entries(&imported).await.unwrap();
+    store.import_legacy_entries(&imported).await.unwrap();
+    assert_eq!(
+        store
+            .get(NAMESPACE, &imported[0].key)
+            .await
+            .unwrap(),
+        Some(imported[0].value.clone())
+    );
+
+    store
+        .set(NAMESPACE, &imported[1].key, serde_json::json!("advanced"))
+        .await
+        .unwrap();
+    let late_import = vec![
+        LegacyPersonaStateEntry {
+            key: "new-before-conflict".into(),
+            value: serde_json::json!("must-not-publish"),
+        },
+        imported[1].clone(),
+    ];
+    assert!(store.import_legacy_entries(&late_import).await.is_err());
+    assert_eq!(
+        store
+            .get(NAMESPACE, "new-before-conflict")
+            .await
+            .unwrap(),
+        None
+    );
+}
