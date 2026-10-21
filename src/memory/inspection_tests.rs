@@ -179,7 +179,7 @@ fn snapshot_reads_owner_kv_and_chunk_records_from_explicit_storage() {
         created_at: timestamp,
         partial_message: false,
     };
-    upsert_chunks(&config, &[chunk.clone()]).unwrap();
+    upsert_chunks(&config, std::slice::from_ref(&chunk)).unwrap();
 
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
