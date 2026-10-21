@@ -326,7 +326,7 @@ impl KvStore {
 
     /// Read a global key; corrupt stored data returns an error.
     pub fn get_global(&self, key: &str) -> Result<Option<Value>, String> {
-        let key = Self::normalized_global_key(key);
+        let key = key.to_string();
         let store = self.clone();
         self.blocking
             .run(async move { store.get_value(EntryKind::Global, None, &key).await })
@@ -335,8 +335,7 @@ impl KvStore {
 
     /// Async form of [`Self::get_global`].
     pub async fn get_global_async(&self, key: &str) -> Result<Option<Value>, String> {
-        let key = Self::normalized_global_key(key);
-        self.get_value(EntryKind::Global, None, &key).await
+        self.get_value(EntryKind::Global, None, key).await
     }
 
     /// Insert or update a namespace-scoped key.
@@ -389,7 +388,7 @@ impl KvStore {
 
     /// Delete a global key; returns whether a record existed.
     pub fn delete_global(&self, key: &str) -> Result<bool, String> {
-        let key = Self::normalized_global_key(key);
+        let key = key.to_string();
         let store = self.clone();
         self.blocking
             .run(async move { store.delete_key(EntryKind::Global, None, &key).await })
@@ -398,8 +397,7 @@ impl KvStore {
 
     /// Async form of [`Self::delete_global`].
     pub async fn delete_global_async(&self, key: &str) -> Result<bool, String> {
-        let key = Self::normalized_global_key(key);
-        self.delete_key(EntryKind::Global, None, &key).await
+        self.delete_key(EntryKind::Global, None, key).await
     }
 
     /// Delete a namespace key; returns whether a record existed.
