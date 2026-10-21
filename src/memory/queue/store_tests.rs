@@ -186,9 +186,11 @@ async fn typed_import_jobs_stage_dedupe_atomically_before_hint_publication() {
     let conflict_snapshot = crate::memory::chunks::versioned::capture_state_snapshot_async(&cfg)
         .await
         .unwrap();
-    assert!(stage_import_jobs_at_snapshot(&cfg, &conflict_snapshot, &[conflict])
-        .await
-        .is_err());
+    assert!(
+        stage_import_jobs_at_snapshot(&cfg, &conflict_snapshot, &[conflict])
+            .await
+            .is_err()
+    );
     assert!(get_job_async(&cfg, "different-import-job")
         .await
         .unwrap()
@@ -200,22 +202,27 @@ async fn typed_import_jobs_stage_dedupe_atomically_before_hint_publication() {
     let staged = stage_import_jobs_at_snapshot(&cfg, &snapshot, &[job])
         .await
         .unwrap();
-    assert!(crate::memory::chunks::versioned::commit_if_state_matches_async(
-        &cfg,
-        &staged.expected,
-        &[],
-        &staged.changes,
-    )
-    .await
-    .unwrap());
+    assert!(
+        crate::memory::chunks::versioned::commit_if_state_matches_async(
+            &cfg,
+            &staged.expected,
+            &[],
+            &staged.changes,
+        )
+        .await
+        .unwrap()
+    );
     publish_import_job_hints_async(&cfg, &staged.publish)
         .await
         .unwrap();
-    assert_eq!(get_job_async(&cfg, "legacy-import-job")
-        .await
-        .unwrap()
-        .unwrap()
-        .status, JobStatus::Ready);
+    assert_eq!(
+        get_job_async(&cfg, "legacy-import-job")
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        JobStatus::Ready
+    );
 }
 
 #[tokio::test]
