@@ -41,6 +41,7 @@ struct DocumentDelegate {
     summariser: ConcatSummariser,
     projected: Arc<AtomicUsize>,
     invalidate_job_lease: Option<String>,
+    fail_projection: bool,
 }
 
 #[async_trait]
@@ -114,6 +115,9 @@ impl QueueDelegates for DocumentDelegate {
         tree_id: &str,
         summaries: &[SummaryNode],
     ) -> Result<()> {
+        if self.fail_projection {
+            bail!("injected projection failure");
+        }
         for summary in summaries {
             let stored = store::get_summary_async(config, &summary.id).await?;
             anyhow::ensure!(
@@ -174,6 +178,7 @@ fn delegate(invalidate_job_lease: Option<String>) -> DocumentDelegate {
         summariser: ConcatSummariser,
         projected: Arc::new(AtomicUsize::new(0)),
         invalidate_job_lease,
+        fail_projection: false,
     }
 }
 
@@ -288,4 +293,44 @@ async fn stale_document_lease_publishes_neither_summaries_nor_projection() {
             .status,
         JobStatus::Done
     );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn projection_failure_does_not_retry_a_committed_document_seal() {
+    let (_temp, config, tree, chunk) = test_setup().await;
+    let payload = SealDocumentPayload {
+        tree_scope: tree.scope.clone(),
+        doc_id: "doc-projection-failure".into(),
+        version_ms: Some(3),
+        chunk_ids: vec![chunk.id],
+    };
+    let job_id = crate::memory::queue::store::enqueue_async(
+        &config,
+        &NewJob::seal_document(&payload).unwrap(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let mut service = delegate(None);
+    service.fail_projection = true;
+
+    assert!(crate::memory::queue::run_once(&config, &service)
+        .await
+        .unwrap());
+    assert_eq!(
+        crate::memory::queue::store::get_job_async(&config, &job_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        JobStatus::Done,
+        "projection runs after durable settlement and must not requeue it"
+    );
+    assert!(store::get_tree_async(&config, &tree.id)
+        .await
+        .unwrap()
+        .unwrap()
+        .root_id
+        .is_some());
+    assert_eq!(service.projected.load(Ordering::SeqCst), 0);
 }
