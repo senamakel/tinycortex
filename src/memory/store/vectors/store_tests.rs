@@ -60,11 +60,15 @@ impl EmbeddingBackend for MismatchEmbedding {
 }
 
 fn fake_store(dims: usize) -> VectorStore {
-    VectorStore::from_config(
-        &crate::memory::chunks::test_support::host_config("unused-vector-workspace"),
-        Arc::new(FakeEmbedding { dims }),
-    )
-    .unwrap()
+    fake_store_with_backend(Arc::new(FakeEmbedding { dims }))
+}
+
+fn fake_store_with_backend(backend: Arc<dyn EmbeddingBackend>) -> VectorStore {
+    let config = crate::memory::chunks::test_support::host_config("unused-vector-workspace");
+    std::thread::spawn(move || VectorStore::from_config(&config, backend))
+        .join()
+        .unwrap()
+        .unwrap()
 }
 
 fn put_raw_record(store: &VectorStore, namespace: &str, id: &str, doc: serde_json::Value) {
@@ -166,6 +170,16 @@ fn reopening_prepared_store_with_different_dims_errors() {
 }
 
 #[test]
+fn reopening_prepared_store_with_different_backend_errors() {
+    let config = crate::memory::chunks::test_support::host_config("unused-vector-workspace");
+    VectorStore::from_config(&config, Arc::new(FakeEmbedding { dims: 2 })).unwrap();
+    let error = VectorStore::from_config(&config, Arc::new(MismatchEmbedding))
+        .err()
+        .expect("backend mismatch must fail closed");
+    assert!(error.to_string().contains("backend mismatch"));
+}
+
+#[test]
 fn open_rejects_corrupt_dimension_metadata() {
     let config = crate::memory::chunks::test_support::host_config("unused-vector-workspace");
     let store = VectorStore::from_config(&config, Arc::new(FakeEmbedding { dims: 4 })).unwrap();
@@ -233,22 +247,28 @@ fn embedding_signature_format_is_stable() {
     assert_eq!(backend.signature(), "provider=fake;model=fake;dims=7");
 }
 
-#[test]
-fn vector_store_uses_the_prepared_host_document_port() {
+#[tokio::test(flavor = "current_thread")]
+async fn vector_store_uses_the_prepared_host_document_port() {
     let config = crate::memory::chunks::test_support::host_config("unused-vector-workspace");
-    let store = VectorStore::from_config(&config, Arc::new(FakeEmbedding { dims: 2 })).unwrap();
+    let store = VectorStore::from_config_async(&config, Arc::new(FakeEmbedding { dims: 2}))
+        .await
+        .unwrap();
 
     store
-        .insert_with_vector(
+        .insert_with_vector_async(
             "host-backed",
             "notes",
             "text",
             &[1.0, 0.0],
             json!({"source": "test"}),
         )
+        .await
         .unwrap();
 
-    let results = store.search_by_vector("notes", &[1.0, 0.0], 1).unwrap();
+    let results = store
+        .search_by_vector_async("notes", &[1.0, 0.0], 1)
+        .await
+        .unwrap();
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].id, "host-backed");
     assert_eq!(results[0].metadata["source"], "test");
@@ -335,11 +355,7 @@ async fn insert_batch_empty() {
 
 #[tokio::test]
 async fn insert_batch_mismatch_error() {
-    let store = VectorStore::from_config(
-        &crate::memory::chunks::test_support::host_config("unused-vector-workspace"),
-        Arc::new(MismatchEmbedding),
-    )
-    .unwrap();
+    let store = fake_store_with_backend(Arc::new(MismatchEmbedding));
     let entries = vec![("a", "alpha", json!({})), ("b", "beta", json!({}))];
     let err = store.insert_batch("ns", &entries).await.unwrap_err();
     assert!(err.to_string().contains("mismatch"));

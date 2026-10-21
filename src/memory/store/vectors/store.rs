@@ -109,6 +109,29 @@ impl VectorStore {
         })
     }
 
+    /// Async constructor for hosts running on a current-thread Tokio runtime.
+    pub async fn from_config_async(
+        config: &MemoryConfig,
+        backend: Arc<dyn EmbeddingBackend>,
+    ) -> anyhow::Result<Self> {
+        let documents = Arc::clone(config.storage()?.documents());
+        let blocking = config.storage_blocking()?.clone();
+        check_or_store_metadata(
+            documents.as_ref(),
+            VectorMetadata {
+                backend_name: backend.name().to_owned(),
+                backend_signature: backend.signature(),
+                dimensions: backend.dimensions(),
+            },
+        )
+        .await?;
+        Ok(Self {
+            documents,
+            blocking,
+            backend,
+        })
+    }
+
     /// Returns a reference to the embedding backend.
     pub fn backend(&self) -> &dyn EmbeddingBackend {
         self.backend.as_ref()
