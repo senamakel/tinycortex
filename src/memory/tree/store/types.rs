@@ -14,6 +14,7 @@
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::fmt;
 
 pub use crate::memory::config::{INPUT_TOKEN_BUDGET, OUTPUT_TOKEN_BUDGET, SUMMARY_FANOUT};
 
@@ -40,6 +41,23 @@ pub enum TreeKind {
     /// slug (e.g. `"tweet-style"`). See `docs/spec/flavoured-trees.md`.
     Flavoured,
 }
+
+/// A tree insert lost its owner-state compare-and-swap because the ID or
+/// `(kind, scope)` key was already present. Callers may re-read the scope to
+/// return a concurrently created tree.
+#[derive(Debug)]
+pub(crate) struct TreeInsertConflict {
+    pub(crate) kind: TreeKind,
+    pub(crate) scope: String,
+}
+
+impl fmt::Display for TreeInsertConflict {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "tree insert conflict for kind={} scope={}", self.kind.as_str(), self.scope)
+    }
+}
+
+impl std::error::Error for TreeInsertConflict {}
 
 impl TreeKind {
     /// Stable lowercase form used in SQL discriminator columns and ids.

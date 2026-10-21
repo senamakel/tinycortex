@@ -316,28 +316,64 @@ fn purge_failure_keeps_the_captured_owner_state_visible() {
     );
 }
 
-#[test]
-fn purge_all_leaves_the_write_audit_trail_alone() {
+#[tokio::test]
+async fn purge_all_leaves_host_audit_collection_alone() {
+    use tinystoragedrivers_api::DocumentStore;
+    use tinystoragedrivers_types::{CollectionSpec, Precondition};
+
     let (_tmp, cfg) = test_config();
     let chunk = chunk_with("slack:#eng", 0, 1_000, "body");
     upsert_chunks(&cfg, std::slice::from_ref(&chunk)).unwrap();
-    with_connection(&cfg, |conn| {
-        conn.execute(
-            "INSERT INTO mcp_writes (timestamp_ms, client_info, tool_name, success)
-             VALUES (1700000000000, 'test-client', 'remember', 1)",
-            [],
-        )?;
-        Ok(())
-    })
+    let docs = cfg.storage().unwrap().documents();
+    docs.ensure_collection(&CollectionSpec::new("host_audit"))
+        .await
+        .unwrap();
+    docs.put(
+        "host_audit",
+        "write:1",
+        serde_json::json!({"tool":"remember"}),
+        Precondition::None,
+    )
+    .await
     .unwrap();
 
-    // The fixture's chunk lives in the host document store, not the legacy
-    // SQLite tables counted by PURGED_TABLES. Purge reports logical owner
-    // rows removed, while the audit record remains outside that domain.
-    assert_eq!(purge_all(&cfg).unwrap(), 1);
+    assert_eq!(purge_all_async(&cfg).await.unwrap(), 1);
     assert_eq!(
-        count_rows(&cfg, "mcp_writes"),
-        1,
+        docs.get("host_audit", "write:1")
+            .await
+            .unwrap()
+            .unwrap()
+            .doc,
+        serde_json::json!({"tool":"remember"}),
         "an audit record of a write is not the memory it wrote"
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn delete_chunks_by_source_removes_symlink_entry_not_target_file() {
+    let (_tmp, cfg) = test_config();
+    let chunk = chunk_with("slack:c-1", 0, 1_700_000_000_000, "body");
+    upsert_staged_chunks(
+        &cfg,
+        &[super::types::StagedChunk {
+            chunk: chunk.clone(),
+            content_path: "chunks/link.md".into(),
+            content_sha256: "link-hash".into(),
+        }],
+    )
+    .unwrap();
+    let root = content_root(&cfg);
+    let target_path = root.join("chunks/target.md");
+    let link_path = root.join("chunks/link.md");
+    std::fs::create_dir_all(target_path.parent().unwrap()).unwrap();
+    std::fs::write(&target_path, "target").unwrap();
+    std::os::unix::fs::symlink("target.md", &link_path).unwrap();
+
+    assert_eq!(
+        delete_chunks_by_source(&cfg, SourceKind::Chat, "slack:c-1").unwrap(),
+        1
+    );
+    assert!(target_path.exists());
+    assert!(!link_path.exists());
 }

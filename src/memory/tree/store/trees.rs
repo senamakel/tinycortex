@@ -4,10 +4,7 @@ use std::collections::HashMap;
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
-use rusqlite::{params, Connection, OptionalExtension, Transaction};
-
-use super::common::ms_to_utc;
-use super::types::{Tree, TreeKind, TreeStatus};
+use super::types::{Tree, TreeInsertConflict, TreeKind, TreeStatus};
 use crate::memory::config::MemoryConfig;
 
 /// Insert a new tree row. Fails if `(kind, scope)` already exists; callers that
@@ -43,7 +40,11 @@ pub fn insert_tree(config: &MemoryConfig, tree: &Tree) -> Result<()> {
     {
         Ok(())
     } else {
-        anyhow::bail!("UNIQUE constraint failed: trees(kind, scope)")
+        Err(TreeInsertConflict {
+            kind: tree.kind,
+            scope: tree.scope.clone(),
+        }
+        .into())
     }
 }
 
@@ -85,7 +86,11 @@ pub async fn insert_tree_async(config: &MemoryConfig, tree: &Tree) -> Result<()>
     {
         Ok(())
     } else {
-        anyhow::bail!("UNIQUE constraint failed: trees(kind, scope)")
+        Err(TreeInsertConflict {
+            kind: tree.kind,
+            scope: tree.scope.clone(),
+        }
+        .into())
     }
 }
 
