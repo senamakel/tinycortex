@@ -37,6 +37,34 @@ fn delete_chunks_by_source_removes_safe_content_files_but_rejects_escape_paths()
 }
 
 #[test]
+fn deleting_one_chunk_keeps_content_file_referenced_by_another_chunk() {
+    let (_tmp, cfg) = test_config();
+    let first = sample_chunk("notion:shared-content", 0, 1_700_000_000_000);
+    let second = sample_chunk("notion:shared-content", 1, 1_700_000_001_000);
+    let shared_path = "chunks/notion/shared.md";
+    let staged = [first.clone(), second.clone()]
+        .into_iter()
+        .map(|chunk| StagedChunk {
+            chunk,
+            content_path: shared_path.to_owned(),
+            content_sha256: "shared-hash".to_owned(),
+        })
+        .collect::<Vec<_>>();
+    upsert_staged_chunks(&cfg, &staged).unwrap();
+
+    let absolute = content_root(&cfg).join(shared_path);
+    std::fs::create_dir_all(absolute.parent().unwrap()).unwrap();
+    std::fs::write(&absolute, "shared body").unwrap();
+
+    assert_eq!(delete_chunk_by_id(&cfg, &first.id).unwrap(), 1);
+    assert!(absolute.exists(), "the surviving chunk still owns this file");
+    assert_eq!(
+        get_chunk_content_path(&cfg, &second.id).unwrap().as_deref(),
+        Some(shared_path)
+    );
+}
+
+#[test]
 fn delete_chunks_by_source_removes_only_unreferenced_raw_files_and_gates() {
     let (_tmp, cfg) = test_config();
     let first = sample_chunk("gmail:thread-1", 0, 1_700_000_000_000);

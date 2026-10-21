@@ -292,7 +292,7 @@ async fn delete_filtered_async(config: &MemoryConfig, filter: DeleteFilter<'_>) 
         )
         .await?
         {
-            remove_chunk_content_files(config, &content_paths);
+            remove_unreferenced_content_files_async(config, &content_paths).await?;
             return Ok(selected.len());
         }
     }
@@ -659,7 +659,7 @@ pub async fn purge_all_async(config: &MemoryConfig) -> Result<usize> {
         )
         .await?
         {
-            remove_chunk_content_files(config, &content_paths);
+            remove_unreferenced_content_files_async(config, &content_paths).await?;
             return Ok(logical_rows);
         }
     }
