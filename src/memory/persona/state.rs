@@ -18,10 +18,10 @@
 
 use std::path::Path;
 
+use crate::memory::store::kv::KvStore;
 use anyhow::Result;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use crate::memory::store::kv::KvStore;
 
 /// Persona-scoped state namespace.
 pub const NAMESPACE: &str = "persona-sync-state";

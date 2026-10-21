@@ -80,13 +80,18 @@ pub async fn read_audit_log_async(config: &MemoryConfig) -> anyhow::Result<Vec<S
     read_entries(&**config.storage()?.streams()).await
 }
 
-async fn read_entries(streams: &dyn tinystoragedrivers_api::StreamStore) -> anyhow::Result<Vec<SyncAuditEntry>> {
+async fn read_entries(
+    streams: &dyn tinystoragedrivers_api::StreamStore,
+) -> anyhow::Result<Vec<SyncAuditEntry>> {
     let len = streams.len(AUDIT_STREAM).await?;
     let mut offset = 0_u64;
     let mut entries = Vec::new();
     while offset < len {
         let page = streams.read_window(AUDIT_STREAM, offset, 512).await?;
-        anyhow::ensure!(!page.is_empty(), "audit stream ended before its reported length");
+        anyhow::ensure!(
+            !page.is_empty(),
+            "audit stream ended before its reported length"
+        );
         for record in page {
             offset = record.offset.saturating_add(1);
             match serde_json::from_value::<SyncAuditEntry>(record.value) {

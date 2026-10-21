@@ -31,7 +31,10 @@ async fn audit_round_trip_is_newest_first_and_skips_malformed_lines() {
         .storage()
         .unwrap()
         .streams()
-        .append("tinycortex:sync-audit:v1", serde_json::json!({"broken": true}))
+        .append(
+            "tinycortex:sync-audit:v1",
+            serde_json::json!({"broken": true}),
+        )
         .await
         .unwrap();
     append_audit_entry_async(&config, &second).await.unwrap();
