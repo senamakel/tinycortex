@@ -210,7 +210,10 @@ fn matching_chunks(
             }
         }
         if query.exclude_dropped
-            && lifecycle.get(&chunk.id).and_then(|value| value.as_str())
+            && lifecycle
+                .get(&chunk.id)
+                .and_then(|value| value.get("status"))
+                .and_then(serde_json::Value::as_str)
                 == Some(CHUNK_STATUS_DROPPED)
         {
             return false;
@@ -327,6 +330,7 @@ pub fn list_chunk_details(
         .map(|chunk| ChunkDetailRow {
             lifecycle_status: lifecycle
                 .get(&chunk.id)
+                .and_then(|value| value.get("status"))
                 .and_then(serde_json::Value::as_str)
                 .map(str::to_owned),
             has_embedding: embedded_ids.contains(&chunk.id),
