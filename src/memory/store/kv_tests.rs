@@ -65,26 +65,65 @@ async fn namespace_sanitization_and_scope_merge_preserve_precedence() {
 async fn records_for_scope_keeps_namespace_records_ahead_of_global_ties() {
     let config = config().await;
     let kv = KvStore::from_config(&config).unwrap();
-    kv.set_namespace_async("scope", "z-local", &json!(1))
+    let namespace = KvStore::sanitize_namespace("scope");
+    let key = "shared";
+    kv.port
+        .put(
+            &KvStore::storage_key(EntryKind::Namespace, Some(&namespace), key),
+            serde_json::to_value(Entry {
+                kind: EntryKind::Namespace,
+                namespace: Some(namespace),
+                key: key.into(),
+                value: json!("local"),
+                updated_at: 42.0,
+            })
+            .unwrap(),
+        )
         .await
         .unwrap();
-    kv.set_global_async("a-global", &json!(2)).await.unwrap();
-    let mut scoped = kv.records_for_scope_async("scope").await.unwrap();
-    // Both writes happen within one clock tick in the deterministic memory
-    // driver test. If clock resolution differs, the API still sorts by time.
-    scoped.sort_by(|left, right| left.updated_at.total_cmp(&right.updated_at));
-    let local = scoped
-        .iter()
-        .position(|record| record.namespace.is_some())
+    kv.port
+        .put(
+            &KvStore::storage_key(EntryKind::Global, None, key),
+            serde_json::to_value(Entry {
+                kind: EntryKind::Global,
+                namespace: None,
+                key: key.into(),
+                value: json!("global"),
+                updated_at: 42.0,
+            })
+            .unwrap(),
+        )
+        .await
         .unwrap();
-    let global = scoped
-        .iter()
-        .position(|record| record.namespace.is_none())
+    let merged = kv.records_for_scope_async("scope").await.unwrap();
+    assert_eq!(merged.len(), 2, "namespace values shadow reads, not storage");
+    assert_eq!(merged[0].namespace.as_deref(), Some("scope"));
+    assert_eq!(merged[0].value, json!("local"));
+    assert_eq!(merged[1].namespace, None);
+    assert_eq!(merged[1].value, json!("global"));
+}
+
+#[tokio::test]
+async fn a_hashed_storage_key_with_wrong_body_identity_fails_closed() {
+    let config = config().await;
+    let kv = KvStore::from_config(&config).unwrap();
+    let key = "logical-key";
+    kv.port
+        .put(
+            &KvStore::storage_key(EntryKind::Global, None, key),
+            serde_json::to_value(Entry {
+                kind: EntryKind::Global,
+                namespace: None,
+                key: "different-key".into(),
+                value: json!("wrong record"),
+                updated_at: 1.0,
+            })
+            .unwrap(),
+        )
+        .await
         .unwrap();
-    if scoped[local].updated_at == scoped[global].updated_at {
-        let merged = kv.records_for_scope_async("scope").await.unwrap();
-        assert!(merged[0].namespace.is_some());
-    }
+    let error = kv.get_global_async(key).await.unwrap_err();
+    assert!(error.contains("identity mismatch"));
 }
 
 #[tokio::test]
