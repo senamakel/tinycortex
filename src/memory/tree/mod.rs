@@ -67,7 +67,7 @@ pub use io::{
 pub use read::read_tree;
 pub use registry::{
     get_or_create_tree, get_or_create_tree_async, get_or_create_tree_with_ask,
-    get_or_create_tree_with_ask_async, is_unique_violation, new_summary_id, new_tree_id,
+    get_or_create_tree_with_ask_async, is_tree_insert_conflict, new_summary_id, new_tree_id,
 };
 pub use store::{
     Buffer, SummaryNode, Tree, TreeKind, TreeStatus, INPUT_TOKEN_BUDGET, OUTPUT_TOKEN_BUDGET,

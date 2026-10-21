@@ -85,8 +85,5 @@ fn get_or_create_recovers_from_unique_race() {
         ..pre_existing.clone()
     };
     let err = store::insert_tree(&cfg, &dup).unwrap_err();
-    assert!(
-        is_unique_violation(&err),
-        "expected UNIQUE violation: {err:#}"
-    );
+    assert!(is_tree_insert_conflict(&err), "expected typed conflict: {err:#}");
 }

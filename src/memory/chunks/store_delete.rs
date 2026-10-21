@@ -676,16 +676,10 @@ fn purge_row_counts_toward_legacy_total(collection: &str, key: &str) -> bool {
     }
 }
 
-/// Remove staged content files only when no committed chunk or summary points
-/// at them. Corrupt pointer state fails closed and keeps every candidate.
-pub(crate) fn remove_unreferenced_content_files(
-    config: &MemoryConfig,
-    candidates: &[String],
-) -> Result<()> {
-    run_delete_sync(remove_unreferenced_content_files_async(config, candidates))
-}
-
-/// Async counterpart for ingest pipelines running on Tokio.
+/// Best-effort cleanup after an owner commit. Corrupt pointer state or a
+/// reference at the checked commit head keeps every candidate. The head check
+/// narrows the race with a concurrent reattachment but cannot prevent a later
+/// writer from reusing a path after the check.
 pub(crate) async fn remove_unreferenced_content_files_async(
     config: &MemoryConfig,
     candidates: &[String],

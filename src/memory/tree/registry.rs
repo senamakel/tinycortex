@@ -8,7 +8,7 @@ use chrono::Utc;
 use uuid::Uuid;
 
 use crate::memory::config::MemoryConfig;
-use crate::memory::tree::store::{self, Tree, TreeKind, TreeStatus};
+use crate::memory::tree::store::{self, Tree, TreeInsertConflict, TreeKind, TreeStatus};
 
 /// Generic get-or-create. Returns the existing tree for `(kind, scope)` or
 /// inserts a fresh one, recovering from a `UNIQUE` race by re-querying.
@@ -54,7 +54,7 @@ pub fn get_or_create_tree_with_ask(
     };
     match store::insert_tree(config, &tree) {
         Ok(()) => Ok(tree),
-        Err(err) if is_unique_violation(&err) => {
+        Err(err) if is_tree_insert_conflict(&err) => {
             // Another caller created the same (kind, scope) between our lookup
             // and insert; re-query and return the winner.
             store::get_tree_by_scope(config, kind, scope)?.ok_or_else(|| {
@@ -92,24 +92,18 @@ pub async fn get_or_create_tree_with_ask_async(
     };
     match store::insert_tree_async(config, &tree).await {
         Ok(()) => Ok(tree),
-        Err(err) => {
-            if let Some(existing) = store::get_tree_by_scope_async(config, kind, scope).await? {
-                Ok(existing)
-            } else {
-                Err(err)
-            }
+        Err(err) if is_tree_insert_conflict(&err) => {
+            store::get_tree_by_scope_async(config, kind, scope)
+                .await?
+                .ok_or(err)
         }
+        Err(err) => Err(err),
     }
 }
 
-/// Return true if `err` represents a SQLite UNIQUE constraint violation.
-pub fn is_unique_violation(err: &anyhow::Error) -> bool {
-    if let Some(rusqlite::Error::SqliteFailure(sqlite_err, _)) =
-        err.downcast_ref::<rusqlite::Error>()
-    {
-        return sqlite_err.code == rusqlite::ErrorCode::ConstraintViolation;
-    }
-    format!("{err:#}").contains("UNIQUE constraint failed")
+/// Return true if `err` represents an owner-state tree insert conflict.
+pub fn is_tree_insert_conflict(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<TreeInsertConflict>().is_some()
 }
 
 /// Generate a stable id for a new tree row, prefixed with the kind discriminator.

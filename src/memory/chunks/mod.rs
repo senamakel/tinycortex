@@ -137,9 +137,7 @@ pub use store_delete::{
     delete_chunks_by_source_prefix, delete_chunks_by_source_prefix_async,
     delete_orphaned_source_tree, delete_orphaned_source_tree_async, purge_all, purge_all_async,
 };
-pub(crate) use store_delete::{
-    remove_unreferenced_content_files, remove_unreferenced_content_files_async,
-};
+pub(crate) use store_delete::remove_unreferenced_content_files_async;
 pub use store_list::{
     count_chunks_matching, list_chunk_details, list_chunks, source_totals, ChunkDetailRow,
     ListChunksQuery, SourceTotal,
