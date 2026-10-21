@@ -7,7 +7,6 @@ use tinycortex::memory::{
     config::MemoryConfig,
     store::vectors::{InertEmbedding, LegacyVectorMetadata, LegacyVectorRecord, VectorStore},
 };
-use tinystoragedrivers_api::DocumentStore;
 use tinystoragedrivers_types::{Filter, Query, Scope};
 
 const FIXTURE: &str = "tests/fixtures/legacy-v0.1.3-vector-public-writer/vectors.db";

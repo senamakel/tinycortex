@@ -193,6 +193,58 @@ fn reopening_prepared_store_with_different_backend_name_and_same_dims_succeeds()
         .expect("the historical store only guards embedding dimensions");
 }
 
+#[tokio::test]
+async fn legacy_import_conflict_does_not_publish_other_batch_rows() {
+    let store = fake_store(2);
+    store
+        .insert_with_vector_async(
+            "existing",
+            "notes",
+            "current value",
+            &[1.0, 0.0],
+            json!({"current": true}),
+        )
+        .await
+        .unwrap();
+    let source = super::LegacyVectorMetadata {
+        provider_name: "legacy-provider".into(),
+        dimensions: 2,
+    };
+    let record = |id: &str, text: &str| super::LegacyVectorRecord {
+        namespace: "notes".into(),
+        id: id.into(),
+        text: text.into(),
+        dimensions: 2,
+        embedding_le: super::vec_to_bytes(&[0.0, 1.0]),
+        metadata_json: "{}".into(),
+        created_at: 1.0,
+        updated_at: 2.0,
+    };
+
+    let error = store
+        .import_legacy_records(
+            &source,
+            &[record("new", "new value"), record("existing", "old value")],
+        )
+        .await
+        .unwrap_err();
+
+    assert!(error.to_string().contains("conflicts with existing ID"));
+    assert_eq!(store.count_async(None).await.unwrap(), 1);
+    assert_eq!(
+        store
+            .documents
+            .count(
+                super::VECTOR_METADATA,
+                &tinystoragedrivers_types::Filter::All
+            )
+            .await
+            .unwrap(),
+        1,
+        "failed import must not publish source provenance"
+    );
+}
+
 #[test]
 fn equal_scores_use_a_deterministic_logical_id_tiebreaker() {
     let store = fake_store(2);
