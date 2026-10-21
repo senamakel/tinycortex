@@ -252,18 +252,23 @@ impl VectorStore {
             .map_err(anyhow::Error::from)?
     }
 
+    /// Async deletion for callers on current-thread runtimes.
+    pub async fn delete_async(&self, namespace: &str, id: &str) -> anyhow::Result<bool> {
+        delete_record(self.documents.as_ref(), namespace, id).await
+    }
+
     /// Deletes all vectors in a namespace and returns the number removed.
     pub fn clear_namespace(&self, namespace: &str) -> anyhow::Result<usize> {
         let documents = Arc::clone(&self.documents);
         let namespace = namespace.to_owned();
         self.blocking
-            .run(async move {
-                let removed = documents
-                    .delete_where(VECTOR_RECORDS, &Filter::eq("namespace", namespace))
-                    .await?;
-                usize::try_from(removed).context("vector count did not fit in usize")
-            })
+            .run(async move { clear_namespace_documents(documents.as_ref(), &namespace).await })
             .map_err(anyhow::Error::from)?
+    }
+
+    /// Async namespace clearing for callers on current-thread runtimes.
+    pub async fn clear_namespace_async(&self, namespace: &str) -> anyhow::Result<usize> {
+        clear_namespace_documents(self.documents.as_ref(), namespace).await
     }
 
     /// Returns the number of vectors in one namespace (or all namespaces).
@@ -273,28 +278,60 @@ impl VectorStore {
             Filter::eq("namespace", namespace.to_owned())
         });
         self.blocking
-            .run(async move {
-                let count = documents.count(VECTOR_RECORDS, &filter).await?;
-                usize::try_from(count).context("vector count did not fit in usize")
-            })
+            .run(async move { count_documents(documents.as_ref(), &filter).await })
             .map_err(anyhow::Error::from)?
+    }
+
+    /// Async count for callers on current-thread runtimes.
+    pub async fn count_async(&self, namespace: Option<&str>) -> anyhow::Result<usize> {
+        let filter = namespace.map_or(Filter::All, |namespace| {
+            Filter::eq("namespace", namespace.to_owned())
+        });
+        count_documents(self.documents.as_ref(), &filter).await
     }
 
     /// Lists namespaces in lexical order.
     pub fn list_namespaces(&self) -> anyhow::Result<Vec<String>> {
         let documents = Arc::clone(&self.documents);
         self.blocking
-            .run(async move {
-                let rows = query_all(documents.as_ref(), Filter::All).await?;
-                let mut namespaces = BTreeSet::new();
-                for row in rows {
-                    let record = decode_record(row)?;
-                    namespaces.insert(record.namespace);
-                }
-                Ok(namespaces.into_iter().collect())
-            })
+            .run(async move { list_namespaces_documents(documents.as_ref()).await })
             .map_err(anyhow::Error::from)?
     }
+
+    /// Async namespace listing for callers on current-thread runtimes.
+    pub async fn list_namespaces_async(&self) -> anyhow::Result<Vec<String>> {
+        list_namespaces_documents(self.documents.as_ref()).await
+    }
+}
+
+async fn clear_namespace_documents(
+    documents: &dyn DocumentStore,
+    namespace: &str,
+) -> anyhow::Result<usize> {
+    let removed = documents
+        .delete_where(VECTOR_RECORDS, &Filter::eq("namespace", namespace.to_owned()))
+        .await?;
+    usize::try_from(removed).context("vector count did not fit in usize")
+}
+
+async fn count_documents(
+    documents: &dyn DocumentStore,
+    filter: &Filter,
+) -> anyhow::Result<usize> {
+    let count = documents.count(VECTOR_RECORDS, filter).await?;
+    usize::try_from(count).context("vector count did not fit in usize")
+}
+
+async fn list_namespaces_documents(
+    documents: &dyn DocumentStore,
+) -> anyhow::Result<Vec<String>> {
+    let rows = query_all(documents, Filter::All).await?;
+    let mut namespaces = BTreeSet::new();
+    for row in rows {
+        let record = decode_record(row)?;
+        namespaces.insert(record.namespace);
+    }
+    Ok(namespaces.into_iter().collect())
 }
 
 async fn check_or_store_metadata(

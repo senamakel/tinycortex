@@ -148,7 +148,6 @@ fn prepared_host_store_starts_empty() {
 }
 
 #[test]
-#[test]
 fn reopening_prepared_store_with_same_backend_succeeds() {
     let config = crate::memory::chunks::test_support::host_config("unused-vector-workspace");
     VectorStore::from_config(&config, Arc::new(FakeEmbedding { dims: 4 })).unwrap();
@@ -279,9 +278,9 @@ async fn insert_and_count() {
     store.insert("a", "ns1", "hello", json!({})).await.unwrap();
     store.insert("b", "ns1", "world", json!({})).await.unwrap();
     store.insert("c", "ns2", "other", json!({})).await.unwrap();
-    assert_eq!(store.count(Some("ns1")).unwrap(), 2);
-    assert_eq!(store.count(Some("ns2")).unwrap(), 1);
-    assert_eq!(store.count(None).unwrap(), 3);
+    assert_eq!(store.count_async(Some("ns1")).await.unwrap(), 2);
+    assert_eq!(store.count_async(Some("ns2")).await.unwrap(), 1);
+    assert_eq!(store.count_async(None).await.unwrap(), 3);
 }
 
 #[tokio::test]
@@ -295,9 +294,10 @@ async fn insert_upsert_replaces() {
         .insert("a", "ns", "updated", json!({"v": 2}))
         .await
         .unwrap();
-    assert_eq!(store.count(Some("ns")).unwrap(), 1);
+    assert_eq!(store.count_async(Some("ns")).await.unwrap(), 1);
     let results = store
-        .search_by_vector("ns", &text_to_vec("updated", 4), 10)
+        .search_by_vector_async("ns", &text_to_vec("updated", 4), 10)
+        .await
         .unwrap();
     assert_eq!(results[0].text, "updated");
     assert_eq!(results[0].metadata["v"], 2);
@@ -323,14 +323,14 @@ async fn insert_batch_multiple() {
         ("c", "gamma", json!({})),
     ];
     store.insert_batch("ns", &entries).await.unwrap();
-    assert_eq!(store.count(Some("ns")).unwrap(), 3);
+    assert_eq!(store.count_async(Some("ns")).await.unwrap(), 3);
 }
 
 #[tokio::test]
 async fn insert_batch_empty() {
     let store = fake_store(4);
     store.insert_batch("ns", &[]).await.unwrap();
-    assert_eq!(store.count(None).unwrap(), 0);
+    assert_eq!(store.count_async(None).await.unwrap(), 0);
 }
 
 #[tokio::test]
