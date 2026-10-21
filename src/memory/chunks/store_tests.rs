@@ -304,8 +304,8 @@ fn delete_chunks_by_source_removes_chunks_side_rows_and_ingest_gate() {
     let other = sample_chunk("slack:c-2", 0, 1_700_000_002_000);
     upsert_chunks(&cfg, &[target_a.clone(), target_b.clone(), other.clone()]).unwrap();
 
-    let entity_index = crate::memory::store::entity_index::EntityIndex::for_memory_config(&cfg)
-        .unwrap();
+    let entity_index =
+        crate::memory::store::entity_index::EntityIndex::for_memory_config(&cfg).unwrap();
     for chunk in [&target_a, &target_b, &other] {
         crate::memory::score::store::upsert_score(
             &cfg,
@@ -333,15 +333,22 @@ fn delete_chunks_by_source_removes_chunks_side_rows_and_ingest_gate() {
             .unwrap();
         super::set_chunk_embedding_for_signature(&cfg, &chunk.id, "test/model@3", &[1.0, 2.0, 3.0])
             .unwrap();
-        super::mark_chunk_reembed_skipped(&cfg, &chunk.id, "test/model@3", "terminal")
-            .unwrap();
+        super::mark_chunk_reembed_skipped(&cfg, &chunk.id, "test/model@3", "terminal").unwrap();
     }
     assert!(crate::memory::chunks::store_sources::claim_source_ingest(
-        &cfg, SourceKind::Chat, "slack:c-1", 1_700_000_000_000,
-    ).unwrap());
+        &cfg,
+        SourceKind::Chat,
+        "slack:c-1",
+        1_700_000_000_000,
+    )
+    .unwrap());
     assert!(crate::memory::chunks::store_sources::claim_source_ingest(
-        &cfg, SourceKind::Chat, "slack:c-2", 1_700_000_000_000,
-    ).unwrap());
+        &cfg,
+        SourceKind::Chat,
+        "slack:c-2",
+        1_700_000_000_000,
+    )
+    .unwrap());
 
     let deleted = delete_chunks_by_source(&cfg, SourceKind::Chat, "slack:c-1").unwrap();
 
@@ -353,10 +360,26 @@ fn delete_chunks_by_source_removes_chunks_side_rows_and_ingest_gate() {
     assert!(!is_source_ingested(&cfg, SourceKind::Chat, "slack:c-1").unwrap());
     assert!(is_source_ingested(&cfg, SourceKind::Chat, "slack:c-2").unwrap());
 
-    assert_eq!(crate::memory::score::store_query::count_scores(&cfg).unwrap(), 1);
-    assert_eq!(crate::memory::score::store_query::count_entity_index(&cfg).unwrap(), 1);
-    assert_eq!(crate::memory::chunks::get_chunk_embedding_for_signature(&cfg, &other.id, "test/model@3").unwrap(), Some(vec![1.0, 2.0, 3.0]));
-    assert!(crate::memory::chunks::get_chunk_embedding_for_signature(&cfg, &target_a.id, "test/model@3").unwrap().is_none());
+    assert_eq!(
+        crate::memory::score::store_query::count_scores(&cfg).unwrap(),
+        1
+    );
+    assert_eq!(
+        crate::memory::score::store_query::count_entity_index(&cfg).unwrap(),
+        1
+    );
+    assert_eq!(
+        crate::memory::chunks::get_chunk_embedding_for_signature(&cfg, &other.id, "test/model@3")
+            .unwrap(),
+        Some(vec![1.0, 2.0, 3.0])
+    );
+    assert!(crate::memory::chunks::get_chunk_embedding_for_signature(
+        &cfg,
+        &target_a.id,
+        "test/model@3"
+    )
+    .unwrap()
+    .is_none());
     let skips = crate::memory::chunks::versioned::list_state(
         &cfg,
         crate::memory::chunks::collections::CHUNK_REEMBED_SKIPS,
@@ -411,24 +434,20 @@ fn delete_chunks_by_owner_preserves_other_owners_for_same_source() {
         ],
     )
     .unwrap();
-    with_connection(&cfg, |conn| {
-        let tx = conn.unchecked_transaction()?;
-        assert!(claim_source_ingest_tx(
-            &tx,
-            SourceKind::Chat,
-            "slack:shared",
-            1_700_000_000_000
-        )?);
-        assert!(claim_source_ingest_tx(
-            &tx,
-            SourceKind::Chat,
-            "slack:c-1-only",
-            1_700_000_000_000
-        )?);
-        tx.commit()?;
-        Ok(())
-    })
-    .unwrap();
+    assert!(crate::memory::chunks::store_sources::claim_source_ingest(
+        &cfg,
+        SourceKind::Chat,
+        "slack:shared",
+        1_700_000_000_000,
+    )
+    .unwrap());
+    assert!(crate::memory::chunks::store_sources::claim_source_ingest(
+        &cfg,
+        SourceKind::Chat,
+        "slack:c-1-only",
+        1_700_000_000_000,
+    )
+    .unwrap());
 
     let deleted = delete_chunks_by_owner(&cfg, SourceKind::Chat, "slack-sync:c-1").unwrap();
 

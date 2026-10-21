@@ -97,7 +97,9 @@ fn test_config() -> (TempDir, MemoryConfig) {
 }
 
 fn on_plain_thread<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -> T {
-    std::thread::spawn(work).join().expect("sync storage assertion thread")
+    std::thread::spawn(work)
+        .join()
+        .expect("sync storage assertion thread")
 }
 
 fn substantive_batch() -> ChatBatch {
@@ -144,7 +146,10 @@ async fn ingest_chat_writes_chunks_and_enqueues_extract_jobs() {
     assert!(!out.already_ingested);
     assert!(out.chunks_written >= 1);
     let read_cfg = cfg.clone();
-    assert_eq!(on_plain_thread(move || count_chunks(&read_cfg)).unwrap(), out.chunks_written as u64);
+    assert_eq!(
+        on_plain_thread(move || count_chunks(&read_cfg)).unwrap(),
+        out.chunks_written as u64
+    );
     assert_eq!(out.chunk_ids.len(), out.chunks_written);
     let read_cfg = cfg.clone();
     let chunk_id = out.chunk_ids[0].clone();
@@ -270,7 +275,10 @@ async fn second_document_ingest_with_same_source_id_is_short_circuited() {
     assert!(second.chunk_ids.is_empty());
 
     let read_cfg = cfg.clone();
-    assert_eq!(on_plain_thread(move || count_chunks(&read_cfg)).unwrap(), first.chunks_written as u64);
+    assert_eq!(
+        on_plain_thread(move || count_chunks(&read_cfg)).unwrap(),
+        first.chunks_written as u64
+    );
     let staged_files_after = walkdir::WalkDir::new(crate::memory::chunks::content_root(&cfg))
         .into_iter()
         .filter_map(Result::ok)
@@ -312,11 +320,17 @@ async fn failed_queue_hint_publication_keeps_committed_intent_recoverable() {
     .await;
     assert!(err.is_err(), "forced enqueue failure should surface as Err");
     let read_cfg = cfg.clone();
-    assert!(on_plain_thread(move || is_source_ingested(&read_cfg, SourceKind::Document, "notion:abc"))
-        .unwrap()
-        .unwrap());
+    assert!(on_plain_thread(move || is_source_ingested(
+        &read_cfg,
+        SourceKind::Document,
+        "notion:abc"
+    ))
+    .unwrap()
+    .unwrap());
     let read_cfg = cfg.clone();
-    let persisted_chunks = on_plain_thread(move || count_chunks(&read_cfg)).unwrap().unwrap() as usize;
+    let persisted_chunks = on_plain_thread(move || count_chunks(&read_cfg))
+        .unwrap()
+        .unwrap() as usize;
     assert!(persisted_chunks > 0, "the committed source has chunks");
     assert_eq!(
         super::dispatch_pending_extract_jobs_async(&cfg, &NullJobSink)
@@ -367,9 +381,13 @@ async fn failed_queue_hint_publication_keeps_committed_intent_recoverable() {
     );
     assert_eq!(sink.ids.lock().unwrap().len(), persisted_chunks);
     let read_cfg = cfg.clone();
-    assert!(on_plain_thread(move || is_source_ingested(&read_cfg, SourceKind::Document, "notion:abc"))
-        .unwrap()
-        .unwrap());
+    assert!(on_plain_thread(move || is_source_ingested(
+        &read_cfg,
+        SourceKind::Document,
+        "notion:abc"
+    ))
+    .unwrap()
+    .unwrap());
 }
 
 #[tokio::test]

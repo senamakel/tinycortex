@@ -94,7 +94,9 @@ fn index_entity(cfg: &MemoryConfig, node_id: &str) {
         span_end: 4,
         score: 0.9,
     };
-    index.index_entity(&entity, node_id, "leaf", 1_700_000_000_000, None).unwrap();
+    index
+        .index_entity(&entity, node_id, "leaf", 1_700_000_000_000, None)
+        .unwrap();
 }
 
 #[test]
@@ -116,7 +118,10 @@ fn delete_chunk_by_id_takes_one_chunk_and_leaves_the_source() {
     assert_eq!(delete_chunk_by_id(&cfg, &target.id).unwrap(), 1);
     assert!(get_chunk(&cfg, &target.id).unwrap().is_none());
     assert!(get_chunk(&cfg, &sibling.id).unwrap().is_some());
-    assert_eq!(crate::memory::score::store_query::count_entity_index(&cfg).unwrap(), 1);
+    assert_eq!(
+        crate::memory::score::store_query::count_entity_index(&cfg).unwrap(),
+        1
+    );
     assert!(
         is_source_ingested(&cfg, SourceKind::Chat, "slack:#eng").unwrap(),
         "a source with surviving chunks keeps its ingest gate"
