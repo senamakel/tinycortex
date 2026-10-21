@@ -205,6 +205,16 @@ impl EntityStore {
             .await
     }
 
+    /// Import the old entity-map file without replacing values already used by
+    /// a running host. Exact retries are safe after an interrupted migration.
+    pub async fn import_legacy_entities(&self, entries: &[(String, String)]) -> Result<()> {
+        let values = entries
+            .iter()
+            .map(|(toolkit, entity_id)| (toolkit.clone(), Value::String(entity_id.clone())))
+            .collect::<Vec<_>>();
+        self.state.import_entries(ENTITY_STORE_OWNER, &values).await
+    }
+
     /// Resolve the entity id to use when connecting `toolkit`, persisting the
     /// choice so future runs are stable.
     ///

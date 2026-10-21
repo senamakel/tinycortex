@@ -146,6 +146,46 @@ impl SourceRegistry {
         .await
     }
 
+    /// Merge source entries decoded by a host's legacy-config reader.
+    /// Identical entries make retries no-ops; a reused id with different data
+    /// fails before the host configuration is changed.
+    pub async fn import_legacy_entries(
+        &self,
+        imported: &[MemorySourceEntry],
+    ) -> Result<usize> {
+        for entry in imported {
+            entry.validate().map_err(|error| anyhow!(error))?;
+        }
+        let mut ids = std::collections::HashMap::with_capacity(imported.len());
+        for entry in imported {
+            if let Some(previous) = ids.insert(&entry.id, entry) {
+                anyhow::ensure!(
+                    serde_json::to_value(previous)? == serde_json::to_value(entry)?,
+                    "conflicting legacy source entries reuse id {:?}",
+                    entry.id
+                );
+            }
+        }
+
+        self.mutate(|sources| {
+            let mut inserted = 0;
+            for entry in imported {
+                if let Some(existing) = sources.iter().find(|source| source.id == entry.id) {
+                    anyhow::ensure!(
+                        serde_json::to_value(existing)? == serde_json::to_value(entry)?,
+                        "legacy source conflicts with existing id {:?}",
+                        entry.id
+                    );
+                } else {
+                    sources.push(entry.clone());
+                    inserted += 1;
+                }
+            }
+            Ok(inserted)
+        })
+        .await
+    }
+
     /// Remove all Composio sources bound to a connection id.
     pub async fn remove_composio_source_by_connection_id(
         &self,
