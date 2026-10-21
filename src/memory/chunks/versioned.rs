@@ -35,6 +35,10 @@ pub(crate) struct HeadSnapshot {
     pub(crate) revision: u64,
 }
 
+pub(crate) type StateRows = HashMap<String, Vec<(String, Value)>>;
+pub(crate) type ChunkStateSnapshot = (Vec<Chunk>, StateRows);
+pub(crate) type ChunkStateSnapshotWithHead = (HeadSnapshot, Vec<Chunk>, StateRows);
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 struct CommitHead {
     op_id: String,
@@ -853,7 +857,7 @@ pub(crate) fn list_chunks(config: &MemoryConfig) -> Result<Vec<Chunk>> {
 pub(crate) fn list_chunk_snapshot(
     config: &MemoryConfig,
     state_collections: &[&str],
-) -> Result<(Vec<Chunk>, HashMap<String, Vec<(String, Value)>>)> {
+) -> Result<ChunkStateSnapshot> {
     let (_, chunks, states) = list_chunk_snapshot_with_head(config, state_collections)?;
     Ok((chunks, states))
 }
@@ -863,11 +867,7 @@ pub(crate) fn list_chunk_snapshot(
 pub(crate) fn list_chunk_snapshot_with_head(
     config: &MemoryConfig,
     state_collections: &[&str],
-) -> Result<(
-    HeadSnapshot,
-    Vec<Chunk>,
-    HashMap<String, Vec<(String, Value)>>,
-)> {
+) -> Result<ChunkStateSnapshotWithHead> {
     let snapshot = capture_head(config)?;
     let return_snapshot = snapshot.clone();
     let documents = config.storage()?.documents().clone();
@@ -977,10 +977,10 @@ pub(crate) fn list_chunk_snapshot_with_head(
                 .get(CHUNK_LIFECYCLE)
                 .into_iter()
                 .flatten()
-                .filter_map(|(key, value)| {
-                    (value.get("status").and_then(Value::as_str) == Some("deleted"))
-                        .then(|| key.clone())
+                .filter(|(_, value)| {
+                    value.get("status").and_then(Value::as_str) == Some("deleted")
                 })
+                .map(|(key, _)| key.clone())
                 .collect();
             chunks.retain(|chunk| !deleted_ids.contains(&chunk.id));
             Ok::<_, tinystoragedrivers_types::StorageError>((chunks, states))
@@ -998,9 +998,12 @@ fn add_implicit_lifecycle_states(
         .iter()
         .map(|(key, _)| key.clone())
         .collect::<HashSet<_>>();
-    lifecycle.extend(defaults.iter().filter_map(|(key, status)| {
-        (!explicit.contains(key)).then(|| (key.clone(), serde_json::json!({"status": status})))
-    }));
+    lifecycle.extend(
+        defaults
+            .iter()
+            .filter(|(key, _)| !explicit.contains(*key))
+            .map(|(key, status)| (key.clone(), serde_json::json!({"status": status}))),
+    );
 }
 
 /// Async materialization of a chunk and state snapshot for current-thread
@@ -1009,11 +1012,7 @@ fn add_implicit_lifecycle_states(
 pub(crate) async fn list_chunk_snapshot_with_head_async(
     config: &MemoryConfig,
     requested_state: &[&str],
-) -> Result<(
-    HeadSnapshot,
-    Vec<Chunk>,
-    HashMap<String, Vec<(String, Value)>>,
-)> {
+) -> Result<ChunkStateSnapshotWithHead> {
     let snapshot = capture_head_async(config).await?;
     let documents = config.storage()?.documents().clone();
     let mut state_collections = requested_state
@@ -1122,9 +1121,8 @@ pub(crate) async fn list_chunk_snapshot_with_head_async(
         .get(CHUNK_LIFECYCLE)
         .into_iter()
         .flatten()
-        .filter_map(|(key, value)| {
-            (value.get("status").and_then(Value::as_str) == Some("deleted")).then(|| key.clone())
-        })
+        .filter(|(_, value)| value.get("status").and_then(Value::as_str) == Some("deleted"))
+        .map(|(key, _)| key.clone())
         .collect();
     chunks.retain(|chunk| !deleted.contains(&chunk.id));
     Ok((snapshot, chunks, states))
@@ -1575,6 +1573,7 @@ pub(crate) async fn commit_if_state_matches_at_snapshot_async(
 
 /// Synchronous counterpart for deletion APIs that enumerate through a
 /// blocking host store and must reject phantom rows before committing.
+#[cfg(test)]
 pub(crate) fn commit_if_state_matches_at_snapshot(
     config: &MemoryConfig,
     snapshot: &HeadSnapshot,
