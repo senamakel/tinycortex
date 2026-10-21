@@ -381,3 +381,29 @@ fn cover_hydrates_legacy_previews_with_page_bounded_state_queries() {
         "state-version queries should scale with 4 pages, not 13 chunks; got {queries}"
     );
 }
+
+#[tokio::test]
+async fn async_cover_works_on_a_current_thread_runtime() {
+    let (_tmp, cfg, _) = test_config_with_state_query_counter();
+    let ts = Utc.timestamp_millis_opt(1_700_000_000_000).unwrap();
+    let chunks = vec![
+        sample_chunk_at("current-thread", 0, "body-a", ts),
+        sample_chunk_at("current-thread", 1, "body-b", ts),
+    ];
+    insert_chunks(&cfg, &chunks);
+
+    let response = cover_window_async(
+        &cfg,
+        ts.timestamp_millis() - 1,
+        ts.timestamp_millis() + 1,
+        None,
+        None,
+        chunks.len(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(response.hits.len(), 2);
+    assert!(response.hits.iter().any(|hit| hit.content == "body-a"));
+    assert!(response.hits.iter().any(|hit| hit.content == "body-b"));
+}

@@ -73,7 +73,7 @@ pub(crate) mod test_support;
 
 // ── Public re-exports ───────────────────────────────────────────────────────
 
-pub use cover::{cover_window, cover_window_scoped};
+pub use cover::{cover_window, cover_window_async, cover_window_scoped, cover_window_scoped_async};
 pub use drill_down::drill_down;
 pub use fast::{fast_retrieve, FastRetrieveOptions};
 pub use fetch::{fetch_leaves, MAX_BATCH};
