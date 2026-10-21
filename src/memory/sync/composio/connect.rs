@@ -31,12 +31,12 @@
 //! [`super::client::ComposioClient`]. No secret is ever logged and error paths
 //! discard raw response bodies (they can echo the key back verbatim).
 
-use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
-
-use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
+
+use anyhow::{Context, Result};
+use crate::memory::config::MemoryConfig;
+use crate::memory::store::state_kv::StateKvStore;
 
 /// Connection statuses that will never recover on their own — polling should
 /// stop and fail. Mirrors the Composio SDK's `terminalErrorStates`
@@ -166,52 +166,47 @@ pub struct ConnectionLink {
     pub redirect_url: Option<String>,
 }
 
-/// Persistent, per-toolkit map of the entity id (`user_id`) chosen for each
-/// integration.
-///
-/// Stored as a small JSON object on disk (e.g. `.composio-harness.json`) so a
-/// re-run reuses the same Composio entity instead of creating a fresh — and
-/// therefore orphaned — connection every time. Load is best-effort: a missing
-/// or corrupt file yields an empty store rather than an error.
-#[derive(Debug, Clone)]
+/// Host-KV-backed per-toolkit map of the entity id (`user_id`) chosen for each
+/// integration. Values are opaque system state and are stored without the
+/// user-memory KV scrubber.
+#[derive(Clone)]
 pub struct EntityStore {
-    path: PathBuf,
-    entries: BTreeMap<String, String>,
+    state: StateKvStore,
 }
 
-#[derive(Default, Serialize, Deserialize)]
-struct EntityStoreFile {
-    /// toolkit slug -> entity id (`user_id`).
-    #[serde(default)]
-    entities: BTreeMap<String, String>,
-}
+const ENTITY_STORE_OWNER: &str = "composio-entity-ids:v1";
 
 impl EntityStore {
-    /// Load the store from `path`, tolerating a missing or unreadable file.
-    pub fn load(path: impl Into<PathBuf>) -> Self {
-        let path = path.into();
-        let entries = std::fs::read_to_string(&path)
-            .ok()
-            .and_then(|raw| serde_json::from_str::<EntityStoreFile>(&raw).ok())
-            .map(|file| file.entities)
-            .unwrap_or_default();
-        Self { path, entries }
-    }
-
-    /// The backing file path.
-    pub fn path(&self) -> &Path {
-        &self.path
+    /// Attach to the prepared host KV port.
+    pub fn from_config(config: &MemoryConfig) -> Result<Self> {
+        Ok(Self {
+            state: StateKvStore::from_config(config)?,
+        })
     }
 
     /// The entity id recorded for `toolkit`, if any.
-    pub fn get(&self, toolkit: &str) -> Option<&str> {
-        self.entries.get(toolkit).map(String::as_str)
+    pub async fn get(&self, toolkit: &str) -> Result<Option<String>> {
+        self.state
+            .get(ENTITY_STORE_OWNER, toolkit)
+            .await?
+            .map(|value| {
+                value
+                    .as_str()
+                    .map(str::to_owned)
+                    .context("stored Composio entity id is not a string")
+            })
+            .transpose()
     }
 
-    /// Record `entity_id` for `toolkit` in memory (call [`Self::save`] to
-    /// persist).
-    pub fn set(&mut self, toolkit: &str, entity_id: impl Into<String>) {
-        self.entries.insert(toolkit.to_owned(), entity_id.into());
+    /// Record `entity_id` for `toolkit` in the host KV port.
+    pub async fn set(&self, toolkit: &str, entity_id: impl Into<String>) -> Result<()> {
+        self.state
+            .set(
+                ENTITY_STORE_OWNER,
+                toolkit,
+                Value::String(entity_id.into()),
+            )
+            .await
     }
 
     /// Resolve the entity id to use when connecting `toolkit`, persisting the
@@ -219,33 +214,35 @@ impl EntityStore {
     ///
     /// Precedence: a value already stored for this toolkit wins; otherwise an
     /// explicit `override_id` (e.g. `COMPOSIO_ENTITY_ID`) is adopted; otherwise
-    /// a fresh id is generated. The resolved id is written back and saved.
-    pub fn entity_id_for(
-        &mut self,
+    /// a fresh id is generated. A conditional insert ensures concurrent
+    /// initializers return the same winning id.
+    pub async fn entity_id_for(
+        &self,
         toolkit: &str,
         override_id: Option<&str>,
-    ) -> std::io::Result<String> {
-        if let Some(existing) = self.get(toolkit) {
-            return Ok(existing.to_owned());
+    ) -> Result<String> {
+        if let Some(existing) = self.get(toolkit).await? {
+            return Ok(existing);
         }
         let chosen = override_id
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(str::to_owned)
             .unwrap_or_else(generate_entity_id);
-        self.set(toolkit, chosen.clone());
-        self.save()?;
-        Ok(chosen)
-    }
-
-    /// Serialize the store to its backing file (pretty JSON).
-    pub fn save(&self) -> std::io::Result<()> {
-        let file = EntityStoreFile {
-            entities: self.entries.clone(),
-        };
-        let json = serde_json::to_string_pretty(&file)
-            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
-        std::fs::write(&self.path, json)
+        if self
+            .state
+            .set_if_absent(
+                ENTITY_STORE_OWNER,
+                toolkit,
+                Value::String(chosen.clone()),
+            )
+            .await?
+        {
+            return Ok(chosen);
+        }
+        self.get(toolkit)
+            .await?
+            .context("Composio entity id disappeared after concurrent initialization")
     }
 }
 
