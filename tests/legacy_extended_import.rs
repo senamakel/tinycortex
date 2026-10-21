@@ -474,7 +474,7 @@ fn read_legacy_batch(root: &Path) -> Result<LegacyImportBatch> {
     batch.hotness = hotness
         .query_map([], |row| {
             Ok(LegacyHotness {
-                counters: tree::HotnessCounters {
+                counters: tree::store::HotnessCounters {
                     entity_id: row.get(0)?,
                     mention_count_30d: row.get::<_, i64>(1)?.max(0) as u32,
                     distinct_sources: row.get::<_, i64>(2)?.max(0) as u32,
