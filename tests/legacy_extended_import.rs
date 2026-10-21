@@ -155,6 +155,13 @@ async fn extended_v013_public_writer_batch_imports_and_reads_back() -> Result<()
     assert_eq!(actual_job.max_attempts, source_job.max_attempts);
     assert_eq!(actual_job.created_at_ms, source_job.created_at_ms);
     assert_eq!(actual_job.available_at_ms, source_job.available_at_ms);
+    assert_eq!(actual_job.started_at_ms, source_job.started_at_ms);
+    assert_eq!(actual_job.completed_at_ms, source_job.completed_at_ms);
+    assert_eq!(actual_job.last_error, source_job.last_error);
+    assert_eq!(actual_job.failure_reason, source_job.failure_reason);
+    assert_eq!(actual_job.failure_class, source_job.failure_class);
+    assert_eq!(actual_job.locked_until_ms, None);
+    assert_eq!(actual_job.queue_receipt, None);
     assert_eq!(queue::count_total(&config)?, 1);
     chunks::import_legacy_batch(&config, &batch).await?;
     assert_eq!(queue::count_total(&config)?, 1);
