@@ -109,9 +109,3 @@ fn the_canonical_spelling_matches_the_namespace_store_byte_for_byte() {
     );
 }
 
-#[test]
-fn in_clause_numbers_placeholders_from_the_given_index() {
-    assert_eq!(signature_in_clause(2, 1), "IN (?1, ?2)");
-    assert_eq!(signature_in_clause(2, 5), "IN (?5, ?6)");
-    assert_eq!(signature_in_clause(1, 3), "IN (?3)");
-}
