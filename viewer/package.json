@@ -8,7 +8,8 @@
     "build": "next build",
     "start": "next start -p 4319",
     "lint": "next lint",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "node --experimental-strip-types --test test/*.test.mjs"
   },
   "dependencies": {
     "d3-force": "^3.0.0",
