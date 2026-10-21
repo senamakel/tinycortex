@@ -85,16 +85,16 @@ fn count_rows(cfg: &MemoryConfig, table: &str) -> i64 {
 }
 
 fn index_entity(cfg: &MemoryConfig, node_id: &str) {
-    with_connection(cfg, |conn| {
-        conn.execute(
-            "INSERT INTO mem_tree_entity_index (
-                entity_id, node_id, node_kind, entity_kind, surface, score, timestamp_ms
-             ) VALUES ('entity:a', ?1, 'leaf', 'org', 'Acme', 0.9, 1700000000000)",
-            params![node_id],
-        )?;
-        Ok(())
-    })
-    .unwrap();
+    let index = crate::memory::store::entity_index::EntityIndex::for_memory_config(cfg).unwrap();
+    let entity = crate::memory::store::entity_index::types::CanonicalEntity {
+        canonical_id: "org:acme".into(),
+        kind: crate::memory::store::entity_index::types::EntityKind::Organization,
+        surface: "Acme".into(),
+        span_start: 0,
+        span_end: 4,
+        score: 0.9,
+    };
+    index.index_entity(&entity, node_id, "leaf", 1_700_000_000_000, None).unwrap();
 }
 
 #[test]
@@ -105,20 +105,18 @@ fn delete_chunk_by_id_takes_one_chunk_and_leaves_the_source() {
     upsert_chunks(&cfg, &[target.clone(), sibling.clone()]).unwrap();
     index_entity(&cfg, &target.id);
     index_entity(&cfg, &sibling.id);
-    with_connection(&cfg, |conn| {
-        conn.execute(
-            "INSERT INTO mem_tree_ingested_sources (source_kind, source_id, ingested_at_ms)
-             VALUES ('chat', 'slack:#eng', 1700000000000)",
-            [],
-        )?;
-        Ok(())
-    })
-    .unwrap();
+    assert!(super::claim_source_ingest(
+        &cfg,
+        SourceKind::Chat,
+        "slack:#eng",
+        1_700_000_000_000,
+    )
+    .unwrap());
 
     assert_eq!(delete_chunk_by_id(&cfg, &target.id).unwrap(), 1);
     assert!(get_chunk(&cfg, &target.id).unwrap().is_none());
     assert!(get_chunk(&cfg, &sibling.id).unwrap().is_some());
-    assert_eq!(count_rows(&cfg, "mem_tree_entity_index"), 1);
+    assert_eq!(crate::memory::score::store_query::count_entity_index(&cfg).unwrap(), 1);
     assert!(
         is_source_ingested(&cfg, SourceKind::Chat, "slack:#eng").unwrap(),
         "a source with surviving chunks keeps its ingest gate"
