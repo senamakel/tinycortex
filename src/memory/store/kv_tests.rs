@@ -127,6 +127,76 @@ async fn a_hashed_storage_key_with_wrong_body_identity_fails_closed() {
 }
 
 #[tokio::test]
+async fn imported_legacy_records_keep_values_namespaces_and_timestamps_on_retry() {
+    let config = config().await;
+    let kv = KvStore::from_config(&config).unwrap();
+    let records = [
+        crate::memory::types::MemoryKvRecord {
+            namespace: None,
+            key: "global-null".into(),
+            value: Value::Null,
+            updated_at: 1234.125,
+        },
+        crate::memory::types::MemoryKvRecord {
+            namespace: Some("team_alpha/_1".into()),
+            key: "arbitrary/key/雪".into(),
+            value: json!([1, false, null]),
+            updated_at: 1234.5,
+        },
+    ];
+    kv.import_legacy_records(&records).await.unwrap();
+    kv.import_legacy_records(&records).await.unwrap();
+    assert_eq!(kv.records_global_async().await.unwrap()[0].updated_at, 1234.125);
+    let imported = kv.records_namespace_async("team_alpha/_1").await.unwrap();
+    assert_eq!(imported.len(), 1);
+    assert_eq!(imported[0].namespace, records[1].namespace);
+    assert_eq!(imported[0].key, records[1].key);
+    assert_eq!(imported[0].value, records[1].value);
+    assert_eq!(imported[0].updated_at, records[1].updated_at);
+    assert_eq!(kv.get_global_async("global-null").await.unwrap(), Some(Value::Null));
+}
+
+#[tokio::test]
+async fn import_conflicts_are_detected_before_any_new_record_is_published() {
+    let config = config().await;
+    let kv = KvStore::from_config(&config).unwrap();
+    kv.set_global_async("already", &json!("new destination value"))
+        .await
+        .unwrap();
+    let records = [
+        crate::memory::types::MemoryKvRecord {
+            namespace: None,
+            key: "would-be-first".into(),
+            value: json!(1),
+            updated_at: 10.0,
+        },
+        crate::memory::types::MemoryKvRecord {
+            namespace: None,
+            key: "already".into(),
+            value: json!("legacy value"),
+            updated_at: 1.0,
+        },
+    ];
+    let error = kv.import_legacy_records(&records).await.unwrap_err();
+    assert!(error.contains("conflicts with existing key"));
+    assert_eq!(kv.get_global_async("would-be-first").await.unwrap(), None);
+    assert_eq!(
+        kv.get_global_async("already").await.unwrap(),
+        Some(json!("new destination value"))
+    );
+}
+
+#[tokio::test]
+async fn kv_logical_keys_are_not_limited_by_driver_key_constraints() {
+    let config = config().await;
+    let kv = KvStore::from_config(&config).unwrap();
+    let key = format!("arbitrary/{}\0suffix", "雪".repeat(700));
+    let value = json!({"preserve": [null, false, 4]});
+    kv.set_global_async(&key, &value).await.unwrap();
+    assert_eq!(kv.get_global_async(&key).await.unwrap(), Some(value));
+}
+
+#[tokio::test]
 async fn paged_namespace_listing_returns_all_entries_and_stable_order() {
     let config = config().await;
     let kv = KvStore::from_config(&config).unwrap();
