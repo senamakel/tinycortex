@@ -324,9 +324,11 @@ async fn main() -> anyhow::Result<()> {
     seed_trees(&config).await?;
 
     println!(
-        "Seeded {doc_count} skill documents in the example's memory backend and built a memory tree in {}.",
-        root.join("memory_tree/chunks.db").display()
+        "Wrote {doc_count} skill documents to the sync manifest under {} and built a memory tree in this process's in-memory testkit storage.",
+        root.display()
     );
-    println!("Point the viewer at it:  TINYCORTEX_WORKSPACE={workspace} npm run dev");
+    println!(
+        "The owner-store data is process-local; the SQLite-backed debug viewer cannot read it until its host adapter is migrated."
+    );
     Ok(())
 }
