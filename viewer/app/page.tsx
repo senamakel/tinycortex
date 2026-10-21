@@ -40,27 +40,27 @@ export default async function OverviewPage() {
       </div>
 
       <div className="panel">
-        <h2>Stores on disk</h2>
+        <h2>Data available from this scope</h2>
         <div className="tablewrap">
           <table>
             <thead>
               <tr>
                 <th>Store</th>
-                <th>Path</th>
+                <th>Source</th>
                 <th>Present</th>
               </tr>
             </thead>
             <tbody>
               <tr>
                 <td>Skill documents</td>
-                <td className="mono muted">memory_tree/skill_docs.db</td>
+                <td className="mono muted">TinyCortex owner KV</td>
                 <td>
                   <Bool value={o.exists.skillDocs} />
                 </td>
               </tr>
               <tr>
                 <td>Memory tree</td>
-                <td className="mono muted">memory_tree/chunks.db</td>
+                <td className="mono muted">TinyCortex owner tree</td>
                 <td>
                   <Bool value={o.exists.chunks} />
                 </td>

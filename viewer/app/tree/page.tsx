@@ -20,7 +20,7 @@ export default async function TreePage() {
         <h1>Memory tree</h1>
         <p className="subtitle">Ingested chunks from the summary tree.</p>
         <Empty>
-          No <code>memory_tree/chunks.db</code> in this workspace yet. Skill docs are
+          No chunks are visible in the configured storage scope yet. Skill docs are
           persisted on sync; the chunk/summary tree is produced by a full ingest pass.
         </Empty>
       </>

@@ -20,7 +20,7 @@ export default async function GraphPage() {
         <h1>Memory graph</h1>
         <p className="subtitle">Force-directed view of the summary tree.</p>
         <Empty>
-          No memory tree in <code>memory_tree/chunks.db</code> yet. Seed one with{" "}
+          No memory tree is visible in this storage scope yet. Seed one with{" "}
           <code>cargo run --example seed_memory --features sync</code> or run a full ingest.
         </Empty>
       </>
