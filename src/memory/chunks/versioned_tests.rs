@@ -431,6 +431,12 @@ async fn explicit_json_null_state_is_rejected_before_head_advance() {
         read_state(&config, CHUNK_LIFECYCLE, "null-state").unwrap(),
         None
     );
+    let documents = config.storage().unwrap().documents().clone();
+    let operations = documents
+        .query(OPERATIONS, &Query::all().limit(10))
+        .await
+        .unwrap();
+    assert!(operations.items.is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
