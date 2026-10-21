@@ -346,6 +346,13 @@ pub async fn import_legacy_batch(
             merge_changes(&mut expected, &mut changes, staged.expected, staged.changes)?;
         }
 
+        changes.retain(|change| {
+            state_map
+                .get(&change.collection)
+                .and_then(|rows| rows.get(&change.key))
+                != change.value.as_ref()
+        });
+
         for ((collection, key), value) in desired {
             let current = state_map
                 .get(&collection)
@@ -465,6 +472,32 @@ fn validate_batch(batch: &LegacyImportBatch) -> Result<()> {
             summary.id
         );
     }
+    let valid_nodes: HashSet<_> = chunk_ids
+        .iter()
+        .copied()
+        .chain(summary_ids.iter().copied())
+        .collect();
+    for occurrence in batch
+        .chunks
+        .iter()
+        .flat_map(|record| record.entities.iter())
+        .chain(batch.entities.iter())
+    {
+        anyhow::ensure!(
+            valid_nodes.contains(occurrence.node_id.as_str()),
+            "legacy entity occurrence references a node outside the import batch"
+        );
+        anyhow::ensure!(
+            !occurrence.entity_id.is_empty()
+                && !occurrence.node_kind.is_empty()
+                && !occurrence.entity_kind.is_empty()
+                && occurrence.score.is_finite(),
+            "invalid legacy entity occurrence"
+        );
+        if let Some(tree_id) = &occurrence.tree_id {
+            anyhow::ensure!(tree_ids.contains(tree_id.as_str()), "entity references unknown tree");
+        }
+    }
     Ok(())
 }
 
@@ -512,6 +545,8 @@ fn safe_relative_path(path: &str) -> bool {
     let parsed = std::path::Path::new(path);
     !path.is_empty()
         && !parsed.is_absolute()
+        && !path.contains('\\')
+        && !path.contains(':')
         && parsed
             .components()
             .all(|component| matches!(component, std::path::Component::Normal(_)))
