@@ -166,11 +166,11 @@ async fn typed_legacy_embedding_import_preserves_signature_dimension_and_idempot
             raw_refs: Vec::new(),
             score: None,
             lifecycle_status: Some(CHUNK_STATUS_ADMITTED.into()),
-            embedding: Some(LegacyEmbedding {
+            embeddings: vec![LegacyEmbedding {
                 model_signature: signature.into(),
                 vector: vector.clone(),
                 created_at_ms: 1_699_999_000_000,
-            }),
+            }],
             entities: Vec::new(),
         }],
         ..Default::default()

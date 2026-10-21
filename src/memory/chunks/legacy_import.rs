@@ -593,16 +593,6 @@ fn validate_batch(batch: &LegacyImportBatch) -> Result<()> {
             content.summary_id
         );
     }
-    for embedding in &batch.summary_embeddings {
-        anyhow::ensure!(
-            summary_ids.contains(embedding.summary_id.as_str())
-                && !embedding.model_signature.trim().is_empty()
-                && !embedding.vector.is_empty()
-                && embedding.vector.iter().all(|value| value.is_finite()),
-            "invalid legacy summary embedding for {}",
-            embedding.summary_id
-        );
-    }
     let valid_nodes: HashSet<_> = chunk_ids
         .iter()
         .copied()
