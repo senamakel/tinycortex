@@ -326,7 +326,10 @@ async fn typed_import_rejects_malformed_existing_content_pointer_without_mutatio
 
     let error = import_legacy_batch(&config, &batch).await.unwrap_err();
 
-    assert!(error.to_string().contains("unsafe path or invalid SHA-256"));
+    assert!(
+        error.to_string().contains("unsafe path or invalid SHA-256"),
+        "unexpected import error: {error:#}"
+    );
     assert_eq!(
         super::super::versioned::capture_state_snapshot_async(&config)
             .await
