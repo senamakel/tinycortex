@@ -94,6 +94,70 @@ async fn arbitrary_message_ids_keep_legacy_append_order_and_duplicates() {
 }
 
 #[tokio::test]
+async fn create_preserves_empty_and_whitespace_thread_ids() {
+    let workspace = tempfile::tempdir().unwrap();
+    let config = crate::memory::chunks::test_support::host_config(workspace.path());
+    let store = ConversationStore::open(&config).unwrap();
+
+    for (id, title) in [("", "Empty id"), ("  ", "Whitespace id")] {
+        let created = store
+            .ensure_thread_async(CreateConversationThread {
+                id: id.into(),
+                title: title.into(),
+                created_at: "2025-02-03T04:05:06Z".into(),
+                parent_thread_id: None,
+                labels: None,
+                personality_id: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(created.id, id);
+        assert_eq!(store.get_messages_async(id).await.unwrap(), Vec::new());
+    }
+
+    let listed = store.list_threads_async().await.unwrap();
+    assert_eq!(listed.len(), 2);
+    assert!(listed.iter().any(|thread| thread.id.is_empty()));
+    assert!(listed.iter().any(|thread| thread.id == "  "));
+}
+
+#[tokio::test]
+async fn legacy_import_preserves_empty_and_whitespace_thread_ids() {
+    let workspace = tempfile::tempdir().unwrap();
+    let config = crate::memory::chunks::test_support::host_config(workspace.path());
+    let store = ConversationStore::open(&config).unwrap();
+
+    for (id, title) in [("", "Imported empty id"), ("  ", "Imported whitespace id")] {
+        let transcript = LegacyConversationTranscript {
+            thread: ConversationThread {
+                id: id.into(),
+                title: title.into(),
+                chat_id: None,
+                is_active: true,
+                message_count: 0,
+                last_message_at: "2025-02-03T04:05:06Z".into(),
+                created_at: "2025-02-03T04:05:06Z".into(),
+                parent_thread_id: None,
+                labels: vec!["general".into()],
+                personality_id: None,
+            },
+            updated_at: "2025-02-03T04:05:06Z".into(),
+            messages: Vec::new(),
+        };
+        store
+            .import_legacy_transcript_async(transcript.clone())
+            .await
+            .unwrap();
+        assert_eq!(store.get_messages_async(id).await.unwrap(), Vec::new());
+        assert!(store
+            .list_threads_async()
+            .await
+            .unwrap()
+            .contains(&transcript.thread));
+    }
+}
+
+#[tokio::test]
 async fn legacy_import_preserves_repeated_message_ids_in_source_order() {
     let workspace = tempfile::tempdir().unwrap();
     let config = crate::memory::chunks::test_support::host_config(workspace.path());

@@ -170,6 +170,7 @@ impl InvertedIndex {
 
     /// Drop every document belonging to a thread. Used by
     /// `delete_thread` and during full purge.
+    #[cfg(test)]
     pub fn remove_thread(&mut self, thread_id: &str) {
         let to_remove: Vec<u32> = self
             .by_message
@@ -195,6 +196,7 @@ impl InvertedIndex {
         self.role_pool.clear();
     }
 
+    #[cfg(test)]
     fn remove_doc(&mut self, doc_id: u32) {
         let idx = doc_id as usize;
         let Some(entry) = self.docs.get_mut(idx).and_then(|slot| slot.take()) else {
