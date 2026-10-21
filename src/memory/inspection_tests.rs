@@ -64,8 +64,8 @@ fn snapshot_reads_owner_kv_and_chunk_records_from_explicit_storage() {
     assert!(snapshot.summaries.is_empty());
 }
 
-#[tokio::test(flavor = "current_thread")]
-async fn snapshot_includes_summary_chunks_outside_the_newest_page() {
+#[test]
+fn snapshot_includes_summary_chunks_outside_the_newest_page() {
     use crate::memory::chunks::versioned::commit_if_state_matches_async;
     use crate::memory::tree::store::{insert_tree_async, SummaryNode, Tree, TreeKind, TreeStatus};
 
@@ -114,48 +114,55 @@ async fn snapshot_includes_summary_chunks_outside_the_newest_page() {
     };
     upsert_chunks(&config, &[referenced.clone(), newest.clone()]).unwrap();
 
-    let tree = Tree {
-        id: "tree-inspection".into(),
-        kind: TreeKind::Source,
-        scope: "source-old".into(),
-        root_id: Some("summary-inspection".into()),
-        max_level: 1,
-        status: TreeStatus::Active,
-        created_at: timestamp,
-        last_sealed_at: Some(timestamp),
-        ask: None,
-    };
-    insert_tree_async(&config, &tree).await.unwrap();
-    let summary = SummaryNode {
-        id: "summary-inspection".into(),
-        tree_id: tree.id,
-        tree_kind: TreeKind::Source,
-        level: 1,
-        parent_id: None,
-        child_ids: vec![referenced.id.clone()],
-        content: "An older chunk remains part of the summary graph".into(),
-        token_count: 9,
-        entities: Vec::new(),
-        topics: Vec::new(),
-        time_range_start: timestamp,
-        time_range_end: timestamp,
-        score: 0.0,
-        sealed_at: timestamp,
-        deleted: false,
-        embedding: None,
-        doc_id: None,
-        version_ms: None,
-    };
-    let staged =
-        crate::memory::tree::store::stage_summary_changes(&summary, None, "test/model").unwrap();
-    assert!(
-        commit_if_state_matches_async(&config, &staged.expected, &[], &staged.changes,)
-            .await
-            .unwrap()
-    );
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let tree = Tree {
+            id: "tree-inspection".into(),
+            kind: TreeKind::Source,
+            scope: "source-old".into(),
+            root_id: Some("summary-inspection".into()),
+            max_level: 1,
+            status: TreeStatus::Active,
+            created_at: timestamp,
+            last_sealed_at: Some(timestamp),
+            ask: None,
+        };
+        insert_tree_async(&config, &tree).await.unwrap();
+        let summary = SummaryNode {
+            id: "summary-inspection".into(),
+            tree_id: tree.id,
+            tree_kind: TreeKind::Source,
+            level: 1,
+            parent_id: None,
+            child_ids: vec![referenced.id.clone()],
+            content: "An older chunk remains part of the summary graph".into(),
+            token_count: 9,
+            entities: Vec::new(),
+            topics: Vec::new(),
+            time_range_start: timestamp,
+            time_range_end: timestamp,
+            score: 0.0,
+            sealed_at: timestamp,
+            deleted: false,
+            embedding: None,
+            doc_id: None,
+            version_ms: None,
+        };
+        let staged =
+            crate::memory::tree::store::stage_summary_changes(&summary, None, "test/model")
+                .unwrap();
+        assert!(
+            commit_if_state_matches_async(&config, &staged.expected, &[], &staged.changes,)
+                .await
+                .unwrap()
+        );
 
-    let snapshot = read_snapshot(workspace.path(), storage, 1).await.unwrap();
-    assert_eq!(snapshot.chunks, vec![newest]);
-    assert_eq!(snapshot.graph_chunks, vec![referenced]);
-    assert_eq!(snapshot.chunk_total, 2);
+        let snapshot = read_snapshot(workspace.path(), storage, 1).await.unwrap();
+        assert_eq!(snapshot.chunks, vec![newest]);
+        assert_eq!(snapshot.graph_chunks, vec![referenced]);
+        assert_eq!(snapshot.chunk_total, 2);
+    });
 }
