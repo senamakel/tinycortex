@@ -6,9 +6,8 @@
 
 use anyhow::Result;
 use rusqlite::Transaction;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
-use super::connection::with_connection;
 use super::types::{Chunk, SourceKind, StagedChunk};
 use crate::memory::config::MemoryConfig;
 
@@ -210,13 +209,63 @@ pub fn count_chunks(config: &MemoryConfig) -> Result<u64> {
     Ok(super::versioned::list_chunks(config)?.len() as u64)
 }
 
-/// Extraction coverage requires entity-index records committed alongside chunks.
+/// Fraction of live chunks that have at least one host-owned entity occurrence.
+/// An empty store has zero coverage.
 ///
 /// # Errors
-/// Returns an error until the host entity-index port is ready.
+/// Returns an error if chunks or the entity index cannot be read.
 pub fn extraction_coverage(config: &MemoryConfig) -> Result<f32> {
-    let _ = config;
-    anyhow::bail!("extraction coverage requires the host entity-index port")
+    let (_, chunks, states) = super::versioned::list_chunk_snapshot_with_head(
+        config,
+        &[super::collections::ENTITY_INDEX],
+    )?;
+    extraction_coverage_from_snapshot(&chunks, &states)
+}
+
+/// Async counterpart for current-thread Tokio callers.
+pub async fn extraction_coverage_async(config: &MemoryConfig) -> Result<f32> {
+    let (_, chunks, states) = super::versioned::list_chunk_snapshot_with_head_async(
+        config,
+        &[super::collections::ENTITY_INDEX],
+    )
+    .await?;
+    extraction_coverage_from_snapshot(&chunks, &states)
+}
+
+fn extraction_coverage_from_snapshot(
+    chunks: &[Chunk],
+    states: &HashMap<String, Vec<(String, serde_json::Value)>>,
+) -> Result<f32> {
+    if chunks.is_empty() {
+        return Ok(0.0);
+    }
+    let live_ids = chunks
+        .iter()
+        .map(|chunk| chunk.id.as_str())
+        .collect::<HashSet<_>>();
+    let mut indexed_ids = HashSet::new();
+    for (key, value) in states
+        .get(super::collections::ENTITY_INDEX)
+        .into_iter()
+        .flatten()
+    {
+        if !key.starts_with("occ:") {
+            continue;
+        }
+        let occurrence: crate::memory::store::entity_index::transaction::EntityOccurrence =
+            serde_json::from_value(value.clone())?;
+        anyhow::ensure!(
+            crate::memory::store::entity_index::transaction::occurrence_key(
+                &occurrence.entity_id,
+                &occurrence.node_id,
+            ) == *key,
+            "entity occurrence key does not match its record"
+        );
+        if live_ids.contains(occurrence.node_id.as_str()) {
+            indexed_ids.insert(occurrence.node_id);
+        }
+    }
+    Ok(indexed_ids.len() as f32 / chunks.len() as f32)
 }
 
 // ── Source ingest gate + lifecycle status + raw-file gate ────────────────────

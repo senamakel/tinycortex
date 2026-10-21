@@ -181,7 +181,7 @@ pub struct JobMutation {
 }
 
 impl JobMutation {
-    fn into_state_changes(self) -> (StateChange, StateChange) {
+    pub(crate) fn into_state_changes(self) -> (StateChange, StateChange) {
         let collection = self.collection.name().to_owned();
         (
             StateChange {
@@ -327,6 +327,7 @@ pub async fn handle_job(
     if !plan.expected.is_empty()
         || !plan.mutations.is_empty()
         || !plan.follow_ups.is_empty()
+        || plan.document_projection.is_some()
         || matches!(plan.outcome, JobOutcome::Defer { .. })
     {
         anyhow::bail!("job effects require lease-fenced worker settlement; use run_once");
