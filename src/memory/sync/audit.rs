@@ -87,7 +87,10 @@ pub async fn import_legacy_audit_entries_async(
     source_id: &str,
     entries: &[SyncAuditEntry],
 ) -> anyhow::Result<()> {
-    anyhow::ensure!(!source_id.trim().is_empty(), "legacy audit source id is empty");
+    anyhow::ensure!(
+        !source_id.trim().is_empty(),
+        "legacy audit source id is empty"
+    );
     if entries.is_empty() {
         return Ok(());
     }
@@ -121,8 +124,7 @@ pub async fn import_legacy_audit_entries_async(
             anyhow::ensure!(
                 for_source.len() == entries.len()
                     && for_source.iter().enumerate().all(|(ordinal, record)| {
-                        record.ordinal == ordinal as u64
-                            && record.entry == entries[ordinal]
+                        record.ordinal == ordinal as u64 && record.entry == entries[ordinal]
                     }),
                 "legacy audit source id already refers to different records"
             );

@@ -158,9 +158,7 @@ impl KvStateStore {
             .iter()
             .map(|entry| (Self::key(NAMESPACE, &entry.key), entry.value.clone()))
             .collect::<Vec<_>>();
-        self.kv
-            .import_entries(NAMESPACE, &owner_entries)
-            .await
+        self.kv.import_entries(NAMESPACE, &owner_entries).await
     }
 }
 

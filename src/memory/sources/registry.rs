@@ -149,10 +149,7 @@ impl SourceRegistry {
     /// Merge source entries decoded by a host's legacy-config reader.
     /// Identical entries make retries no-ops; a reused id with different data
     /// fails before the host configuration is changed.
-    pub async fn import_legacy_entries(
-        &self,
-        imported: &[MemorySourceEntry],
-    ) -> Result<usize> {
+    pub async fn import_legacy_entries(&self, imported: &[MemorySourceEntry]) -> Result<usize> {
         for entry in imported {
             entry.validate().map_err(|error| anyhow!(error))?;
         }

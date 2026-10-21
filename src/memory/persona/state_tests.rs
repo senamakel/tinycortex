@@ -87,10 +87,7 @@ async fn legacy_cursor_import_is_idempotent_and_refuses_conflicts_before_writes(
     store.import_legacy_entries(&imported).await.unwrap();
     store.import_legacy_entries(&imported).await.unwrap();
     assert_eq!(
-        store
-            .get(NAMESPACE, &imported[0].key)
-            .await
-            .unwrap(),
+        store.get(NAMESPACE, &imported[0].key).await.unwrap(),
         Some(imported[0].value.clone())
     );
 
@@ -107,10 +104,7 @@ async fn legacy_cursor_import_is_idempotent_and_refuses_conflicts_before_writes(
     ];
     assert!(store.import_legacy_entries(&late_import).await.is_err());
     assert_eq!(
-        store
-            .get(NAMESPACE, "new-before-conflict")
-            .await
-            .unwrap(),
+        store.get(NAMESPACE, "new-before-conflict").await.unwrap(),
         None
     );
 }

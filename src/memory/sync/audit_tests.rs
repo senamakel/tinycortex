@@ -45,6 +45,68 @@ async fn audit_round_trip_is_newest_first_and_skips_malformed_lines() {
     assert!(!temp.path().join("memory_tree/sync_audit.jsonl").exists());
 }
 
+#[tokio::test]
+async fn legacy_audit_import_preserves_append_order_and_is_retry_safe() {
+    let temp = tempfile::tempdir().unwrap();
+    let config = crate::memory::chunks::test_support::host_config(temp.path());
+    let old_file_order = vec![
+        entry(
+            "legacy-first",
+            Utc.timestamp_millis_opt(1_750_000_000_000).unwrap(),
+        ),
+        entry(
+            "legacy-second",
+            Utc.timestamp_millis_opt(1_600_000_000_000).unwrap(),
+        ),
+    ];
+
+    import_legacy_audit_entries_async(&config, "sha256:source-file", &old_file_order)
+        .await
+        .unwrap();
+    let streams = config.storage().unwrap().streams();
+    let after_first_import = streams
+        .len("tinycortex:sync-audit:legacy-import:v1")
+        .await
+        .unwrap();
+    // Retrying after the host lost the successful response does not append.
+    import_legacy_audit_entries_async(&config, "sha256:source-file", &old_file_order)
+        .await
+        .unwrap();
+    assert_eq!(
+        streams
+            .len("tinycortex:sync-audit:legacy-import:v1")
+            .await
+            .unwrap(),
+        after_first_import
+    );
+
+    append_audit_entry_async(
+        &config,
+        &entry("live", Utc.timestamp_millis_opt(1).unwrap()),
+    )
+    .await
+    .unwrap();
+    let visible = read_audit_log_async(&config).await.unwrap();
+    assert_eq!(
+        visible
+            .iter()
+            .map(|record| record.source_id.as_str())
+            .collect::<Vec<_>>(),
+        ["live", "legacy-second", "legacy-first"]
+    );
+
+    let changed = vec![entry(
+        "different-content",
+        Utc.timestamp_millis_opt(1_750_000_000_000).unwrap(),
+    )];
+    assert!(
+        import_legacy_audit_entries_async(&config, "sha256:source-file", &changed)
+            .await
+            .is_err()
+    );
+    assert_eq!(read_audit_log_async(&config).await.unwrap(), visible);
+}
+
 #[test]
 fn accumulator_uses_real_values_only_when_every_batch_reports_them() {
     let mut complete = RealCostAccumulator::new();

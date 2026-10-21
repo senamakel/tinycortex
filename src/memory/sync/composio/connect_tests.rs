@@ -187,7 +187,10 @@ async fn legacy_entity_import_is_idempotent_and_conflicts_before_any_write() {
 
     store.import_legacy_entities(&entries).await.unwrap();
     store.import_legacy_entities(&entries).await.unwrap();
-    assert_eq!(store.get("gmail").await.unwrap().as_deref(), Some("entity@example.test"));
+    assert_eq!(
+        store.get("gmail").await.unwrap().as_deref(),
+        Some("entity@example.test")
+    );
 
     store.set("slack", "advanced-slack-user").await.unwrap();
     let conflicting = vec![

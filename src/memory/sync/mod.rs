@@ -13,8 +13,8 @@ pub mod traits;
 pub mod workspace;
 
 pub use audit::{
-    append_audit_entry, append_audit_entry_async, estimate_cost_usd, read_audit_log,
-    import_legacy_audit_entries_async, read_audit_log_async, RealCostAccumulator,
+    append_audit_entry, append_audit_entry_async, estimate_cost_usd,
+    import_legacy_audit_entries_async, read_audit_log, read_audit_log_async, RealCostAccumulator,
     SyncAuditEntry,
 };
 pub use composio::{

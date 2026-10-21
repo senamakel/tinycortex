@@ -116,9 +116,27 @@ async fn legacy_source_import_is_idempotent_and_conflicts_before_config_write() 
     );
 
     let entry = folder_entry("legacy-source");
-    assert_eq!(registry.import_legacy_entries(std::slice::from_ref(&entry)).await.unwrap(), 1);
-    assert_eq!(registry.import_legacy_entries(std::slice::from_ref(&entry)).await.unwrap(), 0);
-    assert!(port.state.lock().unwrap().1.iter().any(|source| source.id == "legacy-source"));
+    assert_eq!(
+        registry
+            .import_legacy_entries(std::slice::from_ref(&entry))
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        registry
+            .import_legacy_entries(std::slice::from_ref(&entry))
+            .await
+            .unwrap(),
+        0
+    );
+    assert!(port
+        .state
+        .lock()
+        .unwrap()
+        .1
+        .iter()
+        .any(|source| source.id == "legacy-source"));
 }
 
 #[tokio::test]
