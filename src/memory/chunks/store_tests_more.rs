@@ -152,10 +152,10 @@ fn corrupt_surviving_raw_refs_make_deletion_cleanup_fail_closed() {
         }],
     )
     .unwrap();
-    super::versioned::write_state_changes(
+    crate::memory::chunks::versioned::write_state_changes(
         &cfg,
-        &[super::versioned::StateChange {
-            collection: super::collections::RAW_REFS.into(),
+        &[crate::memory::chunks::versioned::StateChange {
+            collection: crate::memory::chunks::collections::RAW_REFS.into(),
             key: corrupt.id.clone(),
             value: Some(serde_json::Value::String("corrupt".into())),
         }],
@@ -205,10 +205,10 @@ fn raw_refs_round_trip_and_prefix_listing_tolerates_corrupt_rows() {
         }],
     )
     .unwrap();
-    super::versioned::write_state_changes(
+    crate::memory::chunks::versioned::write_state_changes(
         &cfg,
-        &[super::versioned::StateChange {
-            collection: super::collections::RAW_REFS.into(),
+        &[crate::memory::chunks::versioned::StateChange {
+            collection: crate::memory::chunks::collections::RAW_REFS.into(),
             key: corrupt.id.clone(),
             value: Some(serde_json::Value::String("not valid json".into())),
         }],
@@ -241,11 +241,11 @@ fn content_pointer_accessors_return_only_complete_non_deleted_rows() {
         }],
     )
     .unwrap();
-    super::versioned::write_state_changes(
+    crate::memory::chunks::versioned::write_state_changes(
         &cfg,
         &[
-            super::versioned::StateChange {
-                collection: super::collections::SUMMARY_CONTENT_POINTERS.into(),
+            crate::memory::chunks::versioned::StateChange {
+                collection: crate::memory::chunks::collections::SUMMARY_CONTENT_POINTERS.into(),
                 key: "summary:summary-live".into(),
                 value: Some(serde_json::json!({
                     "summary_id": "summary-live",
@@ -253,8 +253,8 @@ fn content_pointer_accessors_return_only_complete_non_deleted_rows() {
                     "content_sha256": "sum123"
                 })),
             },
-            super::versioned::StateChange {
-                collection: super::collections::SUMMARY_CONTENT_POINTERS.into(),
+            crate::memory::chunks::versioned::StateChange {
+                collection: crate::memory::chunks::collections::SUMMARY_CONTENT_POINTERS.into(),
                 key: "summary:summary-deleted".into(),
                 value: Some(serde_json::json!({
                     "summary_id": "summary-deleted",
@@ -262,8 +262,8 @@ fn content_pointer_accessors_return_only_complete_non_deleted_rows() {
                     "content_sha256": "sum456"
                 })),
             },
-            super::versioned::StateChange {
-                collection: super::collections::SUMMARY_CONTENT_POINTERS.into(),
+            crate::memory::chunks::versioned::StateChange {
+                collection: crate::memory::chunks::collections::SUMMARY_CONTENT_POINTERS.into(),
                 key: "summary:summary-incomplete".into(),
                 value: Some(serde_json::json!({
                     "summary_id": "summary-incomplete",
@@ -271,18 +271,18 @@ fn content_pointer_accessors_return_only_complete_non_deleted_rows() {
                     "content_sha256": ""
                 })),
             },
-            super::versioned::StateChange {
-                collection: super::collections::SUMMARIES.into(),
+            crate::memory::chunks::versioned::StateChange {
+                collection: crate::memory::chunks::collections::SUMMARIES.into(),
                 key: "summary:summary-live".into(),
                 value: Some(serde_json::json!({"deleted": false})),
             },
-            super::versioned::StateChange {
-                collection: super::collections::SUMMARIES.into(),
+            crate::memory::chunks::versioned::StateChange {
+                collection: crate::memory::chunks::collections::SUMMARIES.into(),
                 key: "summary:summary-deleted".into(),
                 value: Some(serde_json::json!({"deleted": true})),
             },
-            super::versioned::StateChange {
-                collection: super::collections::SUMMARIES.into(),
+            crate::memory::chunks::versioned::StateChange {
+                collection: crate::memory::chunks::collections::SUMMARIES.into(),
                 key: "summary:summary-incomplete".into(),
                 value: Some(serde_json::json!({"deleted": false})),
             },
@@ -301,10 +301,10 @@ fn content_pointer_accessors_return_only_complete_non_deleted_rows() {
     assert!(get_chunk_content_pointers(&cfg, "missing")
         .unwrap()
         .is_none());
-    super::versioned::write_state_changes(
+    crate::memory::chunks::versioned::write_state_changes(
         &cfg,
-        &[super::versioned::StateChange {
-            collection: super::collections::CHUNK_CONTENT_POINTERS.into(),
+        &[crate::memory::chunks::versioned::StateChange {
+            collection: crate::memory::chunks::collections::CHUNK_CONTENT_POINTERS.into(),
             key: chunk.id.clone(),
             value: Some(serde_json::json!({
                 "chunk_id": chunk.id,
