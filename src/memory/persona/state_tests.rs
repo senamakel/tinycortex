@@ -54,3 +54,16 @@ async fn state_persists_across_reopen() {
     assert!(watermark_unchanged(&store, "k", "v").await.unwrap());
     assert!(!dir.path().join("persona/sync-state.json").exists());
 }
+
+#[tokio::test]
+async fn opaque_cursor_identity_and_json_are_preserved_exactly() {
+    let dir = TempDir::new().unwrap();
+    let config = crate::memory::chunks::test_support::host_config(dir.path());
+    let store = KvStateStore::from_config(&config).unwrap();
+    let key = "transcript:/home/alice@example.com/.agent/sessions/run.jsonl";
+    let value = serde_json::json!({"opaque": "sk-test-opaque-value", "email": "alice@example.com"});
+
+    store.set(NAMESPACE, key, &value).await.unwrap();
+
+    assert_eq!(store.get(NAMESPACE, key).await.unwrap(), Some(value));
+}

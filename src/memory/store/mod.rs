@@ -27,6 +27,8 @@ pub mod kv;
 mod memory_trait;
 /// Secret / PII detection guard applied before KV writes are persisted.
 pub mod safety;
+/// Opaque engine-owned values stored without user-memory PII rewriting.
+pub(crate) mod state_kv;
 /// Starter in-memory reference backend used by the smoke test.
 #[allow(clippy::module_inception)]
 pub mod store;
