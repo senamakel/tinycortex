@@ -311,7 +311,7 @@ pub async fn plan_append_node_for_queue(
     Ok(Some(crate::memory::queue::DelegateOutput {
         result: crate::memory::queue::AppendDecision {
             tree_id,
-            should_seal: should_seal(config, &buffer.buffer),
+            should_seal: should_seal(config, &buffer),
         },
         mutations,
     }))
