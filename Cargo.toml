@@ -83,13 +83,12 @@ wiki-git = ["dep:git2", "dep:hex"]
 # detection is host desktop policy and lives in the host, not here.
 obsidian = []
 
-# Contact resolution and scoring (`memory::people`): a SQLite store of people,
+# Contact resolution and scoring (`memory::people`): a TSD-backed store of people,
 # handle aliases and interactions, a deterministic handle → `PersonId` resolver,
 # and a recency × frequency × reciprocity × depth scorer.
 #
-# Implies `tokio` because the store shares its connection as an
-# `Arc<tokio::sync::Mutex<Connection>>` across tasks. It adds no other
-# dependency — `rusqlite`, `chrono`, `uuid` and `serde` are already core.
+# Implies `tokio` because the store uses async host-supplied document ports.
+# It adds no other dependency; the generic document API/types are already core.
 people = ["tokio"]
 
 # The macOS system address book (`memory::people::address_book`) as a seed

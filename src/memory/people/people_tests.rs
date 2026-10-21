@@ -64,7 +64,7 @@ fn init_rebinds_global_store_using_prepared_host_configs() {
 
     let _serial = GLOBAL_STORE_LOCK.lock();
 
-    let (ws_a, config_a) = crate::memory::people::test_support::config();
+    let (_ws_a, config_a) = crate::memory::people::test_support::config();
     let store_a = store::init(&config_a).unwrap();
 
     // Previously-dead global is now reachable — the 8NM fix.
@@ -76,7 +76,7 @@ fn init_rebinds_global_store_using_prepared_host_configs() {
     assert!(Arc::ptr_eq(&store_a, &again));
 
     // Different workspace (active-user switch) → rebind to a new store. #4378.
-    let (ws_b, config_b) = crate::memory::people::test_support::config();
+    let (_ws_b, config_b) = crate::memory::people::test_support::config();
     let store_b = store::init(&config_b).unwrap();
     assert!(
         !Arc::ptr_eq(&store_a, &store_b),
