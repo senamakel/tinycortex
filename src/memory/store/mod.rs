@@ -7,14 +7,15 @@
 //! - [`content`]       — markdown content store (YAML front-matter, atomic
 //!   writes, `content_path`/`content_sha256` pointers, Obsidian-vault paths).
 //! - [`vectors`]       — host-document-backed packed-`f32` cosine vector store.
-//! - [`kv`]            — global + namespace JSON key-value store.
+//! - [`kv`]            — host-port global + namespace JSON key-value store.
 //! - [`entity_index`] — entity occurrence index over tree nodes.
 //! - [`safety`]       — secret / PII detection guard used by KV writes.
 //!
 //! ## Concurrency contract
 //!
 //! Persistent collections are supplied by the host through the storage ports;
-//! these domain stores do not open their own database connections.
+//! these domain stores do not open their own database connections. KV writes
+//! use optimistic compare-and-swap.
 
 /// Markdown content store: source-of-truth files with YAML front matter,
 /// atomic writes, and `content_path`/`content_sha256` provenance pointers.
