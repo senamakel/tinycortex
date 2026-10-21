@@ -72,32 +72,6 @@ pub async fn plan_seal_one_level_for_queue(
     })
 }
 
-/// Plan one queue-owned append without publishing any tree state.
-///
-/// The returned buffer and tree mutations can be combined with the append
-/// job's lease receipt in the queue's owner-head CAS. This keeps a stale
-/// worker from appending after its lease has expired.
-pub(crate) async fn plan_append_to_buffer_for_queue(
-    config: &MemoryConfig,
-    tree_id: &str,
-    level: u32,
-    item_id: &str,
-    token_delta: i64,
-    item_ts: DateTime<Utc>,
-) -> Result<crate::memory::queue::DelegateOutput<crate::memory::queue::AppendDecision>> {
-    let staged =
-        store::stage_buffer_item_async(config, tree_id, level, item_id, token_delta, item_ts)
-            .await?;
-    let mutations = merge_staged_seal_changes(staged.expected, staged.changes)?;
-    Ok(crate::memory::queue::DelegateOutput {
-        result: crate::memory::queue::AppendDecision {
-            tree_id: tree_id.to_owned(),
-            should_seal: should_seal(config, &staged.buffer),
-        },
-        mutations,
-    })
-}
-
 /// Plan a queue append from its typed node and destination references.
 ///
 /// Cortex resolves the node's stored token/time metadata, rejects missing or
