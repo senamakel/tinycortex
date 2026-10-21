@@ -1,9 +1,8 @@
 //! Round-trip tests for tree / summary / buffer persistence, embedding sidecar
 //! scoping, stale-buffer queries, and the list/archive registry helpers.
 //!
-//! Adapted from OpenHuman's `memory_store/trees/store_tests.rs`:
-//! `Config` → [`MemoryConfig`], and `insert_summary_tx` drops the staged-content
-//! argument (TinyCortex stores full summary bodies inline, no on-disk staging).
+//! Adapted from OpenHuman's tree store tests to the bound versioned document
+//! owner, including staged summary content pointers.
 
 use super::*;
 use chrono::{TimeZone, Utc};

@@ -3,10 +3,11 @@
 //!
 //! Two engines live here:
 //!
-//! - **Bucket-seal SQLite trees** ([`store`], [`bucket_seal`], [`flush`],
+//! - **Bucket-seal owner-state trees** ([`store`], [`bucket_seal`], [`flush`],
 //!   [`registry`], [`factory`], [`io`], [`read`], [`summarise`], and internal
 //!   hydration helpers).
-//!   Source/topic/global trees keyed by `(kind, scope)` in `mem_tree_trees`.
+//!   Source/topic/global trees keyed by `(kind, scope)` in the bound document
+//!   owner.
 //!   Leaves accumulate in per-`(tree, level)` buffers; when a buffer crosses its
 //!   token (L0) or fan-in (L≥1) gate it seals into an immutable
 //!   [`store::SummaryNode`], cascading upward. The LLM is abstracted behind

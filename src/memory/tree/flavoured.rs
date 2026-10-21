@@ -16,7 +16,7 @@
 //! [`crate::memory::tree::bucket_seal::cascade_all_from_with_services`]).
 //!
 //! Unlike the per-node summary staging in [`crate::memory::store::content`], the
-//! compiled root is *not* tracked in SQLite — it is a pure projection of the
+//! compiled root is not persisted — it is a pure projection of the
 //! root node, safe to delete and regenerate at any time.
 
 use std::path::PathBuf;

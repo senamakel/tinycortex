@@ -19,7 +19,8 @@
 //! output the seal falls back to the deterministic [`fallback_summary`]. The
 //! content-staging / git-mirror, async-queue follow-up enqueue, event-bus
 //! progress events, seal-time embedding, and per-document subtree paths are not
-//! ported (deferred). Summary bodies are stored inline in `mem_tree_summaries`.
+//! ported (deferred). Summary records and content pointers are written to the
+//! bound document owner.
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};

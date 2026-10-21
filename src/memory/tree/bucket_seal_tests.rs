@@ -1,7 +1,7 @@
 //! Append + cascade-seal tests. Adapted from OpenHuman's `bucket_seal_tests.rs`
 //! to the reduced foundation: the chat-provider summariser becomes
 //! [`ConcatSummariser`] (a deterministic [`Summariser`]), chunk bodies are read
-//! inline from SQLite (no on-disk staging), and the document-subtree /
+//! inline from owner records (no on-disk staging), and the document-subtree /
 //! embedding assertions are dropped (those features are deferred).
 
 use super::*;
@@ -351,7 +351,7 @@ async fn crossing_budget_triggers_seal() {
     assert!(t.last_sealed_at.is_some());
 
     // The owner model stores the parent-child relationship on the summary;
-    // chunk rows no longer carry a separate SQLite parent backlink.
+    // chunk records no longer carry a separate parent backlink.
     assert!(summary.child_ids.contains(&c1.id));
 }
 
