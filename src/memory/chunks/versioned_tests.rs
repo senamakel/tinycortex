@@ -387,17 +387,17 @@ async fn plain_upsert_keeps_default_lifecycle_implicit() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn explicit_null_lifecycle_suppresses_implicit_admission() {
+async fn legacy_import_without_lifecycle_preserves_missing_admission() {
     let config = config().await;
     let value = chunk("legacy-null-lifecycle", "inline");
-    super::super::store::upsert_chunks(&config, std::slice::from_ref(&value)).unwrap();
-    write_state(
+    let snapshot = capture_head(&config).unwrap();
+    upsert_chunks_at(
         &config,
-        StateChange {
-            collection: CHUNK_LIFECYCLE.to_owned(),
-            key: value.id.clone(),
-            value: Some(Value::Null),
-        },
+        &snapshot,
+        &[value.clone()],
+        &[value.clone()],
+        &[],
+        None,
     )
     .unwrap();
 
@@ -406,9 +406,7 @@ async fn explicit_null_lifecycle_suppresses_implicit_admission() {
         None
     );
     let (_, states) = list_chunk_snapshot(&config, &[CHUNK_LIFECYCLE]).unwrap();
-    assert!(states[CHUNK_LIFECYCLE]
-        .iter()
-        .any(|(key, state)| key == &value.id && state == &Value::Null));
+    assert!(states[CHUNK_LIFECYCLE].is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

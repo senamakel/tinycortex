@@ -65,6 +65,14 @@ pub fn update_chunk_content_sha256(
     super::versioned::update_chunk_content_sha256(config, chunk_id, new_sha256)
 }
 
+pub async fn update_chunk_content_sha256_async(
+    config: &MemoryConfig,
+    chunk_id: &str,
+    new_sha256: &str,
+) -> Result<()> {
+    super::versioned::update_chunk_content_sha256_async(config, chunk_id, new_sha256).await
+}
+
 pub fn update_summary_content_sha256(
     config: &MemoryConfig,
     summary_id: &str,

@@ -330,6 +330,32 @@ pub(crate) fn update_chunk_content_sha256(
     Ok(())
 }
 
+pub(crate) async fn update_chunk_content_sha256_async(
+    config: &MemoryConfig,
+    chunk_id: &str,
+    new_sha256: &str,
+) -> Result<()> {
+    let Some(current) = read_state_async(config, CHUNK_CONTENT_POINTERS, chunk_id).await? else {
+        return Ok(());
+    };
+    let mut pointer: ChunkContentPointer = serde_json::from_value(current.clone())?;
+    pointer.content_sha256 = new_sha256.to_owned();
+    let expected = StateChange {
+        collection: CHUNK_CONTENT_POINTERS.into(),
+        key: chunk_id.into(),
+        value: Some(current),
+    };
+    let update = StateChange {
+        collection: CHUNK_CONTENT_POINTERS.into(),
+        key: chunk_id.into(),
+        value: Some(serde_json::to_value(pointer)?),
+    };
+    if !commit_if_state_matches_async(config, &[expected], &[], &[update]).await? {
+        anyhow::bail!("chunk content pointer changed while updating its hash");
+    }
+    Ok(())
+}
+
 fn commit_operation(
     config: &MemoryConfig,
     chunks: &[Chunk],
