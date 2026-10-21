@@ -122,7 +122,7 @@ impl ConversationStore {
     }
 
     fn document_id(thread_id: &str) -> String {
-        hex(thread_id.as_bytes())
+        format!("thread:{}", hex(thread_id.as_bytes()))
     }
 
     async fn read_stream(&self, thread_id: &str) -> Result<(Vec<(u64, Event)>, u64), String> {
@@ -317,9 +317,6 @@ impl ConversationStore {
             updated_at,
             messages,
         } = transcript;
-        if thread.id.trim().is_empty() {
-            return Err("legacy conversation thread ID is empty".into());
-        }
         let mut expected_thread = thread.clone();
         expected_thread.is_active = true;
         expected_thread.message_count = messages.len();
