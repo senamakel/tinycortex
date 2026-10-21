@@ -4,7 +4,6 @@ use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use tinystoragedrivers_api::StreamStore;
 
 use crate::memory::config::MemoryConfig;
 
@@ -49,6 +48,7 @@ pub fn append_audit_entry(config: &MemoryConfig, entry: &SyncAuditEntry) -> anyh
     let value = serde_json::to_value(entry)?;
     blocking
         .run(async move { streams.append(AUDIT_STREAM, value).await })
+        .map_err(anyhow::Error::from)?
         .map_err(anyhow::Error::from)?;
     tracing::debug!(source_id = %entry.source_id, success = entry.success, "[memory_sync:audit] entry appended");
     Ok(())
