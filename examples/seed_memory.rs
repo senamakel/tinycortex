@@ -106,9 +106,9 @@ async fn seed_skill_docs(config: &MemoryConfig) -> anyhow::Result<usize> {
         ],
         "documentsPersisted": docs.len(),
     });
-    std::fs::create_dir_all(root)?;
+    std::fs::create_dir_all(&config.workspace)?;
     std::fs::write(
-        root.join("sync_manifest.json"),
+        config.workspace.join("sync_manifest.json"),
         serde_json::to_vec_pretty(&manifest)?,
     )?;
     Ok(docs.len())
