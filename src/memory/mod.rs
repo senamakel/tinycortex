@@ -109,12 +109,12 @@ pub mod providers;
 #[cfg(feature = "persona")]
 pub mod persona;
 
-/// Contact resolution and scoring: a SQLite store of people, handle aliases and
+/// Contact resolution and scoring: a host-bound document store of people, handle aliases and
 /// interactions, a deterministic (handle | email | display name) → `PersonId`
 /// resolver, and a recency × frequency × reciprocity × depth scorer.
 ///
 /// Gated behind the default-off `people` feature, which implies `tokio` — the
-/// store shares its connection across tasks. The macOS address-book seed
+/// store uses async document operations. The macOS address-book seed
 /// source additionally requires `contacts`.
 ///
 /// This is storage, so it belongs to the engine rather than to the memory

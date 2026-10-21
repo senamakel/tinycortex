@@ -157,6 +157,9 @@ async fn run_once_claims_and_completes_a_flush_stale_job() {
 
 #[tokio::test]
 async fn run_once_reschedules_reembed_jobs_that_defer() {
+    let _flag_guard = crate::memory::queue::test_support::BACKFILL_FLAG_TEST_LOCK
+        .lock()
+        .await;
     let (_tmp, cfg) = test_config();
     let mut d = RecordingDelegates::admitting();
     d.signature = "provider=test;model=x;dims=3".into();
@@ -183,7 +186,7 @@ async fn run_once_reschedules_reembed_jobs_that_defer() {
 
 #[test]
 fn terminal_reembed_failure_clears_process_backfill_flag() {
-    let _flag_guard = crate::memory::queue::test_support::BACKFILL_FLAG_TEST_LOCK.lock();
+    let _flag_guard = crate::memory::queue::test_support::BACKFILL_FLAG_TEST_LOCK.blocking_lock();
     let (_tmp, cfg) = test_config();
     let mut new_job = NewJob::reembed_backfill(&ReembedBackfillPayload {
         signature: "provider=test;model=terminal;dims=3".into(),
@@ -205,7 +208,7 @@ fn terminal_reembed_failure_clears_process_backfill_flag() {
 
 #[test]
 fn committed_reembed_defer_keeps_backfill_hint_until_completion() {
-    let _flag_guard = crate::memory::queue::test_support::BACKFILL_FLAG_TEST_LOCK.lock();
+    let _flag_guard = crate::memory::queue::test_support::BACKFILL_FLAG_TEST_LOCK.blocking_lock();
     let (_tmp, cfg) = test_config();
     let new_job = NewJob::reembed_backfill(&ReembedBackfillPayload {
         signature: "provider=test;model=defer;dims=3".into(),
@@ -302,6 +305,9 @@ fn completed_seal_rearms_same_level_when_live_buffer_still_crosses_gate() {
 async fn run_once_holds_an_llm_permit_for_llm_bound_jobs() {
     // While a single worker is sequential, the gate must still be acquired and
     // released around the llm-bound handler so it ends free.
+    let _flag_guard = crate::memory::queue::test_support::BACKFILL_FLAG_TEST_LOCK
+        .lock()
+        .await;
     let (_tmp, cfg) = test_config();
     let d = RecordingDelegates::admitting();
     let new_job = NewJob::reembed_backfill(&ReembedBackfillPayload {
@@ -319,6 +325,9 @@ async fn run_once_holds_an_llm_permit_for_llm_bound_jobs() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn run_once_defers_instead_of_blocking_when_llm_gate_is_full() {
+    let _flag_guard = crate::memory::queue::test_support::BACKFILL_FLAG_TEST_LOCK
+        .lock()
+        .await;
     let (_tmp, cfg) = test_config();
     let d = RecordingDelegates::admitting();
     let gate = crate::memory::queue::gate::LlmGate::new(1);

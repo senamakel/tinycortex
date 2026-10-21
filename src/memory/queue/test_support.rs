@@ -21,7 +21,8 @@ use crate::memory::queue::handlers::{
 use crate::memory::queue::types::{AppendTarget, NodeRef, SealDocumentPayload, SealPayload};
 
 /// Serializes tests that mutate the process-wide re-embed backfill flag.
-pub(crate) static BACKFILL_FLAG_TEST_LOCK: Mutex<()> = parking_lot::const_mutex(());
+pub(crate) static BACKFILL_FLAG_TEST_LOCK: tokio::sync::Mutex<()> =
+    tokio::sync::Mutex::const_new(());
 
 /// Observable call counters, cloneable so a test can read them after `drain`.
 #[derive(Default)]

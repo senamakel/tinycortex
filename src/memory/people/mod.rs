@@ -8,11 +8,18 @@
 //! `chronicle`, `nudges`, or UI. Integration happens in later slices.
 
 pub mod address_book;
-pub mod migrations;
+pub mod collections;
+pub mod legacy_import;
 pub mod resolver;
 pub mod scorer;
 pub mod store;
 pub mod types;
 
+pub use collections::collections;
+
 #[cfg(test)]
+pub(crate) mod test_support;
+
+#[cfg(test)]
+#[path = "people_tests.rs"]
 mod tests;

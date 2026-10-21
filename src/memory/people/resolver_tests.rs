@@ -4,7 +4,7 @@ use crate::memory::people::types::AddressBookContact;
 
 #[tokio::test]
 async fn resolve_returns_none_for_unknown_handle() {
-    let s = PeopleStore::open_in_memory().unwrap();
+    let s = crate::memory::people::test_support::store();
     let r = HandleResolver::new(&s);
     let got = r.resolve(&Handle::Email("x@y.z".into())).await.unwrap();
     assert!(got.is_none());
@@ -12,7 +12,7 @@ async fn resolve_returns_none_for_unknown_handle() {
 
 #[tokio::test]
 async fn resolve_or_create_is_deterministic_across_case_and_whitespace() {
-    let s = PeopleStore::open_in_memory().unwrap();
+    let s = crate::memory::people::test_support::store();
     let r = HandleResolver::new(&s);
     let a = r
         .resolve_or_create(&Handle::Email("Sarah@Example.COM".into()))
@@ -27,7 +27,7 @@ async fn resolve_or_create_is_deterministic_across_case_and_whitespace() {
 
 #[tokio::test]
 async fn concurrent_resolve_or_create_returns_one_database_id() {
-    let s = PeopleStore::open_in_memory().unwrap();
+    let s = crate::memory::people::test_support::store();
     let r = HandleResolver::new(&s);
     let handles: Vec<_> = (0..16)
         .map(|_| Handle::Email("Race@Example.COM".into()))
@@ -46,7 +46,7 @@ async fn concurrent_resolve_or_create_returns_one_database_id() {
 
 #[tokio::test]
 async fn same_email_different_display_name_resolve_same_id() {
-    let s = PeopleStore::open_in_memory().unwrap();
+    let s = crate::memory::people::test_support::store();
     let r = HandleResolver::new(&s);
     let via_email = r
         .resolve_or_create(&Handle::Email("a@b.c".into()))
@@ -71,7 +71,7 @@ async fn same_email_different_display_name_resolve_same_id() {
 
 #[tokio::test]
 async fn distinct_handles_without_linking_produce_distinct_ids() {
-    let s = PeopleStore::open_in_memory().unwrap();
+    let s = crate::memory::people::test_support::store();
     let r = HandleResolver::new(&s);
     let a = r
         .resolve_or_create(&Handle::Email("a@b.c".into()))
@@ -86,7 +86,7 @@ async fn distinct_handles_without_linking_produce_distinct_ids() {
 
 #[tokio::test]
 async fn seed_from_address_book_populates_store() {
-    let s = PeopleStore::open_in_memory().unwrap();
+    let s = crate::memory::people::test_support::store();
     let r = HandleResolver::new(&s);
 
     let source = MockContactsSource::ok(vec![
@@ -134,7 +134,7 @@ async fn seed_from_address_book_populates_store() {
 
 #[tokio::test]
 async fn seed_from_address_book_permission_denied_is_propagated() {
-    let s = PeopleStore::open_in_memory().unwrap();
+    let s = crate::memory::people::test_support::store();
     let r = HandleResolver::new(&s);
 
     let source = MockContactsSource::permission_denied();
@@ -151,7 +151,7 @@ async fn seed_from_address_book_permission_denied_is_propagated() {
 
 #[tokio::test]
 async fn seed_is_idempotent() {
-    let s = PeopleStore::open_in_memory().unwrap();
+    let s = crate::memory::people::test_support::store();
     let r = HandleResolver::new(&s);
 
     let source = MockContactsSource::ok(vec![AddressBookContact {
@@ -172,7 +172,7 @@ async fn seed_is_idempotent() {
 
 #[tokio::test]
 async fn contact_with_only_display_name_is_seeded() {
-    let s = PeopleStore::open_in_memory().unwrap();
+    let s = crate::memory::people::test_support::store();
     let r = HandleResolver::new(&s);
 
     let source = MockContactsSource::ok(vec![AddressBookContact {
@@ -187,7 +187,7 @@ async fn contact_with_only_display_name_is_seeded() {
 
 #[tokio::test]
 async fn contact_with_no_fields_is_skipped() {
-    let s = PeopleStore::open_in_memory().unwrap();
+    let s = crate::memory::people::test_support::store();
     let r = HandleResolver::new(&s);
 
     let source = MockContactsSource::ok(vec![AddressBookContact {
@@ -212,7 +212,7 @@ async fn contact_with_no_fields_is_skipped() {
 /// must NOT be merged — they may be homonymous individuals.
 #[tokio::test]
 async fn same_display_name_from_different_sources_does_not_merge() {
-    let s = PeopleStore::open_in_memory().unwrap();
+    let s = crate::memory::people::test_support::store();
     let r = HandleResolver::new(&s);
 
     // Source A — email-backed identity
@@ -286,7 +286,7 @@ async fn same_display_name_from_different_sources_does_not_merge() {
 /// canonical handle.
 #[tokio::test]
 async fn same_email_from_two_sources_collapses_to_one_person() {
-    let s = PeopleStore::open_in_memory().unwrap();
+    let s = crate::memory::people::test_support::store();
     let r = HandleResolver::new(&s);
 
     // Simulate two different ingestion paths (gmail vs slack) that both
@@ -320,7 +320,7 @@ async fn same_email_from_two_sources_collapses_to_one_person() {
 /// (issue#1538).
 #[tokio::test]
 async fn phone_and_email_from_different_sources_are_not_merged_without_link() {
-    let s = PeopleStore::open_in_memory().unwrap();
+    let s = crate::memory::people::test_support::store();
     let r = HandleResolver::new(&s);
 
     // iMessage source sees only a phone.

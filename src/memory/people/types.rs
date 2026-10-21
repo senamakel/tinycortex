@@ -61,7 +61,7 @@ impl Handle {
         }
     }
 
-    /// `(kind, value)` tuple suitable for use as a SQL key.
+    /// `(kind, value)` pair used to construct the canonical handle key.
     pub fn as_key(&self) -> (&'static str, &str) {
         match self {
             Handle::IMessage(s) => ("imessage", s.as_str()),
