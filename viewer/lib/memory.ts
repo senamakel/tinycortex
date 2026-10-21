@@ -66,7 +66,7 @@ function rowToDoc(namespace: string | null, value: Record<string, unknown>, upda
 export async function listSkillDocs(workspace: string): Promise<SkillDoc[]> {
   const snapshot = await readOwnerSnapshot(workspace);
   return snapshot.skill_documents
-    .filter((row) => row.key.startsWith(SKILLDOC_NS_PREFIX))
+    .filter((row) => row.namespace?.startsWith(SKILLDOC_NS_PREFIX))
     .map((row) => rowToDoc(row.namespace, row.value, row.updated_at))
     .sort((a, b) => (b.updatedAt ?? 0) - (a.updatedAt ?? 0));
 }

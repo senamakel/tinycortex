@@ -28,7 +28,8 @@ TINYCORTEX_WORKSPACE=/tmp/tinycortex-demo \
 TINYCORTEX_WORKSPACE=/tmp/tinycortex-demo \
   cargo run --example composio_harness --features sync
 
-# 2. Build the standalone owner inspector.+cargo build --manifest-path viewer/inspector/Cargo.toml --locked
+# 2. Build the standalone owner inspector.
+cargo build --manifest-path viewer/inspector/Cargo.toml --locked
 
 # 3. Point the viewer at the workspace and explicitly configured owner storage.
 cd viewer
