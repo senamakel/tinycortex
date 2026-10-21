@@ -477,9 +477,7 @@ async fn prepare_chunk_upsert_state_changes_at(
             prepared.push(StateChange {
                 collection: CHUNK_LIFECYCLE.to_owned(),
                 key: chunk.id.clone(),
-                value: Some(serde_json::json!({
-                    "status": super::store::CHUNK_STATUS_ADMITTED
-                })),
+                value: None,
             });
         }
         // Avoid persisting tombstones for pointers that never existed while
