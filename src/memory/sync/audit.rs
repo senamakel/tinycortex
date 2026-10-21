@@ -19,7 +19,7 @@ struct LegacyAuditRecord {
     entry: SyncAuditEntry,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct SyncAuditEntry {
     pub timestamp: DateTime<Utc>,
     pub source_id: String,
