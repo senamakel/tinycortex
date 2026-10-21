@@ -143,7 +143,10 @@ fn matching_chunks(
                 .push(occurrence);
         }
     }
-    let requested_entity_ids = query.entity_ids.iter().collect::<std::collections::HashSet<_>>();
+    let requested_entity_ids = query
+        .entity_ids
+        .iter()
+        .collect::<std::collections::HashSet<_>>();
     let requested_entity_kinds = query
         .entity_kinds
         .iter()
@@ -174,7 +177,10 @@ fn matching_chunks(
         {
             return false;
         }
-        let occurrences = indexed_entities.get(&chunk.id).map(Vec::as_slice).unwrap_or(&[]);
+        let occurrences = indexed_entities
+            .get(&chunk.id)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
         if (!query.entity_ids.is_empty()
             && !occurrences
                 .iter()
