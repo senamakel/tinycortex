@@ -222,6 +222,21 @@ fn embedding_signature_format_is_stable() {
     assert_eq!(backend.signature(), "provider=fake;model=fake;dims=7");
 }
 
+#[test]
+fn vector_store_uses_the_prepared_host_document_port() {
+    let config = crate::memory::chunks::test_support::host_config("unused-vector-workspace");
+    let store = VectorStore::from_config(&config, Arc::new(FakeEmbedding { dims: 2 })).unwrap();
+
+    store
+        .insert_with_vector("host-backed", "notes", "text", &[1.0, 0.0], json!({"source": "test"}))
+        .unwrap();
+
+    let results = store.search_by_vector("notes", &[1.0, 0.0], 1).unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].id, "host-backed");
+    assert_eq!(results[0].metadata["source"], "test");
+}
+
 #[tokio::test]
 async fn inert_embedding_is_deterministic_zero_vector_mock_backend() {
     let backend = InertEmbedding::new(3);
