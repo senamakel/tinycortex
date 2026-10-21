@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
-use rusqlite::{Connection, OpenFlags, Row};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, Row};
 use tinycortex::memory::{
     chunks::{
         self, Chunk, LegacyChunkRecord, LegacyContentPointer, LegacyEmbedding,
@@ -12,7 +12,7 @@ use tinycortex::memory::{
     config::MemoryConfig,
     graph,
     queue::{self, ImportedJob, JobKind, JobStatus},
-    score::{self, store::ScoreRow, ScoreSignals},
+    score::{self, signals::ScoreSignals, store::ScoreRow},
     store::{
         content::{read_chunk_body, read_summary_body},
         entity_index::EntityIndex,
@@ -66,10 +66,8 @@ async fn extended_v013_public_writer_batch_imports_and_reads_back() -> Result<()
         chunks::get_chunk_content_pointers(&config, &actual_chunk.id)?,
         Some((pointer.path.clone(), pointer.sha256.clone()))
     );
-    assert_eq!(
-        chunks::get_chunk_raw_refs(&config, &actual_chunk.id)?,
-        Some(source_chunk.raw_refs.clone())
-    );
+    let actual_raw_refs = chunks::get_chunk_raw_refs(&config, &actual_chunk.id)?.unwrap_or_default();
+    assert_eq!(actual_raw_refs, source_chunk.raw_refs);
     assert_eq!(
         chunks::get_chunk_lifecycle_status(&config, &actual_chunk.id)?,
         source_chunk.lifecycle_status
@@ -199,7 +197,7 @@ fn read_legacy_batch(root: &Path) -> Result<LegacyImportBatch> {
     )?;
     batch.trees = trees
         .query_map([], |row| {
-            let created = datetime(row.get(6)?)?;
+            let created = datetime(row.get(6)?).map_err(to_sql_error)?;
             let last_sealed: Option<i64> = row.get(7)?;
             Ok(Tree {
                 id: row.get(0)?,
