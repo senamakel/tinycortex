@@ -64,6 +64,9 @@ async fn drain_runs_the_full_extract_append_seal_pipeline() {
 #[tokio::test]
 async fn drain_terminates_on_a_deferred_job() {
     use crate::memory::queue::types::ReembedBackfillPayload;
+    let _flag_guard = crate::memory::queue::test_support::BACKFILL_FLAG_TEST_LOCK
+        .lock()
+        .await;
     let (_tmp, cfg) = test_config();
     let d = RecordingDelegates::admitting();
     *d.reembed.lock() =

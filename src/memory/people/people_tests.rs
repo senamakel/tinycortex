@@ -13,7 +13,7 @@ use crate::memory::people::types::{Handle, PersonId};
 ///
 /// The slot is process-wide, so two tests rebinding it concurrently race and
 /// either may observe the other's store through `get()`.
-static GLOBAL_STORE_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+static GLOBAL_STORE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 #[tokio::test]
 async fn resolver_and_store_cooperate_across_handle_kinds() {
@@ -61,7 +61,7 @@ fn address_book_is_empty_on_non_mac() {
 fn init_rebinds_global_store_using_prepared_host_configs() {
     use crate::memory::people::store;
 
-    let _serial = GLOBAL_STORE_LOCK.lock();
+    let _serial = GLOBAL_STORE_LOCK.blocking_lock();
 
     let (_ws_a, config_a) = crate::memory::people::test_support::config();
     let store_a = store::init(&config_a).unwrap();
@@ -100,7 +100,7 @@ async fn init_rebinds_same_workspace_to_new_host_storage_without_leaking_records
     use tinystoragedrivers_api::Storage;
     use tinystoragedrivers_types::Scope;
 
-    let _serial = GLOBAL_STORE_LOCK.lock();
+    let _serial = GLOBAL_STORE_LOCK.lock().await;
     let workspace = tempfile::tempdir().unwrap();
     let first = crate::memory::chunks::test_support::host_config(workspace.path());
     let first_store = store::init(&first).unwrap();
