@@ -115,21 +115,16 @@ pub async fn plan_append_node_for_queue(
 
     let (item_id, token_delta, timestamp, node_mutations) = match node {
         crate::memory::queue::NodeRef::Leaf { chunk_id } => {
-            let keys = [
-                StateKey {
-                    collection: c::CHUNKS.to_owned(),
-                    key: chunk_id.clone(),
-                },
-                StateKey {
-                    collection: c::CHUNK_LIFECYCLE.to_owned(),
-                    key: chunk_id.clone(),
-                },
-            ];
-            let values = read_state_keys_async(config, &keys).await?;
-            let Some(chunk_value) = values[0].clone() else {
+            let Some(chunk) = crate::memory::chunks::get_chunk_async(config, chunk_id).await?
+            else {
                 return Ok(None);
             };
-            if values[1]
+            let keys = [StateKey {
+                collection: c::CHUNK_LIFECYCLE.to_owned(),
+                key: chunk_id.clone(),
+            }];
+            let values = read_state_keys_async(config, &keys).await?;
+            if values[0]
                 .as_ref()
                 .and_then(|v| v.get("status"))
                 .and_then(serde_json::Value::as_str)
@@ -137,25 +132,16 @@ pub async fn plan_append_node_for_queue(
             {
                 return Ok(None);
             }
-            let chunk: crate::memory::chunks::Chunk = serde_json::from_value(chunk_value.clone())?;
             (
                 chunk_id.clone(),
                 i64::from(chunk.token_count),
                 chunk.created_at,
-                vec![
-                    JobMutation {
-                        collection: C::Chunks,
-                        key: chunk_id.clone(),
-                        expected: Some(chunk_value.clone()),
-                        value: Some(chunk_value),
-                    },
-                    JobMutation {
-                        collection: C::ChunkLifecycle,
-                        key: chunk_id.clone(),
-                        expected: values[1].clone(),
-                        value: values[1].clone(),
-                    },
-                ],
+                vec![JobMutation {
+                    collection: C::ChunkLifecycle,
+                    key: chunk_id.clone(),
+                    expected: values[0].clone(),
+                    value: values[0].clone(),
+                }],
             )
         }
         crate::memory::queue::NodeRef::Summary { summary_id } => {

@@ -127,9 +127,9 @@ pub fn set_chunk_embedding_for_signature(
 
 /// Plan one queue-owned embedding write without publishing it.
 ///
-/// The chunk row is carried as a guarded no-op mutation so a concurrent chunk
-/// deletion fences the vector write during the same lease settlement. The
-/// existing vector is replaced and any matching re-embed skip is cleared.
+/// The lifecycle row is carried as a guarded no-op mutation so a concurrent
+/// chunk deletion fences the vector write during the same lease settlement.
+/// The existing vector is replaced and any matching re-embed skip is cleared.
 pub async fn plan_chunk_embedding_for_queue(
     config: &MemoryConfig,
     chunk_id: &str,
@@ -140,9 +140,12 @@ pub async fn plan_chunk_embedding_for_queue(
     let model_signature = validate_reembed_skip_key("model_signature", model_signature)?;
     let dim = i64::try_from(embedding.len()).context("embedding dimension does not fit i64")?;
     let key = chunk_embedding_key(chunk_id, model_signature);
+    let _chunk = super::versioned::get_chunk_async(config, chunk_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("cannot plan an embedding for missing chunk {chunk_id}"))?;
     let keys = [
         super::versioned::StateKey {
-            collection: super::collections::CHUNKS.to_owned(),
+            collection: super::collections::CHUNK_LIFECYCLE.to_owned(),
             key: chunk_id.to_owned(),
         },
         super::versioned::StateKey {
@@ -155,9 +158,14 @@ pub async fn plan_chunk_embedding_for_queue(
         },
     ];
     let values = super::versioned::read_state_keys_async(config, &keys).await?;
-    let Some(chunk) = values[0].clone() else {
-        anyhow::bail!("cannot plan an embedding for missing chunk {chunk_id}");
-    };
+    anyhow::ensure!(
+        values[0]
+            .as_ref()
+            .and_then(|value| value.get("status"))
+            .and_then(serde_json::Value::as_str)
+            != Some("deleted"),
+        "cannot plan an embedding for deleted chunk {chunk_id}"
+    );
     let record = ChunkEmbeddingRecord {
         chunk_id: chunk_id.to_owned(),
         model_signature: model_signature.to_owned(),
@@ -170,10 +178,10 @@ pub async fn plan_chunk_embedding_for_queue(
         result: (),
         mutations: vec![
             JobMutation {
-                collection: Collection::Chunks,
+                collection: Collection::ChunkLifecycle,
                 key: chunk_id.to_owned(),
-                expected: Some(chunk.clone()),
-                value: Some(chunk),
+                expected: values[0].clone(),
+                value: values[0].clone(),
             },
             JobMutation {
                 collection: Collection::ChunkEmbeddings,

@@ -141,10 +141,6 @@ fn config() -> (TempDir, crate::memory::config::MemoryConfig) {
 #[tokio::test(flavor = "current_thread")]
 async fn queued_append_publishes_buffer_with_lease_settlement() {
     let (_tmp, config) = config();
-    let tree =
-        crate::memory::tree::get_or_create_tree_async(&config, TreeKind::Topic, "queue-append")
-            .await
-            .unwrap();
     let chunk = chunk(3, 1_700_000_000_000);
     upsert_chunks_async(&config, std::slice::from_ref(&chunk))
         .await
@@ -153,8 +149,8 @@ async fn queued_append_publishes_buffer_with_lease_settlement() {
         node: NodeRef::Leaf {
             chunk_id: chunk.id.clone(),
         },
-        target: AppendTarget::Topic {
-            tree_id: tree.id.clone(),
+        target: AppendTarget::Source {
+            source_id: "queue-append-source".to_owned(),
         },
     };
     let delegate = SealDelegate {
@@ -170,10 +166,12 @@ async fn queued_append_publishes_buffer_with_lease_settlement() {
         .unwrap()
         .unwrap();
     assert!(!planned.mutations.is_empty());
-    assert!(store::get_buffer_async(&config, &tree.id, 0)
-        .await
-        .unwrap()
-        .is_empty());
+    assert!(
+        store::get_tree_by_scope_async(&config, TreeKind::Source, "queue-append-source",)
+            .await
+            .unwrap()
+            .is_none()
+    );
 
     let job_id = crate::memory::queue::store::enqueue_async(
         &config,
@@ -185,6 +183,10 @@ async fn queued_append_publishes_buffer_with_lease_settlement() {
     assert!(crate::memory::queue::run_once(&config, &delegate)
         .await
         .unwrap());
+    let tree = store::get_tree_by_scope_async(&config, TreeKind::Source, "queue-append-source")
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(
         store::get_buffer_async(&config, &tree.id, 0)
             .await

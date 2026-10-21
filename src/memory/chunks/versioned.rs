@@ -705,39 +705,78 @@ pub(crate) fn list_chunk_snapshot(
     config
         .storage_blocking()?
         .run(async move {
-            let mut ids = HashSet::new();
-            for collection in [CHUNK_VERSIONS, CHUNKS] {
-                let mut query = Query::all().limit(PAGE_SIZE);
-                loop {
-                    let page = documents.query(collection, &query).await?;
-                    for record in page.items {
-                        if collection == CHUNKS {
-                            ids.insert(record.id);
-                        } else {
-                            if record.meta.schema != RECORD_SCHEMA
-                                || record.meta.expires_ms.is_some()
-                            {
-                                return Err(tinystoragedrivers_types::StorageError::backend(
-                                    "chunk version has unexpected schema or expiry metadata",
-                                ));
-                            }
-                            let version: ChunkVersion = serde_json::from_value(record.doc)
-                                .map_err(tinystoragedrivers_types::StorageError::from)?;
-                            if version_id(&version.logical_id, &version.operation_id) == record.id {
-                                ids.insert(version.logical_id);
-                            }
-                        }
+            // Resolve immutable versions against one in-memory copy of the
+            // captured head's ancestry. Querying CHUNK_VERSIONS once per
+            // logical id makes a full listing quadratic on stores whose
+            // filtered query scans the collection.
+            let manifests = load_operation_manifests(&*documents).await?;
+            let visible = visible_operations_at_snapshot(&snapshot, &manifests)?;
+            let mut latest = HashMap::<String, (u64, Chunk)>::new();
+            let mut query = Query::all().limit(PAGE_SIZE);
+            loop {
+                let page = documents.query(CHUNK_VERSIONS, &query).await?;
+                for record in page.items {
+                    if record.meta.schema != RECORD_SCHEMA || record.meta.expires_ms.is_some() {
+                        return Err(tinystoragedrivers_types::StorageError::backend(
+                            "chunk version has unexpected schema or expiry metadata",
+                        ));
                     }
-                    match page.next {
-                        Some(cursor) => query = query.clone().after(cursor),
-                        None => break,
+                    let version: ChunkVersion = serde_json::from_value(record.doc)
+                        .map_err(tinystoragedrivers_types::StorageError::from)?;
+                    if version.chunk.id != version.logical_id
+                        || version_id(&version.logical_id, &version.operation_id) != record.id
+                    {
+                        // Match the point-read behavior: immutable rows with
+                        // inconsistent keys are not candidates for a logical
+                        // chunk value.
+                        continue;
+                    }
+                    let Some(manifest) = visible.get(&version.operation_id) else {
+                        continue;
+                    };
+                    if manifest.revision != version.revision
+                        || !manifest.writes.iter().any(|write| {
+                            write.logical_id == version.logical_id && write.version_id == record.id
+                        })
+                    {
+                        continue;
+                    }
+                    let replace = latest
+                        .get(&version.logical_id)
+                        .is_none_or(|(revision, _)| version.revision > *revision);
+                    if replace {
+                        latest.insert(version.logical_id, (version.revision, version.chunk));
                     }
                 }
+                match page.next {
+                    Some(cursor) => query = query.clone().after(cursor),
+                    None => break,
+                }
             }
+
+            let mut legacy = HashMap::new();
+            let mut query = Query::all().limit(PAGE_SIZE);
+            loop {
+                let page = documents.query(CHUNKS, &query).await?;
+                for record in page.items {
+                    legacy.insert(record.id, record.doc);
+                }
+                match page.next {
+                    Some(cursor) => query = query.clone().after(cursor),
+                    None => break,
+                }
+            }
+            let mut ids = HashSet::new();
+            ids.extend(latest.keys().cloned());
+            ids.extend(legacy.keys().cloned());
             let mut chunks = Vec::with_capacity(ids.len());
             for id in ids {
-                if let Some(chunk) = read_chunk_at(&*documents, &snapshot, &id).await? {
+                if let Some((_, chunk)) = latest.remove(&id) {
                     chunks.push(chunk);
+                } else if let Some(value) = legacy.remove(&id) {
+                    chunks.push(serde_json::from_value(value).map_err(
+                        tinystoragedrivers_types::StorageError::from,
+                    )?);
                 }
             }
             let mut states = HashMap::new();
@@ -1345,6 +1384,96 @@ async fn read_state_at(
         }
     }
     Ok(None)
+}
+
+async fn load_operation_manifests(
+    documents: &dyn tinystoragedrivers_api::DocumentStore,
+) -> tinystoragedrivers_types::Result<HashMap<String, OperationManifest>> {
+    let mut manifests = HashMap::new();
+    let mut query = Query::all().limit(PAGE_SIZE);
+    loop {
+        let page = documents.query(OPERATIONS, &query).await?;
+        for row in page.items {
+            if row.meta.schema != RECORD_SCHEMA || row.meta.expires_ms.is_some() {
+                return Err(tinystoragedrivers_types::StorageError::backend(
+                    "operation manifest has unexpected schema or expiry metadata",
+                ));
+            }
+            let manifest: OperationManifest = serde_json::from_value(row.doc)
+                .map_err(tinystoragedrivers_types::StorageError::from)?;
+            manifests.insert(row.id, manifest);
+        }
+        match page.next {
+            Some(cursor) => query = query.clone().after(cursor),
+            None => break,
+        }
+    }
+    Ok(manifests)
+}
+
+fn visible_operations_at_snapshot(
+    snapshot: &HeadSnapshot,
+    manifests: &HashMap<String, OperationManifest>,
+) -> tinystoragedrivers_types::Result<HashMap<String, OperationManifest>> {
+    let mut visible = HashMap::new();
+    let (Some(head_id), Some(_)) = (snapshot.op_id.as_deref(), snapshot.version.as_ref()) else {
+        return Ok(visible);
+    };
+
+    let mut current_id = Some(head_id.to_owned());
+    let mut expected_revision = snapshot.revision;
+    let mut chain = Vec::new();
+    while let Some(id) = current_id {
+        let manifest = manifests.get(&id).ok_or_else(|| {
+            tinystoragedrivers_types::StorageError::backend(
+                "commit head references a missing operation manifest",
+            )
+        })?;
+        if manifest.op_id != id || manifest.revision != expected_revision {
+            return Err(tinystoragedrivers_types::StorageError::backend(
+                "commit head does not match its operation manifest",
+            ));
+        }
+        chain.push((id.clone(), manifest.clone()));
+        current_id = manifest.parent_op.clone();
+        if let Some(parent) = current_id.as_ref() {
+            if manifest.ancestors.first() != Some(parent) {
+                return Err(tinystoragedrivers_types::StorageError::backend(
+                    "operation manifest parent does not match its ancestor index",
+                ));
+            }
+            expected_revision = expected_revision.checked_sub(1).ok_or_else(|| {
+                tinystoragedrivers_types::StorageError::backend(
+                    "operation manifest revision underflow",
+                )
+            })?;
+        } else if expected_revision != 1 {
+            return Err(tinystoragedrivers_types::StorageError::backend(
+                "operation manifest chain ended before the root revision",
+            ));
+        }
+    }
+
+    // Validate the binary-lifting index used by point reads. The bulk reader
+    // follows parent links once, but must reject a corrupt index rather than
+    // disagreeing with point-read visibility at the same snapshot.
+    for (index, (_, manifest)) in chain.iter().enumerate() {
+        for (level, ancestor) in manifest.ancestors.iter().enumerate() {
+            let distance = 1_usize.checked_shl(level as u32).ok_or_else(|| {
+                tinystoragedrivers_types::StorageError::backend(
+                    "operation ancestor index is too deep",
+                )
+            })?;
+            let expected = index.checked_add(distance).and_then(|i| chain.get(i));
+            if expected.map(|(id, _)| id) != Some(ancestor) {
+                return Err(tinystoragedrivers_types::StorageError::backend(
+                    "operation manifest has an invalid ancestor index",
+                ));
+            }
+        }
+    }
+    visible.extend(chain);
+    Ok(visible)
 }
 
 async fn operation_contains_chunk_write(
