@@ -11,7 +11,7 @@ fn test_config() -> (TempDir, MemoryConfig) {
 
 #[test]
 fn backfill_flag_setters_are_wired() {
-    let _flag_guard = crate::memory::queue::test_support::BACKFILL_FLAG_TEST_LOCK.lock();
+    let _flag_guard = crate::memory::queue::test_support::BACKFILL_FLAG_TEST_LOCK.blocking_lock();
     // The flag is process-global and shared across parallel tests, so this only
     // exercises the setters compile/run path (it does not assert the value,
     // which other tests may concurrently toggle).

@@ -88,6 +88,9 @@ impl QueueDelegates for ReembedDelegate {
 
 #[tokio::test(flavor = "current_thread")]
 async fn queued_reembed_planner_keeps_vector_invisible_until_settlement() {
+    let _flag_guard = crate::memory::queue::test_support::BACKFILL_FLAG_TEST_LOCK
+        .lock()
+        .await;
     let tmp = TempDir::new().unwrap();
     let config = crate::memory::chunks::test_support::host_config(tmp.path());
     let timestamp = chrono::Utc::now();
@@ -161,6 +164,9 @@ async fn queued_reembed_planner_keeps_vector_invisible_until_settlement() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn a_preplanned_reembed_cannot_resurrect_a_deleted_chunk() {
+    let _flag_guard = crate::memory::queue::test_support::BACKFILL_FLAG_TEST_LOCK
+        .lock()
+        .await;
     let tmp = TempDir::new().unwrap();
     let config = crate::memory::chunks::test_support::host_config(tmp.path());
     let timestamp = chrono::Utc::now();
