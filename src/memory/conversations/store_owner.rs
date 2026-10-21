@@ -20,6 +20,7 @@ use super::types::{
 
 const STREAM_PREFIX: &str = "tinycortex:conversation:";
 const STREAM_PAGE: usize = 512;
+const MAX_WRITE_ATTEMPTS: usize = 128;
 
 /// Counts returned by [`ConversationStore::purge_threads`].
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -117,8 +118,9 @@ impl ConversationStore {
         let mut cursor = 0_u64;
         let mut events = Vec::new();
         while cursor < length {
+            let remaining = usize::try_from(length - cursor).unwrap_or(usize::MAX);
             let page = streams
-                .read_window(&name, cursor, STREAM_PAGE)
+                .read_window(&name, cursor, remaining.min(STREAM_PAGE))
                 .await
                 .map_err(|error| error.to_string())?;
             if page.is_empty() {
@@ -252,7 +254,7 @@ impl ConversationStore {
     async fn project(&self, thread_id: &str, snapshot: &ThreadSnapshot) -> Result<(), String> {
         let documents = self.storage.documents();
         let id = Self::document_id(thread_id);
-        for _ in 0..8 {
+        for _ in 0..MAX_WRITE_ATTEMPTS {
             let current = documents
                 .get(THREAD_INDEX, &id)
                 .await
@@ -316,7 +318,7 @@ impl ConversationStore {
         &self,
         request: CreateConversationThread,
     ) -> Result<ConversationThread, String> {
-        for _ in 0..8 {
+        for _ in 0..MAX_WRITE_ATTEMPTS {
             let before = self.snapshot(&request.id).await?;
             let mut thread = before.thread.clone().unwrap_or_else(|| ConversationThread {
                 id: request.id.clone(),
@@ -418,7 +420,7 @@ impl ConversationStore {
         thread_id: &str,
         message: ConversationMessage,
     ) -> Result<ConversationMessage, String> {
-        for _ in 0..8 {
+        for _ in 0..MAX_WRITE_ATTEMPTS {
             let before = self.snapshot(thread_id).await?;
             if before.thread.is_none() {
                 return Err(format!("thread {thread_id} not found"));
@@ -489,7 +491,7 @@ impl ConversationStore {
         title: &str,
         updated_at: &str,
     ) -> Result<ConversationThread, String> {
-        for _ in 0..8 {
+        for _ in 0..MAX_WRITE_ATTEMPTS {
             let before = self.snapshot(thread_id).await?;
             let mut thread = before
                 .thread
@@ -529,7 +531,7 @@ impl ConversationStore {
         updated_at: &str,
     ) -> Result<ConversationThread, String> {
         let labels = super::store::normalize_labels(labels);
-        for _ in 0..8 {
+        for _ in 0..MAX_WRITE_ATTEMPTS {
             let before = self.snapshot(thread_id).await?;
             let mut thread = before
                 .thread
@@ -568,7 +570,7 @@ impl ConversationStore {
         message_id: &str,
         patch: ConversationMessagePatch,
     ) -> Result<ConversationMessage, String> {
-        for _ in 0..8 {
+        for _ in 0..MAX_WRITE_ATTEMPTS {
             let snapshot = self.snapshot(thread_id).await?;
             let mut message = snapshot
                 .messages
@@ -607,7 +609,7 @@ impl ConversationStore {
         thread_id: &str,
         message_id: &str,
     ) -> Result<Option<usize>, String> {
-        for _ in 0..8 {
+        for _ in 0..MAX_WRITE_ATTEMPTS {
             let snapshot = self.snapshot(thread_id).await?;
             let Some(index) = snapshot
                 .messages
