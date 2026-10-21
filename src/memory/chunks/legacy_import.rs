@@ -105,6 +105,30 @@ pub struct LegacySourceGate {
     pub ingested_at_ms: i64,
 }
 
+/// Full-content pointer for a legacy summary body copied by the host.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LegacySummaryContent {
+    /// Summary identifier whose complete markdown is stored at this path.
+    pub summary_id: String,
+    /// Safe, forward-slash relative path beneath the host content root.
+    pub path: String,
+    /// SHA-256 of the complete summary body.
+    pub sha256: String,
+}
+
+/// Per-model summary embedding decoded from the source store.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LegacySummaryEmbedding {
+    /// Summary row identifier.
+    pub summary_id: String,
+    /// Stable model signature used by the source store.
+    pub model_signature: String,
+    /// Decoded vector values in their original order.
+    pub vector: Vec<f32>,
+    /// Historical creation time in epoch milliseconds.
+    pub created_at_ms: i64,
+}
+
 /// One import batch read by the host's legacy adapter.
 #[derive(Clone, Debug, Default)]
 pub struct LegacyImportBatch {
@@ -114,6 +138,10 @@ pub struct LegacyImportBatch {
     pub trees: Vec<Tree>,
     /// Sealed summaries and their original content.
     pub summaries: Vec<SummaryNode>,
+    /// Full-content pointers for summaries whose body was externalized.
+    pub summary_content: Vec<LegacySummaryContent>,
+    /// Per-model summary embedding rows.
+    pub summary_embeddings: Vec<LegacySummaryEmbedding>,
     /// Entity occurrences not already attached to a chunk record.
     pub entities: Vec<LegacyEntityOccurrence>,
     /// Existing aggregate edge weights; import does not increment them.
@@ -295,6 +323,36 @@ pub async fn import_legacy_batch(
                 c::SUMMARIES,
                 &format!("summary:{}", summary.id),
                 Some(serde_json::to_value(summary)?),
+            )?;
+        }
+        for content in &batch.summary_content {
+            add_desired(
+                &mut desired,
+                c::SUMMARY_CONTENT_POINTERS,
+                &format!("summary:{}", content.summary_id),
+                Some(serde_json::json!({
+                    "summary_id": content.summary_id,
+                    "content_path": content.path,
+                    "content_sha256": content.sha256,
+                })),
+            )?;
+        }
+        for embedding in &batch.summary_embeddings {
+            let key = super::embeddings::summary_embedding_key(
+                &embedding.summary_id,
+                &embedding.model_signature,
+            );
+            add_desired(
+                &mut desired,
+                c::SUMMARY_EMBEDDINGS,
+                &key,
+                Some(serde_json::json!({
+                    "summary_id": embedding.summary_id,
+                    "model_signature": embedding.model_signature,
+                    "vector": super::embeddings::embedding_to_blob(&embedding.vector),
+                    "dim": embedding.vector.len(),
+                    "created_at_ms": embedding.created_at_ms,
+                })),
             )?;
         }
         for edge in &batch.edges {
@@ -493,6 +551,25 @@ fn validate_batch(batch: &LegacyImportBatch) -> Result<()> {
             tree_ids.contains(summary.tree_id.as_str()),
             "legacy summary {} has no imported owning tree",
             summary.id
+        );
+    }
+    for content in &batch.summary_content {
+        anyhow::ensure!(
+            summary_ids.contains(content.summary_id.as_str())
+                && safe_relative_path(&content.path)
+                && is_sha256(&content.sha256),
+            "invalid legacy summary content pointer for {}",
+            content.summary_id
+        );
+    }
+    for embedding in &batch.summary_embeddings {
+        anyhow::ensure!(
+            summary_ids.contains(embedding.summary_id.as_str())
+                && !embedding.model_signature.trim().is_empty()
+                && !embedding.vector.is_empty()
+                && embedding.vector.iter().all(|value| value.is_finite()),
+            "invalid legacy summary embedding for {}",
+            embedding.summary_id
         );
     }
     let valid_nodes: HashSet<_> = chunk_ids

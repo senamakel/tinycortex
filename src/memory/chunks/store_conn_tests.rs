@@ -18,10 +18,12 @@ use super::{
     claim_source_ingest_tx, clear_chunk_reembed_skipped, clear_reembed_skipped_for_signature,
     content_root, count_chunks, db_path_for, delete_chunks_by_owner, delete_chunks_by_source,
     extraction_coverage, get_chunk, get_chunk_embedding, get_chunk_embedding_for_signature,
+    get_chunk_embedding_for_signature_async,
     get_chunk_embeddings_for_signature_batch, get_chunks_batch, is_source_ingested, list_chunks,
-    mark_chunk_reembed_skipped, set_chunk_embedding, set_chunk_embedding_for_signature,
-    tree_active_signature, upsert_chunks, upsert_staged_chunks, ListChunksQuery, DB_DIR,
-    GLOBAL_TOPIC_PURGE_MIGRATION_VERSION,
+    import_legacy_batch, mark_chunk_reembed_skipped, set_chunk_embedding,
+    set_chunk_embedding_for_signature, tree_active_signature, upsert_chunks,
+    upsert_staged_chunks, LegacyChunkRecord, LegacyEmbedding, LegacyImportBatch, ListChunksQuery,
+    DB_DIR, GLOBAL_TOPIC_PURGE_MIGRATION_VERSION, CHUNK_STATUS_ADMITTED,
 };
 use crate::memory::config::MemoryConfig;
 use chrono::{TimeZone, Utc};
@@ -151,77 +153,51 @@ fn with_connection_keeps_foreign_keys_on_for_every_call() {
     );
 }
 
-#[test]
-fn legacy_embeddings_migrate_to_sidecar_once() {
+#[tokio::test]
+async fn typed_legacy_embedding_import_preserves_signature_dimension_and_idempotence() {
     let (_tmp, cfg) = test_config();
-    let c_match = sample_chunk("slack:#eng", 0, 1_700_000_000_000);
-    let c_mismatch = sample_chunk("slack:#eng", 1, 1_700_000_000_001);
-    // First open runs the (no-op) migrations and sets user_version to latest.
-    upsert_chunks(&cfg, &[c_match.clone(), c_mismatch.clone()]).unwrap();
-
-    let sig = tree_active_signature(&cfg);
-    let dims = active_embedding_dims(&cfg);
-    let match_vec = vec![0.25f32; dims];
-    let mismatch_vec = vec![0.5f32; dims + 1];
-
-    // Simulate a pre-migration DB: legacy columns populated, gate reset to 0.
-    with_connection(&cfg, |conn| {
-        conn.execute(
-            "UPDATE mem_tree_chunks SET embedding = ?1 WHERE id = ?2",
-            params![embedding_to_blob(&match_vec), c_match.id],
-        )?;
-        conn.execute(
-            "UPDATE mem_tree_chunks SET embedding = ?1 WHERE id = ?2",
-            params![embedding_to_blob(&mismatch_vec), c_mismatch.id],
-        )?;
-        conn.pragma_update(None, "user_version", 0i64)?;
-        Ok(())
-    })
-    .unwrap();
-
-    invalidate_connection(&cfg);
-
+    let chunk = sample_chunk("legacy-embedding-source", 0, 1_700_000_000_000);
+    let vector = vec![0.25f32, 0.5, 0.75];
+    let signature = "provider=fixture;model=embedding;dims=3";
+    let batch = LegacyImportBatch {
+        chunks: vec![LegacyChunkRecord {
+            chunk: chunk.clone(),
+            content: None,
+            raw_refs: Vec::new(),
+            score: None,
+            lifecycle_status: Some(CHUNK_STATUS_ADMITTED.into()),
+            embedding: Some(LegacyEmbedding {
+                model_signature: signature.into(),
+                vector: vector.clone(),
+                created_at_ms: 1_699_999_000_000,
+            }),
+            entities: Vec::new(),
+        }],
+        ..Default::default()
+    };
+    import_legacy_batch(&cfg, &batch).await.unwrap();
     assert_eq!(
-        get_chunk_embedding_for_signature(&cfg, &c_match.id, &sig).unwrap(),
-        Some(match_vec.clone()),
-        "matching-dim legacy row must be copied to the sidecar at the active sig"
+        get_chunk_embedding_for_signature_async(&cfg, &chunk.id, signature)
+            .await
+            .unwrap(),
+        Some(vector.clone()),
+        "typed import must preserve the embedding values under their historical signature"
     );
-    assert!(
-        get_chunk_embedding_for_signature(&cfg, &c_mismatch.id, &sig)
-            .unwrap()
-            .is_none(),
-        "dim-mismatched legacy row must be skipped"
-    );
+    let rows = super::versioned::list_state_async(&cfg, super::collections::CHUNK_EMBEDDINGS)
+        .await
+        .unwrap();
+    let (_, value) = rows.first().unwrap();
+    assert_eq!(value["dim"], 3);
+    assert_eq!(value["created_at_ms"], 1_699_999_000_000i64);
 
-    with_connection(&cfg, |conn| {
-        let legacy: Option<Vec<u8>> = conn
-            .query_row(
-                "SELECT embedding FROM mem_tree_chunks WHERE id = ?1",
-                params![c_match.id],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert!(
-            legacy.is_some(),
-            "legacy column must be KEPT post-migration"
-        );
-        let v: i64 = conn
-            .query_row("PRAGMA user_version", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(
-            v, GLOBAL_TOPIC_PURGE_MIGRATION_VERSION,
-            "version gate must be set to the latest migration"
-        );
-        Ok(())
-    })
-    .unwrap();
-
-    // Idempotent: subsequent opens are no-ops.
-    with_connection(&cfg, |_| Ok(())).unwrap();
-    assert_eq!(
-        get_chunk_embedding_for_signature(&cfg, &c_match.id, &sig).unwrap(),
-        Some(match_vec)
-    );
+    let before_retry = super::versioned::capture_state_snapshot_async(&cfg)
+        .await
+        .unwrap();
+    import_legacy_batch(&cfg, &batch).await.unwrap();
+    let after_retry = super::versioned::capture_state_snapshot_async(&cfg)
+        .await
+        .unwrap();
+    assert_eq!(before_retry, after_retry, "retry must not append another owner commit");
 }
 
 #[test]

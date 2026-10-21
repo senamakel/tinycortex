@@ -109,6 +109,12 @@ fn fixture_batch() -> LegacyImportBatch {
         }],
         trees: vec![tree.clone()],
         summaries: vec![summary],
+        summary_content: vec![LegacySummaryContent {
+            summary_id: "legacy-summary".into(),
+            path: "summaries/legacy-source/l1.md".into(),
+            sha256: "b".repeat(64),
+        }],
+        summary_embeddings: Vec::new(),
         entities: Vec::new(),
         edges: vec![LegacyEntityEdge {
             entity_a: "person:ada".into(),
