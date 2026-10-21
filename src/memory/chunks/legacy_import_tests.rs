@@ -324,10 +324,9 @@ async fn typed_import_preserves_buffer_hotness_and_skip_history_idempotently() {
     let mut batch = fixture_batch();
     batch.chunks[0].score.as_mut().unwrap().chunk_id = batch.chunks[0].chunk.id.clone();
     let counts = import_legacy_batch(&config, &batch).await.unwrap();
-    let imported_snapshot =
-        crate::memory::chunks::versioned::capture_state_snapshot_async(&config)
-            .await
-            .unwrap();
+    let imported_snapshot = crate::memory::chunks::versioned::capture_state_snapshot_async(&config)
+        .await
+        .unwrap();
     assert_eq!(counts.buffers, 1);
     assert_eq!(counts.hotness, 1);
     assert_eq!(counts.reembed_skips, 2);
@@ -358,7 +357,10 @@ async fn typed_import_preserves_buffer_hotness_and_skip_history_idempotently() {
     .unwrap()
     .unwrap();
     assert_eq!(chunk_skip["reason"], batch.chunk_reembed_skips[0].reason);
-    assert_eq!(chunk_skip["skipped_at_ms"], batch.chunk_reembed_skips[0].skipped_at_ms);
+    assert_eq!(
+        chunk_skip["skipped_at_ms"],
+        batch.chunk_reembed_skips[0].skipped_at_ms
+    );
     let summary_skip = crate::memory::chunks::versioned::read_state_async(
         &config,
         crate::memory::chunks::collections::SUMMARY_REEMBED_SKIPS,
@@ -367,7 +369,10 @@ async fn typed_import_preserves_buffer_hotness_and_skip_history_idempotently() {
     .await
     .unwrap()
     .unwrap();
-    assert_eq!(summary_skip["reason"], batch.summary_reembed_skips[0].reason);
+    assert_eq!(
+        summary_skip["reason"],
+        batch.summary_reembed_skips[0].reason
+    );
     assert_eq!(
         summary_skip["skipped_at_ms"],
         batch.summary_reembed_skips[0].skipped_at_ms

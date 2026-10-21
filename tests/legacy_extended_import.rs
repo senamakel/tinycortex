@@ -6,9 +6,9 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension, Row};
 use sha2::{Digest, Sha256};
 use tinycortex::memory::{
     chunks::{
-        self, Chunk, LegacyChunkRecord, LegacyContentPointer, LegacyEmbedding, LegacyEntityEdge,
-        LegacyEntityOccurrence, LegacyImportBatch, LegacySourceGate, LegacySummaryContent,
-        LegacySummaryEmbedding, LegacyBuffer, LegacyChunkReembedSkip, LegacyHotness,
+        self, Chunk, LegacyBuffer, LegacyChunkRecord, LegacyChunkReembedSkip, LegacyContentPointer,
+        LegacyEmbedding, LegacyEntityEdge, LegacyEntityOccurrence, LegacyHotness,
+        LegacyImportBatch, LegacySourceGate, LegacySummaryContent, LegacySummaryEmbedding,
         LegacySummaryReembedSkip, RawRef, SourceKind,
     },
     config::MemoryConfig,
@@ -442,6 +442,79 @@ fn read_legacy_batch(root: &Path) -> Result<LegacyImportBatch> {
                 model_signature: row.get(1)?,
                 vector: decode_f32(row.get(2)?).map_err(to_sql_error)?,
                 created_at_ms: (created_at * 1000.0) as i64,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+
+    let mut buffers = conn.prepare(
+        "SELECT tree_id, level, item_ids_json, token_sum, oldest_at_ms \
+         FROM mem_tree_buffers ORDER BY tree_id, level",
+    )?;
+    batch.buffers = buffers
+        .query_map([], |row| {
+            let oldest_ms: Option<i64> = row.get(4)?;
+            Ok(LegacyBuffer {
+                buffer: tree::Buffer {
+                    tree_id: row.get(0)?,
+                    level: row.get::<_, i64>(1)?.max(0) as u32,
+                    item_ids: serde_json::from_str(&row.get::<_, String>(2)?)
+                        .map_err(to_sql_error)?,
+                    token_sum: row.get(3)?,
+                    oldest_at: oldest_ms.map(datetime).transpose().map_err(to_sql_error)?,
+                },
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+
+    let mut hotness = conn.prepare(
+        "SELECT entity_id, mention_count_30d, distinct_sources, last_seen_ms, \
+         query_hits_30d, graph_centrality, ingests_since_check, last_hotness, last_updated_ms \
+         FROM mem_tree_entity_hotness ORDER BY entity_id",
+    )?;
+    batch.hotness = hotness
+        .query_map([], |row| {
+            Ok(LegacyHotness {
+                counters: tree::HotnessCounters {
+                    entity_id: row.get(0)?,
+                    mention_count_30d: row.get::<_, i64>(1)?.max(0) as u32,
+                    distinct_sources: row.get::<_, i64>(2)?.max(0) as u32,
+                    last_seen_ms: row.get(3)?,
+                    query_hits_30d: row.get::<_, i64>(4)?.max(0) as u32,
+                    graph_centrality: row.get(5)?,
+                    ingests_since_check: row.get::<_, i64>(6)?.max(0) as u32,
+                    last_hotness: row.get(7)?,
+                    last_updated_ms: row.get(8)?,
+                },
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+
+    let mut chunk_skips = conn.prepare(
+        "SELECT chunk_id, model_signature, reason, skipped_at_ms \
+         FROM mem_tree_chunk_reembed_skipped ORDER BY chunk_id, model_signature",
+    )?;
+    batch.chunk_reembed_skips = chunk_skips
+        .query_map([], |row| {
+            Ok(LegacyChunkReembedSkip {
+                chunk_id: row.get(0)?,
+                model_signature: row.get(1)?,
+                reason: row.get(2)?,
+                skipped_at_ms: row.get(3)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+
+    let mut summary_skips = conn.prepare(
+        "SELECT summary_id, model_signature, reason, skipped_at_ms \
+         FROM mem_tree_summary_reembed_skipped ORDER BY summary_id, model_signature",
+    )?;
+    batch.summary_reembed_skips = summary_skips
+        .query_map([], |row| {
+            Ok(LegacySummaryReembedSkip {
+                summary_id: row.get(0)?,
+                model_signature: row.get(1)?,
+                reason: row.get(2)?,
+                skipped_at_ms: row.get(3)?,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;

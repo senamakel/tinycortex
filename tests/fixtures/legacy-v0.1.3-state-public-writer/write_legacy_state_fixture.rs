@@ -71,7 +71,8 @@ async fn main() -> Result<()> {
         .first()
         .context("public chat writer produced no summary child")?
         .clone();
-    let summary_tree = TreeFactory::source("slack:#pending-summary-frontier").get_or_create(&config)?;
+    let summary_tree =
+        TreeFactory::source("slack:#pending-summary-frontier").get_or_create(&config)?;
     let summary = ingest_summary(
         &config,
         &summary_tree,
