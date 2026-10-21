@@ -18,7 +18,7 @@ static GLOBAL_STORE_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
 #[tokio::test]
 async fn resolver_and_store_cooperate_across_handle_kinds() {
-    let s = PeopleStore::open_in_memory().unwrap();
+    let s = crate::memory::people::test_support::store();
     let r = HandleResolver::new(&s);
 
     // Email mints.

@@ -2,7 +2,7 @@ use super::*;
 
 #[tokio::test]
 async fn insert_list_and_lookup_round_trip() {
-    let s = PeopleStore::open_in_memory().unwrap();
+    let s = crate::memory::people::test_support::store();
     let now = Utc::now();
     let p = Person {
         id: PersonId::new(),
@@ -36,7 +36,7 @@ async fn insert_list_and_lookup_round_trip() {
 
 #[tokio::test]
 async fn interactions_round_trip() {
-    let s = PeopleStore::open_in_memory().unwrap();
+    let s = crate::memory::people::test_support::store();
     let now = Utc::now();
     let pid = PersonId::new();
     let p = Person {
