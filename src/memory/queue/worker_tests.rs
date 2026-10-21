@@ -8,22 +8,13 @@ use crate::memory::queue::store::{
 };
 use crate::memory::queue::test_support::RecordingDelegates;
 use crate::memory::queue::types::{FlushStalePayload, JobStatus, NewJob, ReembedBackfillPayload};
+use tinystoragedrivers_types::{ErrorKind, StorageError};
 use tempfile::TempDir;
 
 fn test_config() -> (TempDir, MemoryConfig) {
     let tmp = TempDir::new().unwrap();
     let cfg = crate::memory::chunks::test_support::host_config(tmp.path());
     (tmp, cfg)
-}
-
-fn sqlite_failure(code: rusqlite::ErrorCode, extended: i32, msg: &str) -> anyhow::Error {
-    anyhow::Error::from(rusqlite::Error::SqliteFailure(
-        rusqlite::ffi::Error {
-            code,
-            extended_code: extended,
-        },
-        Some(msg.into()),
-    ))
 }
 
 #[tokio::test]
@@ -379,123 +370,25 @@ fn bootstrap_purges_retired_and_recovers_locks() {
     assert_eq!(purged, 1);
 }
 
-// ── SQLite error classifiers (ported verbatim) ───────────────────────────────
+// ── Typed storage failure classification ────────────────────────────────────
 
 #[test]
-fn is_sqlite_busy_matches_busy_and_locked() {
-    assert!(is_sqlite_busy(&sqlite_failure(
-        rusqlite::ErrorCode::DatabaseBusy,
-        5,
-        "database is locked"
-    )));
-    assert!(is_sqlite_busy(&sqlite_failure(
-        rusqlite::ErrorCode::DatabaseLocked,
-        6,
-        "database table is locked"
-    )));
-}
+fn storage_failures_are_classified_by_typed_kind_through_context() {
+    let unavailable = anyhow::Error::new(StorageError::unavailable("host is restarting"))
+        .context("read owner queue state");
+    let conflict = anyhow::Error::new(StorageError::conflict("owner head advanced"));
+    let backend = anyhow::Error::new(StorageError::backend("generic storage failure"));
+    let unrelated = anyhow::anyhow!("database disk image is malformed");
 
-#[test]
-fn is_sqlite_busy_matches_through_context_and_text() {
-    let wrapped = sqlite_failure(rusqlite::ErrorCode::DatabaseBusy, 5, "database is locked")
-        .context("Failed to claim next mem_tree_jobs row")
-        .context("with_connection closure failed");
-    assert!(is_sqlite_busy(&wrapped));
-    assert!(is_sqlite_busy(&anyhow::anyhow!(
-        "Failed to claim next mem_tree_jobs row: database is locked"
-    )));
-}
-
-#[test]
-fn is_sqlite_busy_negatives() {
-    assert!(!is_sqlite_busy(&sqlite_failure(
-        rusqlite::ErrorCode::ConstraintViolation,
-        19,
-        "UNIQUE constraint failed"
-    )));
-    assert!(!is_sqlite_busy(&anyhow::anyhow!("upstream 500")));
-}
-
-#[test]
-fn is_sqlite_io_transient_matches_family() {
-    assert!(is_sqlite_io_transient(&sqlite_failure(
-        rusqlite::ErrorCode::SystemIoFailure,
-        1546,
-        "disk I/O error"
-    )));
-    for ext in [4618, 4874, 5386, 8714] {
-        assert!(is_sqlite_io_transient(&sqlite_failure(
-            rusqlite::ErrorCode::SystemIoFailure,
-            ext,
-            "sqlite io failure"
-        )));
-    }
-    assert!(is_sqlite_io_transient(&sqlite_failure(
-        rusqlite::ErrorCode::CannotOpen,
-        14,
-        "unable to open database file"
-    )));
-    assert!(is_sqlite_io_transient(&anyhow::anyhow!(
-        "memory_tree_db circuit breaker open: too many init failures"
-    )));
-    assert!(!is_sqlite_io_transient(&sqlite_failure(
-        rusqlite::ErrorCode::ConstraintViolation,
-        19,
-        "UNIQUE constraint failed"
-    )));
-}
-
-#[test]
-fn is_sqlite_disk_full_matches_code_context_text() {
-    assert!(is_sqlite_disk_full(&sqlite_failure(
-        rusqlite::ErrorCode::DiskFull,
-        13,
-        "database or disk is full"
-    )));
-    let wrapped = sqlite_failure(
-        rusqlite::ErrorCode::DiskFull,
-        13,
-        "database or disk is full",
-    )
-    .context("Failed to claim next mem_tree_jobs row");
-    assert!(is_sqlite_disk_full(&wrapped));
-    assert!(is_sqlite_disk_full(&anyhow::anyhow!(
-        "row: database or disk is full: Error code 13: Insertion failed because database is full"
-    )));
-    assert!(!is_sqlite_disk_full(&sqlite_failure(
-        rusqlite::ErrorCode::DatabaseBusy,
-        5,
-        "database is locked"
-    )));
-}
-
-#[test]
-fn is_sqlite_corrupt_matches_code_notadb_context_text() {
-    assert!(is_sqlite_corrupt(&sqlite_failure(
-        rusqlite::ErrorCode::DatabaseCorrupt,
-        11,
-        "database disk image is malformed"
-    )));
-    assert!(is_sqlite_corrupt(&sqlite_failure(
-        rusqlite::ErrorCode::NotADatabase,
-        26,
-        "file is not a database"
-    )));
-    let wrapped = sqlite_failure(
-        rusqlite::ErrorCode::DatabaseCorrupt,
-        11,
-        "database disk image is malformed",
-    )
-    .context("Failed to claim next mem_tree_jobs row");
-    assert!(is_sqlite_corrupt(&wrapped));
-    assert!(is_sqlite_corrupt(&anyhow::anyhow!(
-        "row: database disk image is malformed"
-    )));
-    assert!(!is_sqlite_corrupt(&sqlite_failure(
-        rusqlite::ErrorCode::DiskFull,
-        13,
-        "database or disk is full"
-    )));
+    assert_eq!(storage_error_kind(&unavailable), Some(ErrorKind::Unavailable));
+    assert_eq!(storage_error_kind(&conflict), Some(ErrorKind::Conflict));
+    assert_eq!(storage_error_kind(&backend), Some(ErrorKind::Backend));
+    assert!(is_retryable_storage_error(&unavailable));
+    assert!(is_retryable_storage_error(&conflict));
+    assert!(!is_fatal_storage_error(&unavailable));
+    assert!(!is_fatal_storage_error(&conflict));
+    assert!(is_fatal_storage_error(&backend));
+    assert!(!is_fatal_storage_error(&unrelated));
 }
 
 /// EIO (`5`), ENOSPC (`28`), and EROFS (`30`) are the persistent, user-only-
@@ -525,9 +418,8 @@ fn is_host_io_error_matches_family_code_context_text() {
     )));
 }
 
-/// EACCES (`13`, a permission bug), ENOENT (`2`), `SQLITE_FULL` (its own arm),
-/// and unrelated errors must NOT be swallowed as host I/O — they are real bugs
-/// or handled elsewhere and must keep reporting.
+/// EACCES (`13`), ENOENT (`2`), and unrelated errors must not be swallowed as
+/// host I/O — they are real bugs or handled elsewhere and must keep reporting.
 #[test]
 fn is_host_io_error_negatives() {
     assert!(!is_host_io_error(&anyhow::Error::from(
@@ -535,12 +427,6 @@ fn is_host_io_error_negatives() {
     )));
     assert!(!is_host_io_error(&anyhow::Error::from(
         std::io::Error::from_raw_os_error(2)
-    )));
-    // SQLITE_FULL stays in is_sqlite_disk_full's arm, not here.
-    assert!(!is_host_io_error(&sqlite_failure(
-        rusqlite::ErrorCode::DiskFull,
-        13,
-        "database or disk is full"
     )));
     assert!(!is_host_io_error(&anyhow::anyhow!(
         "upstream returned 500: internal server error"

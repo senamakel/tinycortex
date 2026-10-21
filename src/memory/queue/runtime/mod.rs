@@ -144,10 +144,16 @@ fn backoff_for(err: &anyhow::Error, opts: &WorkerLoopConfig) -> Option<Duration>
         // long, like disk-full, instead of hammering the generic error arm.
         return Some(opts.host_io_backoff);
     }
-    if worker::is_retryable_storage_error(err) {
-        return Some(opts.io_backoff);
+    match worker::storage_error_kind(err) {
+        Some(tinystoragedrivers_types::ErrorKind::Conflict) => {
+            Some(opts.conflict_backoff)
+        }
+        Some(tinystoragedrivers_types::ErrorKind::Unavailable) => {
+            Some(opts.unavailable_backoff)
+        }
+        Some(_) => None,
+        None => Some(opts.error_backoff),
     }
-    Some(opts.error_backoff)
 }
 
 /// Sleep for `total`, but wake early (within [`SLEEP_SLICE`]) if [`Shutdown`]
