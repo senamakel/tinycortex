@@ -10,8 +10,7 @@ use super::compose::split_front_matter;
 use crate::memory::chunks::{
     content_root, get_chunk, get_chunk_content_pointers, get_chunk_raw_refs,
     get_summary_content_pointers, update_chunk_content_sha256, update_summary_content_sha256,
-    update_summary_content_sha256_async,
-    RawRef,
+    update_summary_content_sha256_async, RawRef,
 };
 use crate::memory::config::MemoryConfig;
 
@@ -261,8 +260,12 @@ pub async fn read_summary_body_async(
     let result = read_summary_file(&abs_path)?;
     if result.sha256 != expected_sha256 {
         log::warn!("[memory:content] stale summary checksum token summary_id={summary_id}");
-        if let Err(error) = update_summary_content_sha256_async(config, summary_id, &result.sha256).await {
-            log::warn!("[memory:content] summary checksum repair failed summary_id={summary_id}: {error}");
+        if let Err(error) =
+            update_summary_content_sha256_async(config, summary_id, &result.sha256).await
+        {
+            log::warn!(
+                "[memory:content] summary checksum repair failed summary_id={summary_id}: {error}"
+            );
         }
     }
     Ok(result.body)

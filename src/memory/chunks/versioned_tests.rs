@@ -323,6 +323,7 @@ async fn listing_chunk_state_resolves_many_lifecycle_keys_in_bounded_queries() {
         })
         .collect::<Vec<_>>();
     assert!(commit_if_state_matches(&config, &[], &[], &score_rows).unwrap());
+    state_version_queries.store(0, Ordering::SeqCst);
 
     let (listed, states) = list_chunk_snapshot(
         &config,

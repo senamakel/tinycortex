@@ -534,7 +534,7 @@ pub async fn delete_orphaned_source_tree_async(
             if staged.snapshot != snapshot {
                 return Ok(false);
             }
-            content_paths.extend(staged.content_paths);
+            content_paths.extend(staged.result.content_paths);
             expected.extend(staged.expected);
             changes.extend(staged.changes);
             expected.push(StateChange {

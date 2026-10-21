@@ -106,13 +106,14 @@ pub use types::{
 
 pub use collections::collections;
 pub use connection::{shared_connection, with_connection};
+pub(crate) use embeddings::summary_reembed_skip_key;
 pub use embeddings::{
     clear_chunk_reembed_skipped, clear_reembed_skipped_for_signature,
     clear_summary_reembed_skipped, clear_summary_reembed_skipped_async, embedding_to_blob,
     mark_chunk_reembed_skipped, mark_summary_reembed_skipped, mark_summary_reembed_skipped_async,
     plan_chunk_embedding_for_queue, set_chunk_embedding, set_chunk_embedding_for_signature,
     set_chunk_embedding_for_signature_tx, set_summary_embedding_for_signature_tx,
-    summary_reembed_skip_key, tree_active_signature, REEMBED_SKIP_KEY_MAX_LEN,
+    tree_active_signature, REEMBED_SKIP_KEY_MAX_LEN,
 };
 pub use embeddings_query::{
     get_chunk_embedding, get_chunk_embedding_async, get_chunk_embedding_for_signature,

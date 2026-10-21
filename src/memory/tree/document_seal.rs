@@ -126,10 +126,7 @@ pub async fn plan_document_subtree_for_queue(
         let summary = store::stage_summary_changes(node, None, &signature)?;
         accumulated.add_many(summary.expected, summary.changes)?;
         if node.embedding.is_some() {
-            let skip_key = crate::memory::chunks::summary_reembed_skip_key(
-                &node.id,
-                &signature,
-            );
+            let skip_key = crate::memory::chunks::summary_reembed_skip_key(&node.id, &signature);
             let skip = crate::memory::chunks::versioned::read_state_async(
                 config,
                 crate::memory::chunks::collections::SUMMARY_REEMBED_SKIPS,
@@ -204,11 +201,13 @@ pub async fn plan_document_subtree_for_queue(
     )?;
 
     let follow_ups = if crate::memory::tree::should_seal(config, &merge_buffer) {
-        vec![crate::memory::queue::NewJob::seal(&crate::memory::queue::SealPayload {
-            tree_id: tree.id.clone(),
-            level: MERGE_LEVEL_BASE,
-            force_now_ms: None,
-        })?]
+        vec![crate::memory::queue::NewJob::seal(
+            &crate::memory::queue::SealPayload {
+                tree_id: tree.id.clone(),
+                level: MERGE_LEVEL_BASE,
+                force_now_ms: None,
+            },
+        )?]
     } else {
         Vec::new()
     };
@@ -271,7 +270,8 @@ impl PlannedDocumentMutations {
                         .and_then(|row| row.get("weight"))
                         .and_then(serde_json::Value::as_i64)
                         .unwrap_or(0);
-                    replacement["weight"] = serde_json::json!(old_weight.saturating_add(*count as i64));
+                    replacement["weight"] =
+                        serde_json::json!(old_weight.saturating_add(*count as i64));
                     self.changes.insert(map_key, Some(replacement));
                 }
                 (crate::memory::chunks::collections::ENTITY_INDEX, key)
@@ -339,14 +339,12 @@ impl PlannedDocumentMutations {
             let value = by_key
                 .remove(&(condition.collection.clone(), condition.key.clone()))
                 .unwrap_or_else(|| condition.value.clone());
-            self.add(
-                &condition.collection,
-                condition.key,
-                condition.value,
-                value,
-            )?;
+            self.add(&condition.collection, condition.key, condition.value, value)?;
         }
-        anyhow::ensure!(by_key.is_empty(), "document seal mutation has no precondition");
+        anyhow::ensure!(
+            by_key.is_empty(),
+            "document seal mutation has no precondition"
+        );
         Ok(())
     }
 
@@ -362,7 +360,16 @@ impl PlannedDocumentMutations {
             .get(&map_key)
             .cloned()
             .context("document seal replacement has no precondition")?;
-        self.add(collection, key, expected, value)
+        let previous = self
+            .changes
+            .get(&map_key)
+            .context("document seal replacement has no staged value")?;
+        anyhow::ensure!(
+            previous == &expected,
+            "document seal replaced {collection}:{key} after another staged write"
+        );
+        self.changes.insert(map_key, value);
+        Ok(())
     }
 
     fn into_job_mutations(self) -> Result<Vec<crate::memory::queue::JobMutation>> {
@@ -375,6 +382,9 @@ impl PlannedDocumentMutations {
                     .cloned()
                     .unwrap_or_else(|| expected.clone());
                 let collection = match key.0.as_str() {
+                    crate::memory::chunks::collections::CHUNK_LIFECYCLE => {
+                        crate::memory::queue::JobStateCollection::ChunkLifecycle
+                    }
                     crate::memory::chunks::collections::TREES => {
                         crate::memory::queue::JobStateCollection::Trees
                     }
@@ -456,8 +466,16 @@ async fn plan_explicit_children(
         !inputs.is_empty(),
         "document seal has no hydrated inputs at level {level}"
     );
-    let time_range_start = inputs.iter().map(|input| input.time_range_start).min().unwrap();
-    let time_range_end = inputs.iter().map(|input| input.time_range_end).max().unwrap();
+    let time_range_start = inputs
+        .iter()
+        .map(|input| input.time_range_start)
+        .min()
+        .unwrap();
+    let time_range_end = inputs
+        .iter()
+        .map(|input| input.time_range_end)
+        .max()
+        .unwrap();
     let score = inputs
         .iter()
         .map(|input| input.score)
@@ -488,7 +506,12 @@ async fn plan_explicit_children(
     let embedding = match services.embedder {
         Some(embedder) if !output.content.trim().is_empty() => {
             let content: String = output.content.chars().take(4_000).collect();
-            Some(embedder.embed(&content).await.context("embed document summary")?)
+            Some(
+                embedder
+                    .embed(&content)
+                    .await
+                    .context("embed document summary")?,
+            )
         }
         _ => None,
     };
@@ -549,7 +572,8 @@ pub async fn seal_document_subtree_with_services(
         version_ms,
         chunk_ids: chunk_ids.to_vec(),
     };
-    let output = plan_document_subtree_for_queue(config, tree, &payload, services, strategy).await?;
+    let output =
+        plan_document_subtree_for_queue(config, tree, &payload, services, strategy).await?;
     let root_id = output.result.root_id.clone();
     let (expected, changes): (Vec<_>, Vec<_>) = output
         .mutations
@@ -611,7 +635,6 @@ async fn batch_leaves_by_token_budget(
 fn batch_by_count(ids: &[String], max: usize) -> Vec<Vec<String>> {
     ids.chunks(max.max(1)).map(<[String]>::to_vec).collect()
 }
-
 
 #[cfg(test)]
 #[path = "document_seal_tests.rs"]

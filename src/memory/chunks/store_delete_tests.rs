@@ -251,7 +251,6 @@ fn enqueue_advancing_the_head_invalidates_a_captured_purge_snapshot() {
         &cfg,
         &snapshot,
         std::slice::from_ref(&change),
-        &[],
         &[super::versioned::StateChange {
             value: None,
             ..change.clone()

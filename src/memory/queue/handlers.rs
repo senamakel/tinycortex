@@ -27,8 +27,8 @@ use async_trait::async_trait;
 use serde::de::DeserializeOwned;
 
 use crate::memory::chunks::collections::{
-    BUFFERS, CHUNK_EMBEDDINGS, CHUNK_LIFECYCLE, CHUNK_REEMBED_SKIPS, ENTITY_EDGES,
-    ENTITY_HOTNESS, ENTITY_INDEX, SCORES, SUMMARIES, SUMMARY_CONTENT_POINTERS, TREES,
+    BUFFERS, CHUNK_EMBEDDINGS, CHUNK_LIFECYCLE, CHUNK_REEMBED_SKIPS, ENTITY_EDGES, ENTITY_HOTNESS,
+    ENTITY_INDEX, SCORES, SUMMARIES, SUMMARY_CONTENT_POINTERS, TREES,
 };
 use crate::memory::chunks::versioned::StateChange;
 use crate::memory::config::MemoryConfig;
@@ -152,9 +152,7 @@ impl JobStateCollection {
             Self::Trees => TREES,
             Self::Summaries => SUMMARIES,
             Self::SummaryEmbeddings => crate::memory::chunks::collections::SUMMARY_EMBEDDINGS,
-            Self::SummaryReembedSkips => {
-                crate::memory::chunks::collections::SUMMARY_REEMBED_SKIPS
-            }
+            Self::SummaryReembedSkips => crate::memory::chunks::collections::SUMMARY_REEMBED_SKIPS,
             Self::SummaryContentPointers => SUMMARY_CONTENT_POINTERS,
             Self::TreeBuffers => BUFFERS,
             Self::ChunkEmbeddings => CHUNK_EMBEDDINGS,

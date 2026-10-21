@@ -1,8 +1,10 @@
 use super::*;
-use crate::memory::chunks::{chunk_id, upsert_chunks_async, Chunk, Metadata, SourceKind, SourceRef};
+use crate::memory::chunks::{
+    chunk_id, upsert_chunks_async, Chunk, Metadata, SourceKind, SourceRef,
+};
 use crate::memory::queue::{
-    AppendDecision, AppendTarget, DelegateOutput, ExtractDecision, JobStatus,
-    NewJob, NodeRef, QueueDelegates, ReembedProgress, SealDocumentPayload, SealPayload, StaleBuffer,
+    AppendDecision, AppendTarget, DelegateOutput, ExtractDecision, JobStatus, NewJob, NodeRef,
+    QueueDelegates, ReembedProgress, SealDocumentPayload, SealPayload, StaleBuffer,
 };
 use crate::memory::tree::store::{self, TreeKind};
 use crate::memory::tree::summarise::ConcatSummariser;
@@ -87,7 +89,7 @@ impl QueueDelegates for DocumentDelegate {
         let services = SealServices {
             summariser: &self.summariser,
             embedder: None,
-            observer: &super::types::NoopSealObserver,
+            observer: &crate::memory::tree::types::NoopSealObserver,
         };
         let output = plan_document_subtree_for_queue(
             config,
@@ -145,7 +147,12 @@ impl QueueDelegates for DocumentDelegate {
     }
 }
 
-async fn test_setup() -> (TempDir, crate::memory::config::MemoryConfig, store::Tree, Chunk) {
+async fn test_setup() -> (
+    TempDir,
+    crate::memory::config::MemoryConfig,
+    store::Tree,
+    Chunk,
+) {
     let temp = TempDir::new().unwrap();
     let config = crate::memory::chunks::test_support::host_config(temp.path());
     let tree = crate::memory::tree::get_or_create_tree_async(
@@ -183,7 +190,7 @@ async fn document_planning_is_invisible_until_worker_settlement_and_projects_aft
     let services = SealServices {
         summariser: &service.summariser,
         embedder: None,
-        observer: &super::types::NoopSealObserver,
+        observer: &crate::memory::tree::types::NoopSealObserver,
     };
     let planned = plan_document_subtree_for_queue(
         &config,
