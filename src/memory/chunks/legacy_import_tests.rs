@@ -303,20 +303,23 @@ async fn typed_import_rejects_malformed_existing_content_pointer_without_mutatio
     let config = crate::memory::chunks::test_support::host_config(tmp.path());
     let batch = fixture_batch();
     let chunk_id = batch.chunks[0].chunk.id.clone();
-    super::super::versioned::write_state_async(
+    let pointer = StateChange {
+        collection: super::super::collections::CHUNK_CONTENT_POINTERS.to_owned(),
+        key: chunk_id.clone(),
+        value: Some(serde_json::json!({
+            "chunk_id": chunk_id,
+            "content_path": "../escape.md",
+            "content_sha256": "a".repeat(64),
+        })),
+    };
+    assert!(super::super::versioned::commit_if_state_matches_async(
         &config,
-        StateChange {
-            collection: super::super::collections::CHUNK_CONTENT_POINTERS.to_owned(),
-            key: chunk_id.clone(),
-            value: Some(serde_json::json!({
-                "chunk_id": chunk_id,
-                "content_path": "../escape.md",
-                "content_sha256": "a".repeat(64),
-            })),
-        },
+        &[],
+        &[],
+        std::slice::from_ref(&pointer),
     )
     .await
-    .unwrap();
+    .unwrap());
     let before = super::super::versioned::capture_state_snapshot_async(&config)
         .await
         .unwrap();
