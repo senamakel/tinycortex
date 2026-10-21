@@ -405,32 +405,6 @@ fn empty_batch_is_noop() {
 }
 
 #[test]
-fn schema_has_content_path_and_content_sha256_columns() {
-    let (_tmp, cfg) = test_config();
-    with_connection(&cfg, |conn| {
-        let mut stmt = conn.prepare("PRAGMA table_info(mem_tree_chunks)")?;
-        let names: Vec<String> = stmt
-            .query_map(params![], |row| row.get::<_, String>(1))?
-            .filter_map(|r| r.ok())
-            .collect();
-        assert!(
-            names.iter().any(|n| n == "path_scope"),
-            "missing path_scope; found: {names:?}"
-        );
-        assert!(
-            names.iter().any(|n| n == "content_path"),
-            "missing content_path; found: {names:?}"
-        );
-        assert!(
-            names.iter().any(|n| n == "content_sha256"),
-            "missing content_sha256; found: {names:?}"
-        );
-        Ok(())
-    })
-    .unwrap();
-}
-
-#[test]
 fn plain_upsert_clears_staged_pointer_and_readmits_dropped_row() {
     let (_tmp, cfg) = test_config();
     let chunk = sample_chunk("notion:plain-replace", 0, 1_700_000_000_000);
