@@ -108,16 +108,18 @@ pub use collections::collections;
 pub use connection::{shared_connection, with_connection};
 pub use embeddings::{
     clear_chunk_reembed_skipped, clear_reembed_skipped_for_signature,
-    clear_summary_reembed_skipped, embedding_to_blob, mark_chunk_reembed_skipped,
-    mark_summary_reembed_skipped, plan_chunk_embedding_for_queue, set_chunk_embedding,
-    set_chunk_embedding_for_signature, set_chunk_embedding_for_signature_tx,
-    set_summary_embedding_for_signature_tx, tree_active_signature, REEMBED_SKIP_KEY_MAX_LEN,
+    clear_summary_reembed_skipped, clear_summary_reembed_skipped_async, embedding_to_blob,
+    mark_chunk_reembed_skipped, mark_summary_reembed_skipped, mark_summary_reembed_skipped_async,
+    plan_chunk_embedding_for_queue, set_chunk_embedding, set_chunk_embedding_for_signature,
+    set_chunk_embedding_for_signature_tx, set_summary_embedding_for_signature_tx,
+    tree_active_signature, REEMBED_SKIP_KEY_MAX_LEN,
 };
 pub use embeddings_query::{
     get_chunk_embedding, get_chunk_embedding_async, get_chunk_embedding_for_signature,
     get_chunk_embedding_for_signature_async, get_chunk_embeddings_batch,
     get_chunk_embeddings_batch_async, get_chunk_embeddings_for_signature_batch,
     get_chunk_embeddings_for_signature_batch_async, has_uncovered_reembed_work,
+    has_uncovered_reembed_work_async,
 };
 pub use raw_refs::{
     get_chunk_content_path, get_chunk_content_pointers, get_chunk_raw_refs,
@@ -138,9 +140,10 @@ pub use store::{
     filter_raw_paths_not_ingested, get_chunk, get_chunk_async, get_chunk_lifecycle_status,
     get_chunks_batch, get_chunks_batch_async, is_source_ingested, list_source_ids_with_prefix,
     mark_raw_paths_ingested, set_chunk_lifecycle_status, update_chunk_content_sha256,
-    update_summary_content_sha256, upsert_chunks, upsert_chunks_async, upsert_chunks_tx,
-    upsert_staged_chunks_tx, CHUNK_STATUS_ADMITTED, CHUNK_STATUS_BUFFERED, CHUNK_STATUS_DROPPED,
-    CHUNK_STATUS_PENDING_EXTRACTION, CHUNK_STATUS_SEALED, RAW_FILE_GATE_KIND,
+    update_summary_content_sha256, update_summary_content_sha256_async, upsert_chunks,
+    upsert_chunks_async, upsert_chunks_tx, upsert_staged_chunks_tx, CHUNK_STATUS_ADMITTED,
+    CHUNK_STATUS_BUFFERED, CHUNK_STATUS_DROPPED, CHUNK_STATUS_PENDING_EXTRACTION,
+    CHUNK_STATUS_SEALED, RAW_FILE_GATE_KIND,
 };
 pub use store_delete::{
     delete_chunk_by_id, delete_chunk_by_id_async, delete_chunks_by_owner,

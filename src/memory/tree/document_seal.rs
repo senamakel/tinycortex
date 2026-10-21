@@ -118,10 +118,32 @@ pub async fn plan_document_subtree_for_queue(
     // after every generated child has its final parent link in the overlay.
     let signature = crate::memory::chunks::tree_active_signature(config);
     let mut summaries: Vec<_> = generated.into_values().collect();
-    summaries.sort_by_key(|node| node.level);
+    summaries.sort_by(|left, right| {
+        left.level
+            .cmp(&right.level)
+            .then_with(|| left.id.cmp(&right.id))
+    });
     for node in &summaries {
         let summary = store::stage_summary_changes(node, None, &signature)?;
         accumulated.add_many(summary.expected, summary.changes)?;
+        if node.embedding.is_some() {
+            let skip_key = crate::memory::chunks::embeddings::summary_reembed_skip_key(
+                &node.id,
+                &signature,
+            );
+            let skip = crate::memory::chunks::versioned::read_state_async(
+                config,
+                crate::memory::chunks::collections::SUMMARY_REEMBED_SKIPS,
+                &skip_key,
+            )
+            .await?;
+            accumulated.add(
+                crate::memory::chunks::collections::SUMMARY_REEMBED_SKIPS,
+                skip_key,
+                skip,
+                None,
+            )?;
+        }
         let entities = crate::memory::score::store::stage_summary_entity_ids_async(
             config,
             &node.entities,

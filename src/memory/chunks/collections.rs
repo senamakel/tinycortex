@@ -77,6 +77,9 @@ pub fn collections() -> Vec<CollectionSpec> {
         CollectionSpec::new(SUMMARY_EMBEDDINGS)
             .index(IndexSpec::new("by_summary_model", ["summary_id", "model_signature"]).unique())
             .index(IndexSpec::new("by_model", ["model_signature"])),
+        CollectionSpec::new(SUMMARY_REEMBED_SKIPS)
+            .index(IndexSpec::new("by_summary_model", ["summary_id", "model_signature"]).unique())
+            .index(IndexSpec::new("by_model", ["model_signature"])),
         CollectionSpec::new(BUFFERS)
             .index(IndexSpec::new("by_tree_level", ["tree_id", "level"]).unique())
             .index(IndexSpec::new("by_oldest", ["oldest_at_ms"])),
@@ -123,6 +126,8 @@ pub const TREES: &str = "memory_trees";
 pub const SUMMARIES: &str = "memory_summaries";
 /// Stable collection name for per-model summary embedding metadata.
 pub const SUMMARY_EMBEDDINGS: &str = "memory_summary_embeddings";
+/// Stable collection name for summary embedding retry-skip records.
+pub const SUMMARY_REEMBED_SKIPS: &str = "memory_summary_reembed_skipped";
 /// Stable collection name for unsealed tree buffers.
 pub const BUFFERS: &str = "memory_tree_buffers";
 /// Stable collection name for staged summary content pointers.

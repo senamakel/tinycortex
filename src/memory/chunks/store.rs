@@ -5,7 +5,7 @@
 //! moved with the tree, score, queue, and entity-index group.
 
 use anyhow::Result;
-use rusqlite::{params, Transaction};
+use rusqlite::Transaction;
 use std::collections::HashMap;
 
 use super::connection::with_connection;
@@ -84,13 +84,69 @@ pub fn update_summary_content_sha256(
     summary_id: &str,
     new_sha256: &str,
 ) -> Result<()> {
-    with_connection(config, |conn| {
-        conn.execute(
-            "UPDATE mem_tree_summaries SET content_sha256 = ?1 WHERE id = ?2",
-            params![new_sha256, summary_id],
-        )?;
-        Ok(())
-    })
+    let key = format!("summary:{summary_id}");
+    for _ in 0..8 {
+        let Some(mut pointer) = super::versioned::read_state(
+            config,
+            super::collections::SUMMARY_CONTENT_POINTERS,
+            &key,
+        )?
+        else {
+            return Ok(());
+        };
+        let expected = super::versioned::StateChange {
+            collection: super::collections::SUMMARY_CONTENT_POINTERS.to_owned(),
+            key: key.clone(),
+            value: Some(pointer.clone()),
+        };
+        pointer["content_sha256"] = serde_json::Value::String(new_sha256.to_owned());
+        let change = super::versioned::StateChange {
+            collection: expected.collection.clone(),
+            key: key.clone(),
+            value: Some(pointer),
+        };
+        if super::versioned::commit_if_state_matches(config, &[expected], &[], &[change])? {
+            return Ok(());
+        }
+    }
+    anyhow::bail!("summary content pointer changed too often while repairing checksum")
+}
+
+/// Async current-thread-safe counterpart to [`update_summary_content_sha256`].
+pub async fn update_summary_content_sha256_async(
+    config: &MemoryConfig,
+    summary_id: &str,
+    new_sha256: &str,
+) -> Result<()> {
+    let key = format!("summary:{summary_id}");
+    for _ in 0..8 {
+        let Some(mut pointer) = super::versioned::read_state_async(
+            config,
+            super::collections::SUMMARY_CONTENT_POINTERS,
+            &key,
+        )
+        .await?
+        else {
+            return Ok(());
+        };
+        let expected = super::versioned::StateChange {
+            collection: super::collections::SUMMARY_CONTENT_POINTERS.to_owned(),
+            key: key.clone(),
+            value: Some(pointer.clone()),
+        };
+        pointer["content_sha256"] = serde_json::Value::String(new_sha256.to_owned());
+        let change = super::versioned::StateChange {
+            collection: expected.collection.clone(),
+            key: key.clone(),
+            value: Some(pointer),
+        };
+        if super::versioned::commit_if_state_matches_async(config, &[expected], &[], &[change])
+            .await?
+        {
+            return Ok(());
+        }
+    }
+    anyhow::bail!("summary content pointer changed too often while repairing checksum")
 }
 
 pub fn list_source_ids_with_prefix(

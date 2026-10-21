@@ -126,6 +126,8 @@ pub enum JobStateCollection {
     Summaries,
     /// Per-signature summary vectors.
     SummaryEmbeddings,
+    /// Summary re-embedding retry-skip records.
+    SummaryReembedSkips,
     /// Content-addressed summary body pointers.
     SummaryContentPointers,
     /// Mutable tree buffers.
@@ -150,6 +152,9 @@ impl JobStateCollection {
             Self::Trees => TREES,
             Self::Summaries => SUMMARIES,
             Self::SummaryEmbeddings => crate::memory::chunks::collections::SUMMARY_EMBEDDINGS,
+            Self::SummaryReembedSkips => {
+                crate::memory::chunks::collections::SUMMARY_REEMBED_SKIPS
+            }
             Self::SummaryContentPointers => SUMMARY_CONTENT_POINTERS,
             Self::TreeBuffers => BUFFERS,
             Self::ChunkEmbeddings => CHUNK_EMBEDDINGS,

@@ -7,8 +7,7 @@
 //! coupled tree migration lands. Signature-aware chunk reads live in the
 //! [`super::embeddings_query`] sibling.
 
-use super::collections::{CHUNK_EMBEDDINGS, CHUNK_REEMBED_SKIPS};
-use super::connection::with_connection;
+use super::collections::{CHUNK_EMBEDDINGS, CHUNK_REEMBED_SKIPS, SUMMARY_REEMBED_SKIPS};
 use super::signature::format_signature;
 use super::versioned::{list_state, write_chunk_state_changes, write_state_changes, StateChange};
 use anyhow::{Context, Result};
@@ -297,22 +296,47 @@ pub fn mark_summary_reembed_skipped(
 ) -> Result<()> {
     let summary_id = validate_reembed_skip_key("summary_id", summary_id)?;
     let model_signature = validate_reembed_skip_key("model_signature", model_signature)?;
-    with_connection(config, |conn| {
-        conn.execute(
-            "INSERT INTO mem_tree_summary_reembed_skipped
-             (summary_id, model_signature, reason, skipped_at_ms)
-             VALUES (?1, ?2, ?3, ?4)
-             ON CONFLICT(summary_id, model_signature) DO UPDATE SET
-                reason = excluded.reason, skipped_at_ms = excluded.skipped_at_ms",
-            rusqlite::params![
-                summary_id,
-                model_signature,
-                reason,
-                Utc::now().timestamp_millis()
-            ],
-        )?;
-        Ok(())
-    })
+    write_state_changes(
+        config,
+        &[StateChange {
+            collection: SUMMARY_REEMBED_SKIPS.into(),
+            key: summary_embedding_key(summary_id, model_signature),
+            value: Some(serde_json::to_value(SummaryReembedSkip {
+                summary_id: summary_id.into(),
+                model_signature: model_signature.into(),
+                reason: reason.into(),
+                skipped_at_ms: Utc::now().timestamp_millis(),
+            })?),
+        }],
+    )
+}
+
+/// Async current-thread-safe counterpart to [`mark_summary_reembed_skipped`].
+pub async fn mark_summary_reembed_skipped_async(
+    config: &MemoryConfig,
+    summary_id: &str,
+    model_signature: &str,
+    reason: &str,
+) -> Result<()> {
+    let summary_id = validate_reembed_skip_key("summary_id", summary_id)?;
+    let model_signature = validate_reembed_skip_key("model_signature", model_signature)?;
+    super::versioned::commit_if_state_matches_async(
+        config,
+        &[],
+        &[],
+        &[StateChange {
+            collection: SUMMARY_REEMBED_SKIPS.into(),
+            key: summary_reembed_skip_key(summary_id, model_signature),
+            value: Some(serde_json::to_value(SummaryReembedSkip {
+                summary_id: summary_id.into(),
+                model_signature: model_signature.into(),
+                reason: reason.into(),
+                skipped_at_ms: Utc::now().timestamp_millis(),
+            })?),
+        }],
+    )
+    .await?;
+    Ok(())
 }
 
 pub fn clear_summary_reembed_skipped(
@@ -322,14 +346,36 @@ pub fn clear_summary_reembed_skipped(
 ) -> Result<()> {
     let summary_id = validate_reembed_skip_key("summary_id", summary_id)?;
     let model_signature = validate_reembed_skip_key("model_signature", model_signature)?;
-    with_connection(config, |conn| {
-        conn.execute(
-            "DELETE FROM mem_tree_summary_reembed_skipped
-             WHERE summary_id = ?1 AND model_signature = ?2",
-            rusqlite::params![summary_id, model_signature],
-        )?;
-        Ok(())
-    })
+    write_state_changes(
+        config,
+        &[StateChange {
+            collection: SUMMARY_REEMBED_SKIPS.into(),
+            key: summary_embedding_key(summary_id, model_signature),
+            value: None,
+        }],
+    )
+}
+
+/// Async current-thread-safe counterpart to [`clear_summary_reembed_skipped`].
+pub async fn clear_summary_reembed_skipped_async(
+    config: &MemoryConfig,
+    summary_id: &str,
+    model_signature: &str,
+) -> Result<()> {
+    let summary_id = validate_reembed_skip_key("summary_id", summary_id)?;
+    let model_signature = validate_reembed_skip_key("model_signature", model_signature)?;
+    super::versioned::commit_if_state_matches_async(
+        config,
+        &[],
+        &[],
+        &[StateChange {
+            collection: SUMMARY_REEMBED_SKIPS.into(),
+            key: summary_reembed_skip_key(summary_id, model_signature),
+            value: None,
+        }],
+    )
+    .await?;
+    Ok(())
 }
 
 /// Clear all chunk and summary tombstones for a model signature. Returns the
@@ -346,24 +392,43 @@ pub fn clear_reembed_skipped_for_signature(
     let model_signature = validate_reembed_skip_key("model_signature", model_signature)?;
     let chunk_deletes = list_state(config, CHUNK_REEMBED_SKIPS)?
         .into_iter()
-        .filter_map(|(key, value)| {
-            let skip: ChunkReembedSkip = serde_json::from_value(value).ok()?;
-            (skip.model_signature == model_signature).then_some(StateChange {
-                collection: CHUNK_REEMBED_SKIPS.into(),
-                key,
-                value: None,
-            })
+        .map(|(key, value)| {
+            let skip: ChunkReembedSkip = serde_json::from_value(value)
+                .with_context(|| format!("decode chunk re-embed skip {key}"))?;
+            Ok::<_, anyhow::Error>(skip.model_signature.eq(model_signature).then_some(
+                StateChange {
+                    collection: CHUNK_REEMBED_SKIPS.into(),
+                    key,
+                    value: None,
+                },
+            ))
         })
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .flatten()
         .collect::<Vec<_>>();
     let chunk_deleted = chunk_deletes.len();
     write_state_changes(config, &chunk_deletes)?;
-    with_connection(config, |conn| {
-        let summary_deleted = conn.execute(
-            "DELETE FROM mem_tree_summary_reembed_skipped WHERE model_signature = ?1",
-            rusqlite::params![model_signature],
-        )?;
-        Ok(chunk_deleted + summary_deleted)
-    })
+    let summary_deletes = list_state(config, SUMMARY_REEMBED_SKIPS)?
+        .into_iter()
+        .map(|(key, value)| {
+            let skip: SummaryReembedSkip = serde_json::from_value(value)
+                .with_context(|| format!("decode summary re-embed skip {key}"))?;
+            Ok::<_, anyhow::Error>(skip.model_signature.eq(model_signature).then_some(
+                StateChange {
+                    collection: SUMMARY_REEMBED_SKIPS.into(),
+                    key,
+                    value: None,
+                },
+            ))
+        })
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+    let summary_deleted = summary_deletes.len();
+    write_state_changes(config, &summary_deletes)?;
+    Ok(chunk_deleted + summary_deleted)
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -383,8 +448,26 @@ pub(super) struct ChunkReembedSkip {
     pub(super) skipped_at_ms: i64,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(super) struct SummaryReembedSkip {
+    pub(super) summary_id: String,
+    pub(super) model_signature: String,
+    pub(super) reason: String,
+    pub(super) skipped_at_ms: i64,
+}
+
 pub(super) fn chunk_embedding_key(chunk_id: &str, model_signature: &str) -> String {
     serde_json::to_string(&(chunk_id, model_signature))
+        .expect("a pair of strings always serializes")
+}
+
+pub(super) fn summary_embedding_key(summary_id: &str, model_signature: &str) -> String {
+    serde_json::to_string(&(summary_id, model_signature))
+        .expect("a pair of strings always serializes")
+}
+
+pub(crate) fn summary_reembed_skip_key(summary_id: &str, model_signature: &str) -> String {
+    serde_json::to_string(&(summary_id, model_signature))
         .expect("a pair of strings always serializes")
 }
 

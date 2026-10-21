@@ -7,16 +7,20 @@
 //! conventions can still see its own prior vectors.
 //!
 //! No embeddings are computed here — embeddings.rs takes vectors on the write
-//! side; this module only reads them back. The tree-owned re-embed coverage
-//! probe still accepts a SQLite connection while that coupled migration lands.
+//! side; this module only reads them back. Re-embed coverage uses one host
+//! commit snapshot for chunks, summaries, vectors, and skip records.
 
-use super::collections::CHUNK_EMBEDDINGS;
+use super::collections::{
+    CHUNK_EMBEDDINGS, CHUNK_REEMBED_SKIPS, SUMMARIES, SUMMARY_EMBEDDINGS, SUMMARY_REEMBED_SKIPS,
+};
 use super::embeddings::{chunk_embedding_key, tree_active_signature, ChunkEmbeddingRecord};
-use super::signature::{signature_in_clause, signature_variants};
-use super::versioned::{read_state, read_states, read_states_async};
+use super::signature::signature_variants;
+use super::versioned::{
+    list_chunk_snapshot_with_head, list_chunk_snapshot_with_head_async, read_state, read_states,
+    read_states_async,
+};
 use anyhow::Result;
-use rusqlite::Connection;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::memory::config::MemoryConfig;
 use crate::memory::store::content::read::{
@@ -138,56 +142,108 @@ fn embedding_from_blob(bytes: &[u8], dim: i64, label: &str) -> Result<Option<Vec
 }
 
 /// Whether any live chunk or summary lacks both an embedding and terminal
-/// tombstone.
-///
-/// Coverage counts a vector written under *any* spelling of the signature: a
-/// row that only looks uncovered because the convention changed is not work,
-/// and re-embedding it would spend provider quota to reproduce a vector that
-/// is already on disk.
-pub fn has_uncovered_reembed_work(
-    conn: &Connection,
+/// tombstone. Alias spellings represent the same vector space, while legacy
+/// content-pointer read failures remain retryable.
+pub fn has_uncovered_reembed_work(config: &MemoryConfig, model_signature: &str) -> Result<bool> {
+    let (_, chunks, states) = list_chunk_snapshot_with_head(
+        config,
+        &[
+            CHUNK_EMBEDDINGS,
+            CHUNK_REEMBED_SKIPS,
+            SUMMARY_EMBEDDINGS,
+            SUMMARY_REEMBED_SKIPS,
+            SUMMARIES,
+        ],
+    )?;
+    uncovered_reembed_work(&chunks, &states, model_signature)
+}
+
+/// Async counterpart for current-thread queue workers.
+pub async fn has_uncovered_reembed_work_async(
+    config: &MemoryConfig,
     model_signature: &str,
-) -> rusqlite::Result<bool> {
-    let variants = signature_variants(model_signature);
-    let sig_clause = signature_in_clause(variants.len(), 1);
-    // Retryable skip reasons for legacy content-pointer rows; matched after the
-    // signature-variant params (which occupy `?1..=?variants.len()`).
-    let retry_idx_1 = variants.len() + 1;
-    let retry_idx_2 = variants.len() + 2;
-    let missing_pointer_retry_like =
-        format!("body read failed: {LEGACY_NO_CONTENT_POINTER_REASON_PREFIX}%");
-    // Legacy-only: older readers emitted this for present-but-empty content
-    // pointers. Current readers filter those pointers before returning `Some`,
-    // but existing skip rows must still become retriable after the fallback fix.
-    let empty_pointer_retry_like =
-        format!("body read failed: {LEGACY_EMPTY_CONTENT_POINTER_REASON_PREFIX}%");
-    let mut params: Vec<&dyn rusqlite::ToSql> = variants
-        .iter()
-        .map(|variant| variant as &dyn rusqlite::ToSql)
-        .collect();
-    params.push(&missing_pointer_retry_like as &dyn rusqlite::ToSql);
-    params.push(&empty_pointer_retry_like as &dyn rusqlite::ToSql);
-    conn.query_row(
-        &format!(
-            "SELECT EXISTS(
-                 SELECT 1 FROM mem_tree_chunks c
-                  WHERE NOT EXISTS (SELECT 1 FROM mem_tree_chunk_embeddings e
-                                     WHERE e.chunk_id = c.id AND e.model_signature {sig_clause})
-                    AND NOT EXISTS (SELECT 1 FROM mem_tree_chunk_reembed_skipped sk
-                                     WHERE sk.chunk_id = c.id AND sk.model_signature {sig_clause}
-                                       AND sk.reason NOT LIKE ?{retry_idx_1}
-                                       AND sk.reason NOT LIKE ?{retry_idx_2}))
-               OR EXISTS(
-                 SELECT 1 FROM mem_tree_summaries s
-                  WHERE s.deleted = 0
-                    AND NOT EXISTS (SELECT 1 FROM mem_tree_summary_embeddings e
-                                     WHERE e.summary_id = s.id AND e.model_signature {sig_clause})
-                    AND NOT EXISTS (SELECT 1 FROM mem_tree_summary_reembed_skipped sk
-                                     WHERE sk.summary_id = s.id AND sk.model_signature {sig_clause}))"
-        ),
-        params.as_slice(),
-        |row| row.get(0),
+) -> Result<bool> {
+    let (_, chunks, states) = list_chunk_snapshot_with_head_async(
+        config,
+        &[
+            CHUNK_EMBEDDINGS,
+            CHUNK_REEMBED_SKIPS,
+            SUMMARY_EMBEDDINGS,
+            SUMMARY_REEMBED_SKIPS,
+            SUMMARIES,
+        ],
     )
+    .await?;
+    uncovered_reembed_work(&chunks, &states, model_signature)
+}
+
+fn uncovered_reembed_work(
+    chunks: &[super::types::Chunk],
+    states: &HashMap<String, Vec<(String, serde_json::Value)>>,
+    model_signature: &str,
+) -> Result<bool> {
+    let variants = signature_variants(model_signature)
+        .into_iter()
+        .collect::<HashSet<_>>();
+    let ids_for_signature = |collection: &str, id_field: &str| {
+        states
+            .get(collection)
+            .into_iter()
+            .flatten()
+            .filter_map(|(_, value)| {
+                let signature = value.get("model_signature")?.as_str()?;
+                if !variants.contains(signature) {
+                    return None;
+                }
+                value.get(id_field)?.as_str().map(str::to_owned)
+            })
+            .collect::<HashSet<_>>()
+    };
+    let chunk_embeddings = ids_for_signature(CHUNK_EMBEDDINGS, "chunk_id");
+    let summary_embeddings = ids_for_signature(SUMMARY_EMBEDDINGS, "summary_id");
+    let chunk_skips = states
+        .get(CHUNK_REEMBED_SKIPS)
+        .into_iter()
+        .flatten()
+        .filter_map(|(_, value)| {
+            let signature = value.get("model_signature")?.as_str()?;
+            let chunk_id = value.get("chunk_id")?.as_str()?;
+            let reason = value.get("reason")?.as_str()?;
+            let retryable = reason.starts_with(&format!(
+                "body read failed: {LEGACY_NO_CONTENT_POINTER_REASON_PREFIX}"
+            )) || reason.starts_with(&format!(
+                "body read failed: {LEGACY_EMPTY_CONTENT_POINTER_REASON_PREFIX}"
+            ));
+            (variants.contains(signature) && !retryable).then(|| chunk_id.to_owned())
+        })
+        .collect::<HashSet<_>>();
+    let summary_skips = states
+        .get(SUMMARY_REEMBED_SKIPS)
+        .into_iter()
+        .flatten()
+        .filter_map(|(_, value)| {
+            let signature = value.get("model_signature")?.as_str()?;
+            let summary_id = value.get("summary_id")?.as_str()?;
+            variants.contains(signature).then(|| summary_id.to_owned())
+        })
+        .collect::<HashSet<_>>();
+    if chunks
+        .iter()
+        .any(|chunk| !chunk_embeddings.contains(&chunk.id) && !chunk_skips.contains(&chunk.id))
+    {
+        return Ok(true);
+    }
+    Ok(states
+        .get(SUMMARIES)
+        .into_iter()
+        .flatten()
+        .any(|(_, value)| {
+            let live = value.get("deleted").and_then(serde_json::Value::as_bool) != Some(true);
+            let Some(id) = value.get("id").and_then(serde_json::Value::as_str) else {
+                return false;
+            };
+            live && !summary_embeddings.contains(id) && !summary_skips.contains(id)
+        }))
 }
 
 /// Batched read of chunk embeddings under a single `model_signature`.

@@ -362,11 +362,7 @@ fn legacy_body_read_skip_does_not_hide_reembed_work() {
     )
     .unwrap();
 
-    with_connection(&cfg, |conn| {
-        assert!(has_uncovered_reembed_work(conn, sig)?);
-        Ok(())
-    })
-    .unwrap();
+    assert!(has_uncovered_reembed_work(&cfg, sig).unwrap());
 }
 
 #[test]
@@ -386,11 +382,7 @@ fn legacy_empty_pointer_skip_does_not_hide_reembed_work() {
     )
     .unwrap();
 
-    with_connection(&cfg, |conn| {
-        assert!(has_uncovered_reembed_work(conn, sig)?);
-        Ok(())
-    })
-    .unwrap();
+    assert!(has_uncovered_reembed_work(&cfg, sig).unwrap());
 }
 
 #[test]
@@ -410,11 +402,7 @@ fn empty_legacy_content_skip_hides_reembed_work() {
     )
     .unwrap();
 
-    with_connection(&cfg, |conn| {
-        assert!(!has_uncovered_reembed_work(conn, sig)?);
-        Ok(())
-    })
-    .unwrap();
+    assert!(!has_uncovered_reembed_work(&cfg, sig).unwrap());
 }
 
 #[test]
@@ -425,11 +413,7 @@ fn non_legacy_skip_still_hides_reembed_work() {
     let sig = "bge-m3@1024";
     mark_chunk_reembed_skipped(&cfg, &c.id, sig, "embed failed: provider rejected input").unwrap();
 
-    with_connection(&cfg, |conn| {
-        assert!(!has_uncovered_reembed_work(conn, sig)?);
-        Ok(())
-    })
-    .unwrap();
+    assert!(!has_uncovered_reembed_work(&cfg, sig).unwrap());
 }
 
 #[test]
@@ -601,14 +585,10 @@ fn a_vector_written_under_the_legacy_spelling_is_readable_under_the_active_signa
 
     // …and it counts as covered, so the re-embed chain does not pay to
     // recompute a vector that is already on disk.
-    with_connection(&cfg, |conn| {
-        assert!(
-            !super::has_uncovered_reembed_work(conn, &active)?,
-            "a legacy-spelled vector must count as coverage"
-        );
-        Ok(())
-    })
-    .unwrap();
+    assert!(
+        !super::has_uncovered_reembed_work(&cfg, &active).unwrap(),
+        "a legacy-spelled vector must count as coverage"
+    );
 
     // A genuinely different space is still separate.
     assert_eq!(
