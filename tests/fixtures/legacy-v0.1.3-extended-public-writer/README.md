@@ -30,27 +30,27 @@ SHA-256 for this generated output:
 
 ## Regeneration
 
-From the TinyCortex checkout containing this fixture, archive the exact tag
-and inject only the checked-in public writer example. Use a fresh output
-directory for every run:
+From the TinyCortex checkout containing this fixture, fetch the source commit
+and extract it into a fresh directory. Inject only the checked-in public
+writer example; its build artifacts stay under that archive's `target/`:
 
 ```sh
 repo_root=$PWD
+mkdir -p "$repo_root/.epic-repositories"
+legacy_git=$(mktemp -d "$repo_root/.epic-repositories/legacy-v013-git.XXXXXX")
 archive=$(mktemp -d "$repo_root/.epic-repositories/legacy-v013-extended-source.XXXXXX")
-git archive 72ce1d176aa3dc3a9ece14b9e61ecef9a8ae6b53 | tar -x -C "$archive"
+fixture_out=$(mktemp -d "$repo_root/.epic-repositories/legacy-v013-extended-output.XXXXXX")
+git clone --no-checkout https://github.com/senamakel/tinycortex.git "$legacy_git"
+git -C "$legacy_git" fetch --depth=1 origin 72ce1d176aa3dc3a9ece14b9e61ecef9a8ae6b53
+git -C "$legacy_git" archive 72ce1d176aa3dc3a9ece14b9e61ecef9a8ae6b53 | tar -x -C "$archive"
 cp tests/fixtures/legacy-v0.1.3-extended-public-writer/write_legacy_extended_fixture.rs \
   "$archive/examples/"
-mkdir -p "$repo_root/target/logs" "$repo_root/target/compiler-scratch"
-fixture_out=$(mktemp -d "$repo_root/.epic-repositories/legacy-v013-extended-output.XXXXXX")
 cd "$archive"
-flock /home/enamakel/work/openhuman/.git/implementing-an-epic/8131-cargo.lock \
-  /home/enamakel/work/openhuman/worktrees/epic-8131-2-cortex-chunks/scripts/ci-cancel-aware.sh \
-  env TMPDIR="$repo_root/target/compiler-scratch" RUSTC_WRAPPER='' CARGO_BUILD_JOBS=1 \
-  cargo run --locked --manifest-path "$archive/Cargo.toml" \
-    --example write_legacy_extended_fixture -- "$fixture_out"
+cargo run --locked --manifest-path "$archive/Cargo.toml" \
+  --example write_legacy_extended_fixture -- "$fixture_out"
 ```
 
-The recorded generation completed with exit code `0` using the command above
-with output `.epic-repositories/legacy-v013-extended-output`. Its log and exit
-receipt are `target/logs/review31-legacy-v013-extended-generate-01.log` and
-`target/logs/review31-legacy-v013-extended-generate-01.exit`.
+The original manifest and lockfile remain unchanged; the injected example is
+the only source addition. This procedure writes the new database and content
+files under `fixture_out`; compare their hashes with the table above because
+the writer uses the clock and random IDs for some legacy fields.
