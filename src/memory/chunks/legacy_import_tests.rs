@@ -331,11 +331,15 @@ async fn typed_import_preserves_buffer_hotness_and_skip_history_idempotently() {
     assert_eq!(counts.hotness, 1);
     assert_eq!(counts.reembed_skips, 2);
     assert_eq!(
-        crate::memory::tree::store::get_buffer(&config, "legacy-tree", 0).unwrap(),
+        crate::memory::tree::store::get_buffer_async(&config, "legacy-tree", 0)
+            .await
+            .unwrap(),
         batch.buffers[0].buffer
     );
     assert_eq!(
-        crate::memory::tree::store::hotness::get(&config, "person:ada").unwrap(),
+        crate::memory::tree::store::hotness::get_async(&config, "person:ada")
+            .await
+            .unwrap(),
         Some(batch.hotness[0].counters.clone())
     );
     let chunk_skip_key = serde_json::to_string(&(
