@@ -1,19 +1,18 @@
-//! Wire/storage types for the workspace-backed conversation store: threads,
-//! messages, create requests, and partial-update patches.
+//! Public conversation values: threads, messages, create requests, and
+//! partial-update patches.
 //!
-//! These mirror one-to-one the JSONL records persisted under
-//! `<workspace>/memory/conversations/`. The `camelCase` serde renames and the
-//! `type`/`extraMetadata` wire keys are part of the OpenHuman on-disk contract
-//! and must be preserved byte-for-byte so existing transcripts keep loading.
+//! The `camelCase` serde renames and the `type`/`extraMetadata` keys preserve
+//! the established conversation interchange format used by callers and
+//! migration tools.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-/// A persisted conversation thread, mirroring one entry in `threads.jsonl`.
+/// A persisted conversation thread.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct ConversationThread {
-    /// Stable thread identifier; the JSONL key callers reference everywhere.
+    /// Stable thread identifier callers reference everywhere.
     pub id: String,
     /// Human-readable thread title.
     pub title: String,
@@ -42,7 +41,7 @@ pub struct ConversationThread {
     pub personality_id: Option<String>,
 }
 
-/// A single message appended to a thread's JSONL log.
+/// A single message in a thread transcript.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct ConversationMessage {

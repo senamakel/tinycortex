@@ -1,212 +1,859 @@
-//! JSONL-backed thread and message store. Thread metadata lives in
-//! `threads.jsonl` (append-only upsert/delete log); each thread's messages
-//! are appended to a per-thread JSONL file under
-//! `threads/<hex(thread_id)>.jsonl` so arbitrary provider ids remain
-//! filesystem-safe.
+//! Stream-backed conversation persistence.
 //!
-//! On-disk mutations synchronize at the narrowest safe scope: lifecycle per
-//! conversation root, shared metadata per root, and messages per thread.
-//!
-//! Dependency substitutions that keep this crate's `Cargo.toml` untouched:
-//! [`std::sync::LazyLock`] for the statics, the local [`hex_encode`] for
-//! per-thread filenames, and the hand-rolled temp-write in [`rewrite_jsonl`].
-//! They produce the bytes and paths every existing transcript already lives
-//! at, so they must not change.
-//!
-//! The lock registry ([`locks`]) and deterministic-id idempotency were
-//! upstreamed from OpenHuman's host copy of this store.
-//!
-//! # File split
-//!
-//! To respect the repo's file-size limit the `impl ConversationStore` is split
-//! across two child modules — [`ops`] (the public CRUD + search API) and
-//! [`index`] (private thread-folding and inverted-index helpers). Both are
-//! descendant modules of `store`, so they share access to the private statics,
-//! constants, log-entry enum, and JSONL helpers defined here.
+//! Per-thread streams are authoritative. The document collection is only a
+//! rebuildable metadata projection; stream appends and projection updates are
+//! intentionally not described as one cross-port transaction.
 
-use std::collections::HashMap;
-use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
-use std::path::{Path, PathBuf};
-use std::sync::LazyLock;
+use std::path::PathBuf;
 
-use parking_lot::Mutex;
-use uuid::Uuid;
+use serde::{Deserialize, Serialize};
+use serde_json::json;
+use tinystoragedrivers_api::Storage;
+use tinystoragedrivers_types::{Capability, ErrorKind, Precondition, WriteOptions};
 
+use super::collections::THREAD_INDEX;
 use super::inverted_index::InvertedIndex;
 use super::types::{
-    ConversationMessage, ConversationMessagePatch, ConversationThread, CreateConversationThread,
+    is_deterministic_message_id, ConversationMessage, ConversationMessagePatch, ConversationThread,
+    CreateConversationThread, CrossThreadHit,
 };
 
-#[path = "store_ops.rs"]
-mod ops;
+const STREAM_PREFIX: &str = "tinycortex:conversation:";
+const STREAM_PAGE: usize = 512;
+const MAX_WRITE_ATTEMPTS: usize = 128;
 
-#[path = "store_index.rs"]
-mod index;
-#[path = "store_locks.rs"]
-mod locks;
-
-/// Filename of the append-only thread metadata log, relative to the
-/// `memory/conversations` root.
-pub(super) const THREADS_FILENAME: &str = "threads.jsonl";
-/// Subdirectory (relative to the `memory/conversations` root) holding the
-/// per-thread message JSONL files, named `<hex(thread_id)>.jsonl`.
-pub(super) const THREAD_MESSAGES_DIR: &str = "threads";
-
-/// Per-workspace inverted index cache. Keyed by the workspace's
-/// `memory/conversations` root so multiple `ConversationStore` clones
-/// pointing at the same workspace share one index. The cache outlives
-/// individual store handles (which are cloneable PathBuf wrappers); it
-/// is bounded by the number of distinct workspaces a single process
-/// touches, which in practice is one. Tests using `TempDir` paths leave
-/// behind dead entries when the dir is removed — acceptable for an
-/// in-process cache.
-///
-/// # Lock ordering
-///
-/// Every operation first takes the root lifecycle lock. Message operations
-/// then take their per-thread lock and briefly take the metadata lock when
-/// they must inspect or append `threads.jsonl`. When metadata and the index
-/// cache are both needed, metadata is acquired first. No code may acquire a
-/// thread or metadata lock while holding `CONVERSATION_INDEX_CACHE`.
-///
-/// `prime_index_if_cold` minimises shared locking. It may hold both
-/// metadata and index locks only momentarily, and always in the metadata
-/// → `CONVERSATION_INDEX_CACHE` order above: while holding metadata
-/// to snapshot live thread IDs via `thread_index_unlocked`
-/// (header-only, no per-thread I/O) it re-checks the cache once. It then
-/// releases metadata before reading each transcript under that thread's own
-/// lock and finally acquires `CONVERSATION_INDEX_CACHE` alone to insert the
-/// built index. It never holds both across the slow JSONL walk.
-///
-/// `list_threads_unlocked` MUST NOT be used inside the locked snapshot —
-/// it calls `measure_messages_unlocked` per legacy thread (no Stats
-/// history), which reads every per-thread JSONL file and appends a
-/// `Stats` entry to `threads.jsonl`, reintroducing the multi-second
-/// stall under the shared metadata lock that this design was built to avoid.
-static CONVERSATION_INDEX_CACHE: LazyLock<Mutex<HashMap<PathBuf, InvertedIndex>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
-
-/// Counts returned by [`ConversationStore::purge_threads`] — how much was deleted.
-#[derive(Debug, Clone, Copy, Default)]
+/// Counts returned by [`ConversationStore::purge_threads`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ConversationPurgeStats {
-    /// Number of threads removed.
+    /// Number of live threads tombstoned.
     pub thread_count: usize,
-    /// Total messages removed across all purged threads.
+    /// Number of messages in those threads at the time they were read.
     pub message_count: usize,
 }
 
-/// Workspace-rooted handle that reads and writes the JSONL conversation log.
+/// A conversation store bound to prepared host storage.
 #[derive(Debug, Clone)]
 pub struct ConversationStore {
-    root_dir: PathBuf,
-    locks: std::sync::Arc<locks::StoreLocks>,
+    storage: Storage,
+    blocking: crate::memory::storage::Blocking,
+    workspace: PathBuf,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "event", rename_all = "snake_case")]
+enum Event {
+    ThreadUpsert {
+        thread: ConversationThread,
+        updated_at: String,
+    },
+    ThreadDelete {
+        deleted_at: String,
+    },
+    MessageAppend {
+        message: ConversationMessage,
+    },
+    MessageReplace {
+        message: ConversationMessage,
+    },
+    MessagesTruncate {
+        from_message_id: String,
+    },
+}
+
+enum AppendFailure {
+    Conflict,
+    Other(String),
+}
+
+impl AppendFailure {
+    fn message(self) -> String {
+        match self {
+            Self::Conflict => "conversation stream changed too often".into(),
+            Self::Other(message) => message,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ThreadSnapshot {
+    thread: Option<ConversationThread>,
+    updated_at: String,
+    messages: Vec<ConversationMessage>,
+    offset: u64,
 }
 
 impl ConversationStore {
-    /// Construct a store rooted at the given workspace directory.
-    ///
-    /// The conversation root is derived from `workspace_dir` alone
-    /// (`<workspace>/memory/conversations`, see `root_dir` in `store_index.rs`).
-    pub fn new(workspace_dir: PathBuf) -> Self {
-        let root = locks::normalized_root(&workspace_dir.join("memory").join("conversations"));
-        let locks = locks::for_root(&root);
-        Self {
-            root_dir: root,
-            locks,
+    /// Bind the store to an opened configuration. The host must have prepared
+    /// its collections before this handle is created.
+    pub fn open(config: &crate::memory::config::MemoryConfig) -> anyhow::Result<Self> {
+        Ok(Self {
+            storage: config.storage()?.clone(),
+            blocking: config.storage_blocking()?.clone(),
+            workspace: config.workspace.clone(),
+        })
+    }
+
+    /// Workspace associated with the host's storage scope.
+    pub fn workspace(&self) -> &std::path::Path {
+        &self.workspace
+    }
+
+    fn stream_name(thread_id: &str) -> String {
+        format!("{STREAM_PREFIX}{}", hex(thread_id.as_bytes()))
+    }
+
+    fn document_id(thread_id: &str) -> String {
+        hex(thread_id.as_bytes())
+    }
+
+    async fn read_stream(&self, thread_id: &str) -> Result<(Vec<Event>, u64), String> {
+        let streams = self.storage.streams();
+        let name = Self::stream_name(thread_id);
+        // Streams are append-only, so fixing the end before paging gives this
+        // read one coherent prefix even while another writer appends.
+        let length = streams
+            .len(&name)
+            .await
+            .map_err(|error| error.to_string())?;
+        let mut cursor = 0_u64;
+        let mut events = Vec::new();
+        while cursor < length {
+            let remaining = usize::try_from(length - cursor).unwrap_or(usize::MAX);
+            let page = streams
+                .read_window(&name, cursor, remaining.min(STREAM_PAGE))
+                .await
+                .map_err(|error| error.to_string())?;
+            if page.is_empty() {
+                return Err(format!(
+                    "conversation stream {thread_id} ended before captured offset {length}"
+                ));
+            }
+            for entry in page {
+                if entry.offset != cursor {
+                    return Err(format!(
+                        "conversation stream {thread_id} returned offset {}, expected {cursor}",
+                        entry.offset
+                    ));
+                }
+                events.push(
+                    serde_json::from_value(entry.value)
+                        .map_err(|error| format!("decode conversation stream: {error}"))?,
+                );
+                cursor = entry.offset.saturating_add(1);
+            }
+        }
+        Ok((events, length))
+    }
+
+    fn fold(thread_id: &str, events: &[Event], offset: u64) -> ThreadSnapshot {
+        let mut thread: Option<ConversationThread> = None;
+        let mut updated_at = String::new();
+        let mut messages: Vec<ConversationMessage> = Vec::new();
+        for event in events {
+            match event {
+                Event::ThreadUpsert {
+                    thread: next,
+                    updated_at: at,
+                } => {
+                    let mut next = next.clone();
+                    if let Some(previous) = &thread {
+                        next.created_at = previous.created_at.clone();
+                        if next.labels.is_empty() {
+                            next.labels = previous.labels.clone();
+                        }
+                        if next.parent_thread_id.is_none() {
+                            next.parent_thread_id = previous.parent_thread_id.clone();
+                        }
+                        if next.personality_id.is_none() {
+                            next.personality_id = previous.personality_id.clone();
+                        }
+                    } else if next.labels.is_empty() {
+                        next.labels = super::store::infer_labels(thread_id);
+                    }
+                    next.message_count = messages.len();
+                    next.last_message_at = messages
+                        .last()
+                        .map(|message| message.created_at.clone())
+                        .unwrap_or_else(|| next.created_at.clone());
+                    next.is_active = true;
+                    thread = Some(next);
+                    updated_at = at.clone();
+                }
+                Event::ThreadDelete { .. } => {
+                    thread = None;
+                    messages.clear();
+                }
+                Event::MessageAppend { message } => {
+                    if !messages.iter().any(|existing| existing.id == message.id) {
+                        messages.push(message.clone());
+                    }
+                }
+                Event::MessageReplace { message } => {
+                    if let Some(existing) = messages.iter_mut().find(|item| item.id == message.id) {
+                        *existing = message.clone();
+                    }
+                }
+                Event::MessagesTruncate { from_message_id } => {
+                    if let Some(index) =
+                        messages.iter().position(|item| item.id == *from_message_id)
+                    {
+                        messages.truncate(index);
+                    }
+                }
+            }
+        }
+        if let Some(current) = &mut thread {
+            current.message_count = messages.len();
+            current.last_message_at = messages
+                .last()
+                .map(|message| message.created_at.clone())
+                .unwrap_or_else(|| current.created_at.clone());
+        }
+        ThreadSnapshot {
+            thread,
+            updated_at,
+            messages,
+            offset,
         }
     }
 
-    /// Construct a store rooted at the engine's configured workspace
-    /// ([`MemoryConfig::workspace`](crate::memory::config::MemoryConfig)).
-    pub fn from_config(config: &crate::memory::config::MemoryConfig) -> Self {
-        Self::new(config.workspace.clone())
+    async fn snapshot(&self, thread_id: &str) -> Result<ThreadSnapshot, String> {
+        let (events, length) = self.read_stream(thread_id).await?;
+        Ok(Self::fold(thread_id, &events, length))
     }
 
-    #[cfg(test)]
-    pub(super) fn lock_identity_for_test(&self) -> usize {
-        std::sync::Arc::as_ptr(&self.locks) as usize
+    async fn append_event_at(
+        &self,
+        thread_id: &str,
+        expected_offset: u64,
+        event: Event,
+    ) -> Result<u64, AppendFailure> {
+        let streams = self.storage.streams();
+        if !streams
+            .capabilities()
+            .contains(Capability::ConditionalStreamAppend)
+        {
+            return Err(AppendFailure::Other(
+                "conversation writes require ConditionalStreamAppend storage capability".into(),
+            ));
+        }
+        let value =
+            serde_json::to_value(event).map_err(|error| AppendFailure::Other(error.to_string()))?;
+        streams
+            .append_batch_if_offset(&Self::stream_name(thread_id), expected_offset, vec![value])
+            .await
+            .map_err(|error| {
+                if error.kind() == ErrorKind::Conflict {
+                    AppendFailure::Conflict
+                } else {
+                    AppendFailure::Other(error.to_string())
+                }
+            })
     }
 
-    #[cfg(test)]
-    pub(super) fn thread_lock_count_for_test(&self) -> usize {
-        self.locks.thread_count()
+    async fn project(&self, thread_id: &str, snapshot: &ThreadSnapshot) -> Result<(), String> {
+        let documents = self.storage.documents();
+        let id = Self::document_id(thread_id);
+        for _ in 0..MAX_WRITE_ATTEMPTS {
+            let current = documents
+                .get(THREAD_INDEX, &id)
+                .await
+                .map_err(|error| error.to_string())?;
+            if current.as_ref().is_some_and(|record| {
+                record.doc["stream_offset"].as_u64().unwrap_or(0) >= snapshot.offset
+            }) {
+                return Ok(());
+            }
+            let Some(thread) = &snapshot.thread else {
+                if let Some(current) = current {
+                    match documents
+                        .delete(THREAD_INDEX, &id, Precondition::Version(current.version))
+                        .await
+                    {
+                        Ok(_) => return Ok(()),
+                        Err(error) if error.kind() == ErrorKind::Conflict => continue,
+                        Err(error) => return Err(error.to_string()),
+                    }
+                }
+                return Ok(());
+            };
+            let body = json!({
+                "thread_id": thread_id,
+                "title": thread.title,
+                "created_at": thread.created_at,
+                "updated_at": snapshot.updated_at,
+                "parent_thread_id": thread.parent_thread_id,
+                "labels": thread.labels,
+                "personality_id": thread.personality_id,
+                "message_count": thread.message_count,
+                "last_message_at": thread.last_message_at,
+                "stream_offset": snapshot.offset,
+            });
+            let precondition = current
+                .as_ref()
+                .map(|record| Precondition::Version(record.version))
+                .unwrap_or(Precondition::Absent);
+            match documents
+                .put_with(
+                    THREAD_INDEX,
+                    &id,
+                    body,
+                    precondition,
+                    WriteOptions::default(),
+                )
+                .await
+            {
+                Ok(_) => return Ok(()),
+                Err(error) if error.kind() == ErrorKind::Conflict => continue,
+                Err(error) => return Err(error.to_string()),
+            }
+        }
+        Err("conversation projection changed too often".into())
+    }
+
+    /// Create or touch a thread. The event stream is durable before the
+    /// derived document projection is updated; a failed projection is repaired
+    /// by the next operation that projects the thread.
+    pub async fn ensure_thread_async(
+        &self,
+        request: CreateConversationThread,
+    ) -> Result<ConversationThread, String> {
+        for _ in 0..MAX_WRITE_ATTEMPTS {
+            let before = self.snapshot(&request.id).await?;
+            let mut thread = before.thread.clone().unwrap_or_else(|| ConversationThread {
+                id: request.id.clone(),
+                title: request.title.clone(),
+                chat_id: None,
+                is_active: true,
+                message_count: before.messages.len(),
+                last_message_at: before
+                    .messages
+                    .last()
+                    .map(|message| message.created_at.clone())
+                    .unwrap_or_else(|| request.created_at.clone()),
+                created_at: request.created_at.clone(),
+                parent_thread_id: request.parent_thread_id.clone(),
+                labels: request
+                    .labels
+                    .clone()
+                    .map(super::store::normalize_labels)
+                    .unwrap_or_else(|| super::store::infer_labels(&request.id)),
+                personality_id: request.personality_id.clone(),
+            });
+            thread.title = request.title.clone();
+            if let Some(parent) = &request.parent_thread_id {
+                thread.parent_thread_id = Some(parent.clone());
+            }
+            if let Some(labels) = &request.labels {
+                thread.labels = super::store::normalize_labels(labels.clone());
+            }
+            if let Some(personality) = &request.personality_id {
+                thread.personality_id = Some(personality.clone());
+            }
+            thread.is_active = true;
+            match self
+                .append_event_at(
+                    &request.id,
+                    before.offset,
+                    Event::ThreadUpsert {
+                        thread: thread.clone(),
+                        updated_at: request.created_at.clone(),
+                    },
+                )
+                .await
+            {
+                Err(AppendFailure::Conflict) => continue,
+                Err(error) => return Err(error.message()),
+                Ok(_) => {
+                    let snapshot = self.snapshot(&request.id).await?;
+                    self.project(&request.id, &snapshot).await?;
+                    return Ok(snapshot.thread.unwrap_or(thread));
+                }
+            }
+        }
+        Err("conversation stream changed too often".into())
+    }
+
+    /// List live threads in descending update time, matching the legacy
+    /// conversation list ordering.
+    pub async fn list_threads_async(&self) -> Result<Vec<ConversationThread>, String> {
+        let names = self
+            .storage
+            .streams()
+            .streams(STREAM_PREFIX)
+            .await
+            .map_err(|error| error.to_string())?;
+        let mut threads = Vec::new();
+        for name in names {
+            let Some(thread_id) = decode_stream_id(&name) else {
+                continue;
+            };
+            let snapshot = self.snapshot(&thread_id).await?;
+            if let Some(thread) = snapshot.thread {
+                threads.push((snapshot.updated_at, thread));
+            }
+        }
+        threads.sort_by(|left, right| {
+            right
+                .1
+                .last_message_at
+                .cmp(&left.1.last_message_at)
+                .then_with(|| left.1.id.cmp(&right.1.id))
+                .then_with(|| right.0.cmp(&left.0))
+        });
+        Ok(threads.into_iter().map(|(_, thread)| thread).collect())
+    }
+
+    /// Read messages in their append order.
+    pub async fn get_messages_async(
+        &self,
+        thread_id: &str,
+    ) -> Result<Vec<ConversationMessage>, String> {
+        Ok(self.snapshot(thread_id).await?.messages)
+    }
+
+    /// Append one message. Deterministic message ids are deduplicated against
+    /// the stream's current contents; arbitrary client ids retain append
+    /// semantics.
+    pub async fn append_message_async(
+        &self,
+        thread_id: &str,
+        message: ConversationMessage,
+    ) -> Result<ConversationMessage, String> {
+        for _ in 0..MAX_WRITE_ATTEMPTS {
+            let before = self.snapshot(thread_id).await?;
+            if before.thread.is_none() {
+                return Err(format!("thread {thread_id} not found"));
+            }
+            if is_deterministic_message_id(&message.id) {
+                if let Some(existing) = before.messages.iter().find(|item| item.id == message.id) {
+                    return Ok(existing.clone());
+                }
+            }
+            match self
+                .append_event_at(
+                    thread_id,
+                    before.offset,
+                    Event::MessageAppend {
+                        message: message.clone(),
+                    },
+                )
+                .await
+            {
+                Err(AppendFailure::Conflict) => continue,
+                Err(error) => return Err(error.message()),
+                Ok(_) => {
+                    let snapshot = self.snapshot(thread_id).await?;
+                    self.project(thread_id, &snapshot).await?;
+                    return Ok(snapshot
+                        .messages
+                        .iter()
+                        .find(|item| item.id == message.id)
+                        .cloned()
+                        .unwrap_or(message));
+                }
+            }
+        }
+        Err("conversation stream changed too often".into())
+    }
+
+    /// Substring search over live conversation messages.
+    pub async fn search_cross_thread_messages_async(
+        &self,
+        query: &str,
+        limit: usize,
+        exclude_thread_id: Option<&str>,
+    ) -> Result<Vec<CrossThreadHit>, String> {
+        let names = self
+            .storage
+            .streams()
+            .streams(STREAM_PREFIX)
+            .await
+            .map_err(|error| error.to_string())?;
+        let mut index = InvertedIndex::new();
+        for name in names {
+            if let Some(thread_id) = decode_stream_id(&name) {
+                let snapshot = self.snapshot(&thread_id).await?;
+                if snapshot.thread.is_some() {
+                    for message in snapshot.messages {
+                        index.insert(&thread_id, message);
+                    }
+                }
+            }
+        }
+        Ok(index.search(query, limit, exclude_thread_id))
+    }
+
+    /// Update a thread title while preserving its other metadata.
+    pub async fn update_thread_title_async(
+        &self,
+        thread_id: &str,
+        title: &str,
+        updated_at: &str,
+    ) -> Result<ConversationThread, String> {
+        for _ in 0..MAX_WRITE_ATTEMPTS {
+            let before = self.snapshot(thread_id).await?;
+            let mut thread = before
+                .thread
+                .clone()
+                .ok_or_else(|| format!("thread {thread_id} not found"))?;
+            thread.title = title.to_string();
+            match self
+                .append_event_at(
+                    thread_id,
+                    before.offset,
+                    Event::ThreadUpsert {
+                        thread,
+                        updated_at: updated_at.to_string(),
+                    },
+                )
+                .await
+            {
+                Err(AppendFailure::Conflict) => continue,
+                Err(error) => return Err(error.message()),
+                Ok(_) => {
+                    let latest = self.snapshot(thread_id).await?;
+                    self.project(thread_id, &latest).await?;
+                    return latest
+                        .thread
+                        .ok_or_else(|| format!("thread {thread_id} missing after update"));
+                }
+            }
+        }
+        Err("conversation stream changed too often".into())
+    }
+
+    /// Replace a thread's label set.
+    pub async fn update_thread_labels_async(
+        &self,
+        thread_id: &str,
+        labels: Vec<String>,
+        updated_at: &str,
+    ) -> Result<ConversationThread, String> {
+        let labels = super::store::normalize_labels(labels);
+        for _ in 0..MAX_WRITE_ATTEMPTS {
+            let before = self.snapshot(thread_id).await?;
+            let mut thread = before
+                .thread
+                .clone()
+                .ok_or_else(|| format!("thread {thread_id} not found"))?;
+            thread.labels = labels.clone();
+            match self
+                .append_event_at(
+                    thread_id,
+                    before.offset,
+                    Event::ThreadUpsert {
+                        thread,
+                        updated_at: updated_at.to_string(),
+                    },
+                )
+                .await
+            {
+                Err(AppendFailure::Conflict) => continue,
+                Err(error) => return Err(error.message()),
+                Ok(_) => {
+                    let latest = self.snapshot(thread_id).await?;
+                    self.project(thread_id, &latest).await?;
+                    return latest
+                        .thread
+                        .ok_or_else(|| format!("thread {thread_id} missing after update"));
+                }
+            }
+        }
+        Err("conversation stream changed too often".into())
+    }
+
+    /// Patch one message's metadata.
+    pub async fn update_message_async(
+        &self,
+        thread_id: &str,
+        message_id: &str,
+        patch: ConversationMessagePatch,
+    ) -> Result<ConversationMessage, String> {
+        for _ in 0..MAX_WRITE_ATTEMPTS {
+            let snapshot = self.snapshot(thread_id).await?;
+            let mut message = snapshot
+                .messages
+                .iter()
+                .find(|item| item.id == message_id)
+                .cloned()
+                .ok_or_else(|| format!("message {message_id} not found in thread {thread_id}"))?;
+            if let Some(extra_metadata) = &patch.extra_metadata {
+                message.extra_metadata = extra_metadata.clone();
+            }
+            match self
+                .append_event_at(
+                    thread_id,
+                    snapshot.offset,
+                    Event::MessageReplace {
+                        message: message.clone(),
+                    },
+                )
+                .await
+            {
+                Err(AppendFailure::Conflict) => continue,
+                Err(error) => return Err(error.message()),
+                Ok(_) => {
+                    let latest = self.snapshot(thread_id).await?;
+                    self.project(thread_id, &latest).await?;
+                    return Ok(message);
+                }
+            }
+        }
+        Err("conversation stream changed too often".into())
+    }
+
+    /// Remove `message_id` and every later message from the logical transcript.
+    pub async fn delete_messages_from_async(
+        &self,
+        thread_id: &str,
+        message_id: &str,
+    ) -> Result<Option<usize>, String> {
+        for _ in 0..MAX_WRITE_ATTEMPTS {
+            let snapshot = self.snapshot(thread_id).await?;
+            let Some(index) = snapshot
+                .messages
+                .iter()
+                .position(|item| item.id == message_id)
+            else {
+                return Ok(None);
+            };
+            let removed = snapshot.messages.len() - index;
+            match self
+                .append_event_at(
+                    thread_id,
+                    snapshot.offset,
+                    Event::MessagesTruncate {
+                        from_message_id: message_id.to_string(),
+                    },
+                )
+                .await
+            {
+                Err(AppendFailure::Conflict) => continue,
+                Err(error) => return Err(error.message()),
+                Ok(_) => {
+                    let latest = self.snapshot(thread_id).await?;
+                    self.project(thread_id, &latest).await?;
+                    return Ok(Some(removed));
+                }
+            }
+        }
+        Err("conversation stream changed too often".into())
+    }
+
+    /// Tombstone a thread without deleting its stream history.
+    pub async fn delete_thread_async(
+        &self,
+        thread_id: &str,
+        deleted_at: &str,
+    ) -> Result<bool, String> {
+        for _ in 0..MAX_WRITE_ATTEMPTS {
+            let before = self.snapshot(thread_id).await?;
+            if before.thread.is_none() {
+                return Ok(false);
+            }
+            match self
+                .append_event_at(
+                    thread_id,
+                    before.offset,
+                    Event::ThreadDelete {
+                        deleted_at: deleted_at.to_string(),
+                    },
+                )
+                .await
+            {
+                Err(AppendFailure::Conflict) => continue,
+                Err(error) => return Err(error.message()),
+                Ok(_) => {
+                    let latest = self.snapshot(thread_id).await?;
+                    self.project(thread_id, &latest).await?;
+                    return Ok(true);
+                }
+            }
+        }
+        Err("conversation stream changed too often".into())
+    }
+
+    /// Tombstone every live thread. Stream history remains the recovery source.
+    pub async fn purge_threads_async(&self) -> Result<ConversationPurgeStats, String> {
+        let threads = self.list_threads_async().await?;
+        let mut stats = ConversationPurgeStats::default();
+        for thread in threads {
+            stats.thread_count += 1;
+            stats.message_count += thread.message_count;
+            self.delete_thread_async(&thread.id, &thread.last_message_at)
+                .await?;
+        }
+        Ok(stats)
+    }
+
+    pub fn ensure_thread(
+        &self,
+        request: CreateConversationThread,
+    ) -> Result<ConversationThread, String> {
+        let store = self.clone();
+        self.blocking
+            .run(async move { store.ensure_thread_async(request).await })
+            .map_err(|error| error.to_string())?
+    }
+
+    pub fn list_threads(&self) -> Result<Vec<ConversationThread>, String> {
+        let store = self.clone();
+        self.blocking
+            .run(async move { store.list_threads_async().await })
+            .map_err(|error| error.to_string())?
+    }
+
+    pub fn get_messages(&self, thread_id: &str) -> Result<Vec<ConversationMessage>, String> {
+        let store = self.clone();
+        let thread_id = thread_id.to_string();
+        self.blocking
+            .run(async move { store.get_messages_async(&thread_id).await })
+            .map_err(|error| error.to_string())?
+    }
+
+    pub fn append_message(
+        &self,
+        thread_id: &str,
+        message: ConversationMessage,
+    ) -> Result<ConversationMessage, String> {
+        let store = self.clone();
+        let thread_id = thread_id.to_string();
+        self.blocking
+            .run(async move { store.append_message_async(&thread_id, message).await })
+            .map_err(|error| error.to_string())?
+    }
+
+    pub fn search_cross_thread_messages(
+        &self,
+        query: &str,
+        limit: usize,
+        exclude_thread_id: Option<&str>,
+    ) -> Result<Vec<CrossThreadHit>, String> {
+        let store = self.clone();
+        let query = query.to_string();
+        let exclude_thread_id = exclude_thread_id.map(str::to_string);
+        self.blocking
+            .run(async move {
+                store
+                    .search_cross_thread_messages_async(&query, limit, exclude_thread_id.as_deref())
+                    .await
+            })
+            .map_err(|error| error.to_string())?
+    }
+
+    pub fn update_thread_title(
+        &self,
+        thread_id: &str,
+        title: &str,
+        updated_at: &str,
+    ) -> Result<ConversationThread, String> {
+        let store = self.clone();
+        let thread_id = thread_id.to_string();
+        let title = title.to_string();
+        let updated_at = updated_at.to_string();
+        self.blocking
+            .run(async move {
+                store
+                    .update_thread_title_async(&thread_id, &title, &updated_at)
+                    .await
+            })
+            .map_err(|error| error.to_string())?
+    }
+
+    pub fn update_thread_labels(
+        &self,
+        thread_id: &str,
+        labels: Vec<String>,
+        updated_at: &str,
+    ) -> Result<ConversationThread, String> {
+        let store = self.clone();
+        let thread_id = thread_id.to_string();
+        let updated_at = updated_at.to_string();
+        self.blocking
+            .run(async move {
+                store
+                    .update_thread_labels_async(&thread_id, labels, &updated_at)
+                    .await
+            })
+            .map_err(|error| error.to_string())?
+    }
+
+    pub fn update_message(
+        &self,
+        thread_id: &str,
+        message_id: &str,
+        patch: ConversationMessagePatch,
+    ) -> Result<ConversationMessage, String> {
+        let store = self.clone();
+        let thread_id = thread_id.to_string();
+        let message_id = message_id.to_string();
+        self.blocking
+            .run(async move {
+                store
+                    .update_message_async(&thread_id, &message_id, patch)
+                    .await
+            })
+            .map_err(|error| error.to_string())?
+    }
+
+    pub fn delete_messages_from(
+        &self,
+        thread_id: &str,
+        message_id: &str,
+    ) -> Result<Option<usize>, String> {
+        let store = self.clone();
+        let thread_id = thread_id.to_string();
+        let message_id = message_id.to_string();
+        self.blocking
+            .run(async move {
+                store
+                    .delete_messages_from_async(&thread_id, &message_id)
+                    .await
+            })
+            .map_err(|error| error.to_string())?
+    }
+
+    pub fn delete_thread(&self, thread_id: &str, deleted_at: &str) -> Result<bool, String> {
+        let store = self.clone();
+        let thread_id = thread_id.to_string();
+        let deleted_at = deleted_at.to_string();
+        self.blocking
+            .run(async move { store.delete_thread_async(&thread_id, &deleted_at).await })
+            .map_err(|error| error.to_string())?
+    }
+
+    pub fn purge_threads(&self) -> Result<ConversationPurgeStats, String> {
+        let store = self.clone();
+        self.blocking
+            .run(async move { store.purge_threads_async().await })
+            .map_err(|error| error.to_string())?
     }
 }
 
-/// One line in `threads.jsonl`. The append-only log is folded into the current
-/// thread state by [`ConversationStore::thread_index_unlocked`].
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-#[serde(tag = "op", rename_all = "snake_case")]
-pub(super) enum ThreadLogEntry {
-    /// Create-or-replace the metadata for `thread_id`. The latest `Upsert`
-    /// wins when the log is folded; `op` wire string is `upsert`.
-    ///
-    /// NOTE (audit TR-8): `labels: Some(_)` always **replaces** the folded
-    /// label set (see `thread_index_unlocked`'s `Upsert` handling) — it is
-    /// not a merge. Callers that want to touch a thread without disturbing
-    /// its labels (e.g. per-message thread upserts) must pass `labels: None`;
-    /// `bus::persist_channel_turn` currently does not, and so resets a
-    /// user-set label back to `["general"]` on every channel message.
-    Upsert {
-        thread_id: String,
-        title: String,
-        created_at: String,
-        updated_at: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        parent_thread_id: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        labels: Option<Vec<String>>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        personality_id: Option<String>,
-    },
-    /// Tombstone removing `thread_id` from the folded state; `op` wire string
-    /// is `delete`.
-    Delete {
-        thread_id: String,
-        deleted_at: String,
-    },
-    /// Single message appended to a thread. Increments `message_count` by 1
-    /// and overwrites `last_message_at`. Emitted by `append_message` to keep
-    /// list_threads O(threads.jsonl) instead of O(total messages).
-    MessageAppended {
-        thread_id: String,
-        last_message_at: String,
-    },
-    /// Absolute stat snapshot — overrides the running count + timestamp.
-    /// Used to backfill legacy threads whose messages were written before
-    /// `MessageAppended` existed.
-    Stats {
-        thread_id: String,
-        message_count: usize,
-        last_message_at: String,
-    },
+fn hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        output.push(HEX[(byte >> 4) as usize] as char);
+        output.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    output
 }
 
-/// Folded current state for a single thread, derived from the log.
-#[derive(Debug, Clone)]
-pub(super) struct ThreadIndexEntry {
-    /// Human-readable thread title from the latest `Upsert`.
-    pub(super) title: String,
-    /// Thread creation timestamp from the first `Upsert`.
-    pub(super) created_at: String,
-    /// Parent thread id for nested/threaded conversations, if any.
-    pub(super) parent_thread_id: Option<String>,
-    /// Folded labels (already normalised/inferred) bucketing this thread.
-    pub(super) labels: Vec<String>,
-    /// Folded message count. `None` means we have no `MessageAppended` /
-    /// `Stats` history for this thread yet (legacy data) — `list_threads`
-    /// backfills by doing a one-shot read of the per-thread messages file.
-    pub(super) message_count: Option<usize>,
-    /// Timestamp of the newest message, or `None` if unknown (legacy).
-    pub(super) last_message_at: Option<String>,
-    /// Personality/persona id bound to this thread, if any.
-    pub(super) personality_id: Option<String>,
+fn decode_stream_id(stream: &str) -> Option<String> {
+    let encoded = stream.strip_prefix(STREAM_PREFIX)?;
+    if encoded.len() % 2 != 0 {
+        return None;
+    }
+    let bytes = (0..encoded.len())
+        .step_by(2)
+        .map(|index| u8::from_str_radix(&encoded[index..index + 2], 16).ok())
+        .collect::<Option<Vec<_>>>()?;
+    String::from_utf8(bytes).ok()
 }
 
-/// Default labels for a thread whose `Upsert` carried none, inferred from its
-/// id namespace (proactive briefings/notifications vs ordinary chats).
-pub(super) fn infer_labels(thread_id: &str) -> Vec<String> {
+fn infer_labels(thread_id: &str) -> Vec<String> {
     if thread_id == "proactive:morning_briefing" {
         vec!["briefing".to_string()]
     } else if thread_id.starts_with("proactive:") {
@@ -216,252 +863,102 @@ pub(super) fn infer_labels(thread_id: &str) -> Vec<String> {
     }
 }
 
-/// Canonicalise legacy label spellings into their current buckets and dedupe.
-pub(super) fn normalize_labels(labels: Vec<String>) -> Vec<String> {
+fn normalize_labels(labels: Vec<String>) -> Vec<String> {
     let mut normalized = Vec::with_capacity(labels.len());
     for label in labels {
-        let next = match label.as_str() {
+        let label = match label.as_str() {
             "work" => "general".to_string(),
             "from_reflection" | "subconscious_tick" => "subconscious".to_string(),
             "agent-task" | "worker" => "tasks".to_string(),
             _ => label,
         };
-        if !normalized.contains(&next) {
-            normalized.push(next);
+        if !normalized.contains(&label) {
+            normalized.push(label);
         }
     }
     normalized
 }
 
-/// Lowercase hex-encode bytes — used to derive a filesystem-safe per-thread
-/// messages filename from an arbitrary thread id.
-///
-/// This exists because the memory engine had no `hex` dependency; this crate
-/// does, so `hex::encode` would work here. It is kept anyway: this is the
-/// function that decides which file a user's transcript is read from and
-/// written to, and swapping it is only provably safe, never *obviously* safe.
-/// The three lines are cheaper than the argument.
-pub(super) fn hex_encode(bytes: &[u8]) -> String {
-    const HEX: [u8; 16] = *b"0123456789abcdef";
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for &b in bytes {
-        out.push(HEX[(b >> 4) as usize] as char);
-        out.push(HEX[(b & 0x0f) as usize] as char);
-    }
-    out
+fn open_error(config: &crate::memory::config::MemoryConfig) -> Result<ConversationStore, String> {
+    ConversationStore::open(config).map_err(|error| error.to_string())
 }
 
-/// Read a JSONL file into a vector, skipping blank and invalid lines so a
-/// single corrupt line never loses the rest of the transcript.
-pub(super) fn read_jsonl<T>(path: &Path) -> Result<Vec<T>, String>
-where
-    T: for<'de> serde::Deserialize<'de>,
-{
-    if !path.exists() {
-        return Ok(Vec::new());
-    }
-    let file = File::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
-    let reader = BufReader::new(file);
-    let mut items = Vec::new();
-    for (line_no, line) in reader.lines().enumerate() {
-        let line =
-            line.map_err(|e| format!("read {} line {}: {e}", path.display(), line_no + 1))?;
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        if let Ok(value) = serde_json::from_str::<T>(trimmed) {
-            items.push(value);
-        }
-    }
-    Ok(items)
-}
-
-/// Find one message in a thread's JSONL log by id, without materializing the
-/// whole transcript.
-///
-/// Only the lines whose raw text carries the quoted id are deserialized, so a
-/// lookup costs one parse rather than one per stored message; a line that
-/// merely quotes the id inside its own content is rejected by the `id` check.
-/// Mirrors [`read_jsonl`]'s tolerance of blank and corrupt lines.
-pub(super) fn find_message_by_id(
-    path: &Path,
-    id: &str,
-) -> Result<Option<ConversationMessage>, String> {
-    if !path.exists() {
-        return Ok(None);
-    }
-    let needle = serde_json::to_string(id).map_err(|e| format!("encode message id {id}: {e}"))?;
-    let file = File::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
-    for (line_no, line) in BufReader::new(file).lines().enumerate() {
-        let line =
-            line.map_err(|e| format!("read {} line {}: {e}", path.display(), line_no + 1))?;
-        if !line.contains(&needle) {
-            continue;
-        }
-        match serde_json::from_str::<ConversationMessage>(&line) {
-            Ok(message) if message.id == id => return Ok(Some(message)),
-            _ => continue,
-        }
-    }
-    Ok(None)
-}
-
-/// Append one serialized value as a JSONL line, fsync'd before returning.
-pub(super) fn append_jsonl<T>(path: &Path, value: &T) -> Result<(), String>
-where
-    T: serde::Serialize,
-{
-    let parent = path
-        .parent()
-        .ok_or_else(|| format!("resolve parent dir for {}", path.display()))?;
-    fs::create_dir_all(parent)
-        .map_err(|e| format!("create jsonl dir {}: {e}", parent.display()))?;
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .map_err(|e| format!("open {} for append: {e}", path.display()))?;
-    let line = serde_json::to_string(value)
-        .map_err(|e| format!("serialize jsonl line for {}: {e}", path.display()))?;
-    writeln!(file, "{line}").map_err(|e| format!("write {}: {e}", path.display()))?;
-    file.sync_all()
-        .map_err(|e| format!("sync {}: {e}", path.display()))?;
-    Ok(())
-}
-
-/// Atomically rewrite `path` with `values`, one JSON object per line.
-///
-/// Writes to a sibling temp file then renames over the target so a crash
-/// mid-write never leaves a partially-written transcript.
-///
-/// This hand-rolls what OpenHuman originally got from
-/// `tempfile::NamedTempFile`, because the memory engine carried `tempfile` as
-/// a dev-dependency only. This crate has it in full, so the substitution is no
-/// longer forced — but reverting it would change the temp file's name, its
-/// permissions, and which side deletes it when a write fails. That is a change
-/// to the crash-safety path for a user's transcript, and it belongs in a
-/// change that is about that, not in a module move.
-pub(super) fn rewrite_jsonl<T>(path: &Path, values: &[T]) -> Result<(), String>
-where
-    T: serde::Serialize,
-{
-    let parent = path
-        .parent()
-        .ok_or_else(|| format!("resolve parent dir for {}", path.display()))?;
-    fs::create_dir_all(parent)
-        .map_err(|e| format!("create jsonl dir {}: {e}", parent.display()))?;
-    let tmp_path = parent.join(format!(".conversations-{}.tmp", Uuid::new_v4()));
-    let write_result = (|| -> Result<(), String> {
-        let mut temp = File::create(&tmp_path)
-            .map_err(|e| format!("create temp jsonl in {}: {e}", parent.display()))?;
-        for value in values {
-            let line = serde_json::to_string(value)
-                .map_err(|e| format!("serialize jsonl line for {}: {e}", path.display()))?;
-            writeln!(temp, "{line}")
-                .map_err(|e| format!("write temp jsonl for {}: {e}", path.display()))?;
-        }
-        temp.sync_all()
-            .map_err(|e| format!("sync temp jsonl for {}: {e}", path.display()))?;
-        Ok(())
-    })();
-    if let Err(error) = write_result {
-        let _ = fs::remove_file(&tmp_path);
-        return Err(error);
-    }
-    if let Err(error) = fs::rename(&tmp_path, path) {
-        let _ = fs::remove_file(&tmp_path);
-        return Err(format!("persist {}: {error}", path.display()));
-    }
-    Ok(())
-}
-
-/// Free-function shim around [`ConversationStore::ensure_thread`].
 pub fn ensure_thread(
-    workspace_dir: PathBuf,
+    config: &crate::memory::config::MemoryConfig,
     request: CreateConversationThread,
 ) -> Result<ConversationThread, String> {
-    ConversationStore::new(workspace_dir).ensure_thread(request)
+    open_error(config)?.ensure_thread(request)
 }
 
-/// Free-function shim around [`ConversationStore::list_threads`].
-pub fn list_threads(workspace_dir: PathBuf) -> Result<Vec<ConversationThread>, String> {
-    ConversationStore::new(workspace_dir).list_threads()
+pub fn list_threads(
+    config: &crate::memory::config::MemoryConfig,
+) -> Result<Vec<ConversationThread>, String> {
+    open_error(config)?.list_threads()
 }
 
-/// Free-function shim around [`ConversationStore::get_messages`].
 pub fn get_messages(
-    workspace_dir: PathBuf,
+    config: &crate::memory::config::MemoryConfig,
     thread_id: &str,
 ) -> Result<Vec<ConversationMessage>, String> {
-    ConversationStore::new(workspace_dir).get_messages(thread_id)
+    open_error(config)?.get_messages(thread_id)
 }
 
-/// Free-function shim around [`ConversationStore::append_message`].
 pub fn append_message(
-    workspace_dir: PathBuf,
+    config: &crate::memory::config::MemoryConfig,
     thread_id: &str,
     message: ConversationMessage,
 ) -> Result<ConversationMessage, String> {
-    ConversationStore::new(workspace_dir).append_message(thread_id, message)
+    open_error(config)?.append_message(thread_id, message)
 }
 
-/// Free-function shim around [`ConversationStore::update_thread_title`].
 pub fn update_thread_title(
-    workspace_dir: PathBuf,
+    config: &crate::memory::config::MemoryConfig,
     thread_id: &str,
     title: &str,
     updated_at: &str,
 ) -> Result<ConversationThread, String> {
-    ConversationStore::new(workspace_dir).update_thread_title(thread_id, title, updated_at)
+    open_error(config)?.update_thread_title(thread_id, title, updated_at)
 }
 
-/// Free-function shim around [`ConversationStore::update_thread_labels`].
 pub fn update_thread_labels(
-    workspace_dir: PathBuf,
+    config: &crate::memory::config::MemoryConfig,
     thread_id: &str,
     labels: Vec<String>,
     updated_at: &str,
 ) -> Result<ConversationThread, String> {
-    ConversationStore::new(workspace_dir).update_thread_labels(thread_id, labels, updated_at)
+    open_error(config)?.update_thread_labels(thread_id, labels, updated_at)
 }
 
-/// Free-function shim around [`ConversationStore::update_message`].
 pub fn update_message(
-    workspace_dir: PathBuf,
+    config: &crate::memory::config::MemoryConfig,
     thread_id: &str,
     message_id: &str,
     patch: ConversationMessagePatch,
 ) -> Result<ConversationMessage, String> {
-    ConversationStore::new(workspace_dir).update_message(thread_id, message_id, patch)
+    open_error(config)?.update_message(thread_id, message_id, patch)
 }
 
-/// Free-function shim around [`ConversationStore::delete_messages_from`].
 pub fn delete_messages_from(
-    workspace_dir: PathBuf,
+    config: &crate::memory::config::MemoryConfig,
     thread_id: &str,
     message_id: &str,
 ) -> Result<Option<usize>, String> {
-    ConversationStore::new(workspace_dir).delete_messages_from(thread_id, message_id)
+    open_error(config)?.delete_messages_from(thread_id, message_id)
 }
 
-/// Free-function shim around [`ConversationStore::purge_threads`].
-pub fn purge_threads(workspace_dir: PathBuf) -> Result<ConversationPurgeStats, String> {
-    ConversationStore::new(workspace_dir).purge_threads()
-}
-
-/// Free-function shim around [`ConversationStore::delete_thread`].
 pub fn delete_thread(
-    workspace_dir: PathBuf,
+    config: &crate::memory::config::MemoryConfig,
     thread_id: &str,
     deleted_at: &str,
 ) -> Result<bool, String> {
-    ConversationStore::new(workspace_dir).delete_thread(thread_id, deleted_at)
+    open_error(config)?.delete_thread(thread_id, deleted_at)
 }
 
-#[cfg(test)]
-#[path = "store_tests.rs"]
-mod tests;
+pub fn purge_threads(
+    config: &crate::memory::config::MemoryConfig,
+) -> Result<ConversationPurgeStats, String> {
+    open_error(config)?.purge_threads()
+}
 
 #[cfg(test)]
 #[path = "store_port_tests.rs"]
