@@ -4,7 +4,6 @@
 
 use anyhow::Result;
 use chrono::Utc;
-use rusqlite::Transaction;
 
 use super::collections::{CHUNK_LIFECYCLE, INGESTED_SOURCES};
 use super::types::SourceKind;
@@ -40,21 +39,6 @@ pub fn set_chunk_lifecycle_status(
     )
 }
 
-/// Set the lifecycle status column inside a caller-owned transaction. The
-/// caller commits/rolls back `tx`.
-///
-/// # Errors
-/// See [`set_chunk_lifecycle_status`].
-#[allow(dead_code)]
-pub fn set_chunk_lifecycle_status_tx(
-    tx: &Transaction<'_>,
-    chunk_id: &str,
-    status: &str,
-) -> Result<()> {
-    let _ = (tx, chunk_id, status);
-    anyhow::bail!("chunk lifecycle must be committed with host storage, not a SQLite transaction")
-}
-
 /// Read the lifecycle status column for `chunk_id`, or `None` if the row is absent.
 ///
 /// # Errors
@@ -64,14 +48,6 @@ pub fn get_chunk_lifecycle_status(config: &MemoryConfig, chunk_id: &str) -> Resu
         .map(|value| serde_json::from_value(value["status"].clone()))
         .transpose()
         .map_err(anyhow::Error::from)
-}
-
-pub fn get_chunk_lifecycle_status_tx(
-    tx: &Transaction<'_>,
-    chunk_id: &str,
-) -> Result<Option<String>> {
-    let _ = (tx, chunk_id);
-    anyhow::bail!("chunk lifecycle reads must use host storage, not a SQLite transaction")
 }
 
 /// Count chunks currently sitting at a given lifecycle status. Matches
@@ -89,15 +65,8 @@ pub fn count_chunks_by_lifecycle_status(config: &MemoryConfig, status: &str) -> 
 
 // ── Source ingest gate ───────────────────────────────────────────────────────
 
-/// Best-effort, non-transactional check used to skip canonicalisation when a
-/// source has already been ingested. The authoritative gate is
-/// [`claim_source_ingest_tx`].
-///
-/// Because this runs outside any transaction, a `true`/`false` answer here
-/// can be stale by the time the caller acts on it under concurrent ingest —
-/// callers that need a correctness guarantee (not just a fast-path skip)
-/// must still go through [`claim_source_ingest_tx`] inside their own persist
-/// transaction.
+/// Check whether a source has already been ingested. Call
+/// [`claim_source_ingest`] when a conditional claim is required.
 ///
 /// # Errors
 /// Returns `Err` only if the underlying query fails.
@@ -138,30 +107,13 @@ pub fn claim_source_ingest(
     )? == 1)
 }
 
-/// Atomically claim `(source_kind, source_id)` for ingestion. Returns `true` if
-/// the row was newly inserted; `false` if a previous ingest already claimed it.
-/// Lives inside the persist transaction so two concurrent ingests of the same
-/// source can't both pass the gate.
+/// Atomically claim `(source_kind, source_id)` for ingestion. Returns `true`
+/// if the row was newly inserted; `false` if a previous ingest already
+/// claimed it.
 ///
-/// Idempotent by design: repeated calls for an already-claimed
-/// `(source_kind, source_id)` keep returning `false` and never overwrite
-/// `ingested_at_ms` (the `INSERT OR IGNORE` is a no-op on conflict).
+/// Idempotent: repeated calls keep returning `false` and never overwrite the
+/// original `ingested_at_ms`.
 ///
-/// # Errors
-/// Returns `Err` only if the `INSERT OR IGNORE` statement fails. Does not
-/// commit `tx` — the caller owns the surrounding transaction.
-pub fn claim_source_ingest_tx(
-    tx: &Transaction<'_>,
-    source_kind: SourceKind,
-    source_id: &str,
-    now_ms: i64,
-) -> Result<bool> {
-    let _ = (tx, source_kind, source_id, now_ms);
-    anyhow::bail!(
-        "source ingest gates must be committed with host storage, not a SQLite transaction"
-    )
-}
-
 /// Release a previously-claimed source gate row so a later retry can re-claim it.
 ///
 /// Compensation for a document ingest that claimed the gate but then failed

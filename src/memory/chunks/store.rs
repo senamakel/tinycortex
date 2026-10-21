@@ -5,7 +5,6 @@
 //! moved with the tree, score, queue, and entity-index group.
 
 use anyhow::Result;
-use rusqlite::Transaction;
 use std::collections::{HashMap, HashSet};
 
 use super::types::{Chunk, SourceKind, StagedChunk};
@@ -52,22 +51,11 @@ pub async fn upsert_chunks_async(config: &MemoryConfig, chunks: &[Chunk]) -> Res
     super::versioned::upsert_chunks_async(config, chunks).await
 }
 
-pub fn upsert_chunks_tx(tx: &Transaction<'_>, chunks: &[Chunk]) -> Result<usize> {
-    let _ = (tx, chunks);
-    anyhow::bail!("chunks must be committed with host storage, not a SQLite transaction")
-}
-
 /// Upsert staged chunks and their content pointers under one host commit head.
 /// The caller is responsible for writing the file and verifying its hash
 /// before this call.
 pub fn upsert_staged_chunks(config: &MemoryConfig, staged: &[StagedChunk]) -> Result<usize> {
     super::versioned::upsert_staged_chunks(config, staged)
-}
-
-/// Transitional transaction seam. Staged chunks must use host storage.
-pub fn upsert_staged_chunks_tx(tx: &Transaction<'_>, staged: &[StagedChunk]) -> Result<usize> {
-    let _ = (tx, staged);
-    anyhow::bail!("staged chunks must be committed with host storage, not a SQLite transaction")
 }
 
 pub fn update_chunk_content_sha256(
@@ -271,7 +259,7 @@ fn extraction_coverage_from_snapshot(
 // ── Source ingest gate + lifecycle status + raw-file gate ────────────────────
 
 pub use super::store_sources::{
-    claim_source_ingest, claim_source_ingest_tx, count_chunks_by_lifecycle_status,
+    claim_source_ingest, count_chunks_by_lifecycle_status,
     count_raw_paths_ingested_with_prefix, delete_source_ingest, filter_raw_paths_not_ingested,
     get_chunk_lifecycle_status, is_source_ingested, mark_raw_paths_ingested,
     set_chunk_lifecycle_status, RAW_FILE_GATE_KIND,
