@@ -1,21 +1,8 @@
 //! Read-only graph queries derived from an entity occurrence index.
 //!
-//! OpenHuman expressed co-occurrence as a SQL SELF-JOIN over
-//! `mem_tree_entity_index`:
-//!
-//! ```sql
-//! SELECT b.entity_id AS object, COUNT(DISTINCT a.node_id) AS weight
-//!   FROM mem_tree_entity_index a
-//!   JOIN mem_tree_entity_index b ON a.node_id = b.node_id
-//!  WHERE a.entity_id = ?1 AND b.entity_id <> ?1
-//!  GROUP BY b.entity_id
-//!  ORDER BY weight DESC, object ASC
-//!  LIMIT ?2
-//! ```
-//!
-//! Persistent adapters can execute that self-join through the injected
-//! [`EntityOccurrenceIndex`] fast path. Lightweight indexes used by tests fall
-//! back to gathering the subject's nodes and counting in Rust.
+//! Co-occurrence counts distinct shared nodes. Persistent adapters may provide
+//! a storage-specific implementation through [`EntityOccurrenceIndex`]; the
+//! generic fallback gathers the subject's nodes and counts in Rust.
 
 use std::collections::{HashMap, HashSet};
 

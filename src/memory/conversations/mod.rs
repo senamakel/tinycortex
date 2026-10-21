@@ -1,38 +1,23 @@
-//! Workspace-backed conversation thread/message storage.
+//! Conversation transcripts backed by host-provided storage ports.
 //!
-//! Conversations are stored as JSONL files under
-//! `<workspace>/memory/conversations/` (rooted at
-//! [`MemoryConfig::workspace`](crate::memory::config::MemoryConfig)). Thread
-//! metadata is an append-only upsert/delete log in `threads.jsonl`; each
-//! thread's messages live in a dedicated JSONL file under `threads/<id>.jsonl`
-//! for straightforward inspection and recovery.
+//! Each thread has an append-only [`StreamStore`](tinystoragedrivers_api::StreamStore)
+//! containing the authoritative thread and message history. A declared
+//! [`DocumentStore`](tinystoragedrivers_api::DocumentStore) collection holds a
+//! rebuildable thread-list projection. These ports are supplied and prepared by
+//! the host through [`MemoryConfig`](crate::memory::config::MemoryConfig);
+//! this module has no filesystem or in-memory persistence fallback.
 //!
-//! This is **transcript persistence**, not semantic indexing: it owns the raw
-//! thread/message records and a local trigram/CJK-bigram inverted index for
-//! cross-thread substring search over those transcripts. The richer
-//! summary-tree archival of transcripts lives in `super::archivist`.
+//! This is transcript persistence, not semantic indexing: it owns raw thread
+//! and message records and builds the local multilingual inverted index used
+//! for cross-thread substring search. Transcript archival into summary trees
+//! lives in `super::archivist`.
 //!
-//! ## Layout
-//!
-//! - `types` — the on-disk wire types (threads, messages, patches, hits).
-//! - `tokenize` — multilingual normalization + character n-gram tokenizer.
-//! - `inverted_index` — in-memory trigram/bigram index over message content.
-//! - `store` — the JSONL [`ConversationStore`] (append/read/update/delete,
-//!   process-wide write serialization, warm-index cache, cross-thread search).
-//! - `bus` — a channel-persistence subscriber that mirrors inbound/processed
-//!   channel turns into the store.
-//!
-//! ## Ported-from-OpenHuman notes
-//!
-//! - The process-wide write mutex and per-workspace index cache are static
-//!   [`std::sync::LazyLock`]`<`[`parking_lot::Mutex`]`>` (OpenHuman used
-//!   `once_cell::sync::Lazy`, which is not a dependency here).
-//! - The event bus is abstracted behind the [`ConversationEventBus`] /
-//!   [`ChannelEventHandler`] traits and a self-contained [`ChannelEvent`] type,
-//!   so this module carries no dependency on the host's channel/event-bus
-//!   layer (OpenHuman tied directly into `core::event_bus::DomainEvent`).
+//! The event bus remains abstracted behind [`ConversationEventBus`] and
+//! [`ChannelEventHandler`], so this crate has no dependency on a host's
+//! concrete channel event type.
 
 mod bus;
+pub mod collections;
 mod inverted_index;
 mod store;
 mod tokenize;
@@ -42,12 +27,14 @@ pub use bus::{
     register_conversation_persistence_subscriber, ChannelEvent, ChannelEventHandler,
     ConversationEventBus, ConversationPersistenceSubscriber,
 };
+pub use collections::collections;
 pub use store::{
-    append_message, delete_messages_from, delete_thread, ensure_thread, get_messages, list_threads,
-    purge_threads, update_message, update_thread_labels, update_thread_title,
-    ConversationPurgeStats, ConversationStore,
+    append_message, append_message_idempotent_async, delete_messages_from, delete_thread,
+    ensure_thread, get_messages, list_threads, purge_threads, update_message, update_thread_labels,
+    update_thread_title, ConversationPurgeStats, ConversationStore,
 };
 pub use types::{
     is_deterministic_message_id, reply_run_id, run_reply_message_id, ConversationMessage,
     ConversationMessagePatch, ConversationThread, CreateConversationThread, CrossThreadHit,
+    LegacyConversationTranscript,
 };

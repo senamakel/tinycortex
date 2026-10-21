@@ -1,22 +1,23 @@
 use async_trait::async_trait;
 use chrono::{TimeZone, Utc};
 use tempfile::TempDir;
-use tinycortex::memory::chunks::get_chunk;
 use tinycortex::memory::config::MemoryConfig;
 use tinycortex::memory::ingest::canonicalize::chat::{ChatBatch, ChatMessage};
 use tinycortex::memory::ingest::{ingest_chat, QueueJobSink};
 use tinycortex::memory::queue::{
-    drain_until_idle, AppendDecision, AppendTarget, ExtractDecision, NodeRef, QueueDelegates,
-    ReembedProgress, SealDocumentPayload, SealPayload, StaleBuffer,
+    drain_until_idle, AppendDecision, AppendTarget, DelegateOutput, ExtractDecision, JobMutation,
+    JobStateCollection, NodeRef, QueueDelegates, ReembedProgress, SealDocumentPayload, SealPayload,
+    StaleBuffer,
 };
-use tinycortex::memory::retrieval::query_source;
-use tinycortex::memory::score::embed::InertEmbedder;
 use tinycortex::memory::score::ScoringConfig;
-use tinycortex::memory::tree::store::get_tree;
-use tinycortex::memory::tree::{append_leaf_deferred, ConcatSummariser, LeafRef, TreeFactory};
+use tinycortex::memory::tree::{ConcatSummariser, SealObserver};
 use tinycortex::memory::{InMemoryMemoryStore, MemoryInput, MemoryQuery, MemoryStore};
+use tinystoragedrivers_types::Scope;
 
 struct EngineDelegates;
+struct IgnoreSealObserver;
+
+impl SealObserver for IgnoreSealObserver {}
 
 #[async_trait]
 impl QueueDelegates for EngineDelegates {
@@ -24,12 +25,28 @@ impl QueueDelegates for EngineDelegates {
         &self,
         config: &MemoryConfig,
         chunk_id: &str,
-    ) -> anyhow::Result<Option<ExtractDecision>> {
-        Ok(get_chunk(config, chunk_id)?.map(|chunk| ExtractDecision {
-            kept: true,
-            uses_document_subtree: false,
-            tree_scope: chunk.metadata.source_id,
-        }))
+    ) -> anyhow::Result<Option<DelegateOutput<ExtractDecision>>> {
+        Ok(
+            tinycortex::memory::chunks::get_chunk_async(config, chunk_id)
+                .await?
+                .map(|chunk| DelegateOutput {
+                    result: ExtractDecision {
+                        kept: true,
+                        uses_document_subtree: false,
+                        tree_scope: chunk.metadata.source_id,
+                    },
+                    mutations: vec![JobMutation {
+                        collection: JobStateCollection::ChunkLifecycle,
+                        key: chunk.id,
+                        expected: Some(serde_json::json!({
+                            "status": tinycortex::memory::chunks::CHUNK_STATUS_PENDING_EXTRACTION
+                        })),
+                        value: Some(serde_json::json!({
+                            "status": tinycortex::memory::chunks::CHUNK_STATUS_ADMITTED
+                        })),
+                    }],
+                }),
+        )
     }
 
     async fn append_node(
@@ -37,48 +54,33 @@ impl QueueDelegates for EngineDelegates {
         config: &MemoryConfig,
         node: &NodeRef,
         target: &AppendTarget,
-    ) -> anyhow::Result<Option<AppendDecision>> {
-        let NodeRef::Leaf { chunk_id } = node else {
+    ) -> anyhow::Result<Option<DelegateOutput<AppendDecision>>> {
+        let Some(output) =
+            tinycortex::memory::tree::plan_append_node_for_queue(config, node, target).await?
+        else {
             return Ok(None);
         };
-        let Some(chunk) = get_chunk(config, chunk_id)? else {
-            return Ok(None);
-        };
-        let source_id = match target {
-            AppendTarget::Source { source_id } => source_id,
-            AppendTarget::Topic { .. } => return Ok(None),
-        };
-        let factory = TreeFactory::source(source_id.as_str());
-        let tree = factory.get_or_create(config)?;
-        append_leaf_deferred(
-            config,
-            &tree,
-            &LeafRef {
-                chunk_id: chunk.id,
-                token_count: chunk.token_count,
-                timestamp: chunk.metadata.timestamp,
-                content: chunk.content,
-                entities: vec![],
-                topics: vec![],
-                score: 1.0,
-            },
-        )?;
-        Ok(Some(AppendDecision {
-            tree_id: tree.id,
-            should_seal: true,
-        }))
+        Ok(Some(output))
     }
 
     async fn seal_level(
         &self,
         config: &MemoryConfig,
         payload: &SealPayload,
-    ) -> anyhow::Result<Option<SealPayload>> {
-        let tree = get_tree(config, &payload.tree_id)?.expect("queued tree exists");
-        TreeFactory::from_tree(&tree)
-            .seal_now(config, &ConcatSummariser::new())
-            .await?;
-        Ok(None)
+    ) -> anyhow::Result<DelegateOutput<Option<SealPayload>>> {
+        let observer = IgnoreSealObserver;
+        tinycortex::memory::tree::plan_tree_level_seal_for_queue(
+            config,
+            &payload.tree_id,
+            payload.level,
+            &tinycortex::memory::tree::SealServices {
+                summariser: &ConcatSummariser::new(),
+                embedder: None,
+                observer: &observer,
+            },
+            &tinycortex::memory::tree::LabelStrategy::Empty,
+        )
+        .await
     }
 
     async fn list_stale_buffers(
@@ -93,23 +95,26 @@ impl QueueDelegates for EngineDelegates {
         &self,
         _config: &MemoryConfig,
         _payload: &SealDocumentPayload,
-    ) -> anyhow::Result<()> {
-        Ok(())
+    ) -> anyhow::Result<DelegateOutput<tinycortex::memory::tree::DocumentSealPlanResult>> {
+        anyhow::bail!("document sealing is not used by this smoke fixture")
     }
 
     async fn reembed_batch(
         &self,
         _config: &MemoryConfig,
         _signature: &str,
-    ) -> anyhow::Result<ReembedProgress> {
-        Ok(ReembedProgress::Covered)
+    ) -> anyhow::Result<DelegateOutput<ReembedProgress>> {
+        Ok(DelegateOutput {
+            result: ReembedProgress::Covered,
+            mutations: Vec::new(),
+        })
     }
 
     fn active_signature(&self, _config: &MemoryConfig) -> String {
         "inert".into()
     }
 
-    fn has_uncovered_reembed_work(
+    async fn has_uncovered_reembed_work(
         &self,
         _config: &MemoryConfig,
         _signature: &str,
@@ -139,9 +144,16 @@ async fn stores_and_finds_memory() {
 }
 
 #[tokio::test]
-async fn ingests_drains_seals_and_retrieves_real_engine_data() {
+async fn ingests_and_retrieves_chunk_data_with_host_storage() {
     let workspace = TempDir::new().unwrap();
-    let config = MemoryConfig::new(workspace.path());
+    let scope = Scope::new("tinycortex-smoke").unwrap();
+    let mut config = MemoryConfig::open_with_storage(
+        workspace.path(),
+        tinystoragedrivers_testkit::memory_storage(&scope),
+    )
+    .await
+    .unwrap();
+    config.tree.input_token_budget = 1;
     let batch = ChatBatch {
         platform: "slack".into(),
         channel_label: "#launch".into(),
@@ -169,17 +181,22 @@ async fn ingests_drains_seals_and_retrieves_real_engine_data() {
     assert_eq!(ingested.extract_jobs_enqueued, 1);
 
     drain_until_idle(&config, &EngineDelegates).await.unwrap();
-    let response = query_source(
+    let stored = tinycortex::memory::chunks::get_chunk_async(&config, &ingested.chunk_ids[0])
+        .await
+        .unwrap()
+        .expect("ingested chunk remains readable after worker settlement");
+    assert!(stored.content.contains("Phoenix launch"));
+    let tree = tinycortex::memory::tree::store::get_tree_by_scope_async(
         &config,
-        Some("slack:#launch"),
-        None,
-        None,
-        None,
-        &InertEmbedder,
-        10,
+        tinycortex::memory::tree::TreeKind::Source,
+        "slack:#launch",
     )
     .await
-    .unwrap();
-    assert_eq!(response.hits.len(), 1);
-    assert!(response.hits[0].content.contains("Phoenix launch"));
+    .unwrap()
+    .expect("worker append creates the source tree");
+    let summaries =
+        tinycortex::memory::tree::store::list_summaries_at_level_async(&config, &tree.id, 1)
+            .await
+            .unwrap();
+    assert_eq!(summaries.len(), 1, "worker seal publishes the L1 summary");
 }

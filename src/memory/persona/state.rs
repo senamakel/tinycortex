@@ -11,17 +11,16 @@
 //!   the email list forces a re-scan).
 //! - Instruction files: content sha per path — re-digest only on change.
 //!
-//! A concrete [`FileStateStore`] persists the map as one JSON file under the
-//! workspace so cursors survive across process runs; tests use an in-memory
-//! store. Evidence ids are content-addressed (§6.3), so overlapping cursors are
-//! harmless — this state is a *fast-skip* optimisation, not a correctness gate.
+//! [`KvStateStore`] persists cursors through the host's scoped KV port, so they
+//! survive across process runs. Evidence ids are content-addressed (§6.3), so
+//! overlapping cursors are harmless — this state is a *fast-skip* optimisation,
+//! not a correctness gate.
 
-use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-use anyhow::{Context, Result};
+use crate::memory::store::state_kv::StateKvStore;
+use anyhow::Result;
 use async_trait::async_trait;
-use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
 /// Persona-scoped state namespace.
@@ -124,63 +123,55 @@ pub async fn record_watermark(store: &dyn PersonaStateStore, key: &str, value: &
         .await
 }
 
-/// JSON-file-backed [`PersonaStateStore`]. Persists the whole map atomically on
-/// each `set` so cursors survive across runs.
-pub struct FileStateStore {
-    path: PathBuf,
-    data: Mutex<HashMap<String, serde_json::Value>>,
+/// Host-KV-backed [`PersonaStateStore`]. The host owns its scope and backend;
+/// cursor values remain ordinary JSON application data.
+#[derive(Clone)]
+pub struct KvStateStore {
+    kv: StateKvStore,
 }
 
-impl FileStateStore {
-    /// Open (or create) the state file under a workspace's persona directory.
-    pub fn open_in_workspace(workspace: &Path) -> Result<Self> {
-        let path = workspace.join("persona").join("sync-state.json");
-        let data = if path.exists() {
-            let bytes = std::fs::read(&path)
-                .with_context(|| format!("read persona state {}", path.display()))?;
-            serde_json::from_slice(&bytes).unwrap_or_default()
-        } else {
-            HashMap::new()
-        };
+/// One opaque cursor value read by a host from the legacy persona state file.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LegacyPersonaStateEntry {
+    /// Original state key, without the legacy file's namespace prefix.
+    pub key: String,
+    /// Original JSON value, retained without normalization.
+    pub value: serde_json::Value,
+}
+
+impl KvStateStore {
+    /// Attach to the host's prepared KV port.
+    pub fn from_config(config: &crate::memory::config::MemoryConfig) -> Result<Self> {
         Ok(Self {
-            path,
-            data: Mutex::new(data),
+            kv: StateKvStore::from_config(config)?,
         })
     }
 
-    fn composite(namespace: &str, key: &str) -> String {
-        format!("{namespace}:{key}")
+    fn key(namespace: &str, key: &str) -> String {
+        format!("{}:{namespace}{key}", namespace.len())
     }
 
-    fn persist(&self, snapshot: &HashMap<String, serde_json::Value>) -> Result<()> {
-        if let Some(parent) = self.path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("create persona dir {}", parent.display()))?;
-        }
-        let bytes = serde_json::to_vec_pretty(snapshot)?;
-        crate::memory::fsutil::atomic_write(&self.path, &bytes)
-            .with_context(|| format!("write persona state {}", self.path.display()))?;
-        Ok(())
+    /// Import legacy cursor data without overwriting values already advanced
+    /// by the active pipeline. Replaying the same import is idempotent.
+    pub async fn import_legacy_entries(&self, entries: &[LegacyPersonaStateEntry]) -> Result<()> {
+        let owner_entries = entries
+            .iter()
+            .map(|entry| (Self::key(NAMESPACE, &entry.key), entry.value.clone()))
+            .collect::<Vec<_>>();
+        self.kv.import_entries(NAMESPACE, &owner_entries).await
     }
 }
 
 #[async_trait]
-impl PersonaStateStore for FileStateStore {
+impl PersonaStateStore for KvStateStore {
     async fn get(&self, namespace: &str, key: &str) -> Result<Option<serde_json::Value>> {
-        Ok(self
-            .data
-            .lock()
-            .get(&Self::composite(namespace, key))
-            .cloned())
+        self.kv.get(NAMESPACE, &Self::key(namespace, key)).await
     }
 
     async fn set(&self, namespace: &str, key: &str, value: &serde_json::Value) -> Result<()> {
-        let snapshot = {
-            let mut guard = self.data.lock();
-            guard.insert(Self::composite(namespace, key), value.clone());
-            guard.clone()
-        };
-        self.persist(&snapshot)
+        self.kv
+            .set(NAMESPACE, &Self::key(namespace, key), value.clone())
+            .await
     }
 }
 

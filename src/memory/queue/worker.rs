@@ -1,41 +1,36 @@
 //! Worker driver: claim one job, run its handler under the LLM gate, settle.
 //!
-//! OpenHuman spawned a `tokio` worker pool plus a wall-clock scheduler here.
-//! `tokio` is a dev-only dependency in this crate and the runtime/spawn plumbing
-//! (graceful-shutdown hooks, Sentry reporting, the corrupt-DB quarantine path)
-//! is out of the ported surface, so the durable primitive is [`run_once`]: a
+//! The durable primitive is [`run_once`]: a
 //! single claim→handle→settle step that a host drives in its own loop (and that
 //! [`drain_until_idle`](crate::memory::queue::drain_until_idle) calls to settle
 //! the queue deterministically in tests).
 //!
-//! The SQLite error classifiers ([`is_sqlite_busy`] et al.) are ported verbatim
-//! so a host loop can reproduce OpenHuman's "back off, don't page" policy for
-//! transient write-lock / I/O / disk-full / corruption conditions.
-//! [`is_host_io_error`] extends that family to persistent **host-filesystem**
-//! failures (EIO/ENOSPC/EROFS — a dying SD card or full/read-only mount) that
-//! surface as `std::io::Error` rather than a SQLite code; a host loop is meant
-//! to use it to back off long and page once instead of flooding (Sentry
-//! CORE-RUST-19J). The `tokio`-feature runtime loop's `backoff_for`
-//! (`memory::queue::runtime`) includes this classifier.
-//! The Sentry-once emission and the storage-degraded flag stay host-owned
-//! regardless.
+//! Queue storage errors retain their typed categories. `Unavailable` and
+//! `Conflict` can be retried by a host loop; a generic `Backend` error is
+//! returned as fatal because the storage port has no corruption category and
+//! the host cannot safely infer one from diagnostic text. [`is_host_io_error`]
+//! recognizes persistent filesystem failures surfaced by file operations.
 
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
 
 use anyhow::Result;
+#[cfg(any(feature = "tokio", test))]
+use tinystoragedrivers_types::{ErrorKind, StorageError};
 
 use crate::memory::config::MemoryConfig;
 use crate::memory::queue::gate::{LlmGate, Permit};
 use crate::memory::queue::handlers::{self, QueueDelegates};
 use crate::memory::queue::ops::set_backfill_in_progress;
-use crate::memory::queue::store::{claim_next, purge_retired_jobs};
-use crate::memory::queue::store_settle::{
-    mark_deferred, mark_done_with_followups, mark_failed_typed, recover_stale_locks,
-};
-use crate::memory::queue::types::{
-    Job, JobFailure, JobKind, JobOutcome, JobStatus, NewJob, SealPayload,
-};
+#[cfg(test)]
+use crate::memory::queue::store::claim_next;
+use crate::memory::queue::store::purge_retired_jobs;
+#[cfg(test)]
+use crate::memory::queue::store_settle::mark_failed_typed;
+use crate::memory::queue::store_settle::recover_stale_locks;
+use crate::memory::queue::types::{Job, JobFailure, JobKind, JobOutcome, JobStatus};
+#[cfg(test)]
+use crate::memory::queue::types::{NewJob, SealPayload};
 
 /// Process-wide LLM concurrency gate. Single-slot by default (mirrors the
 /// upstream single-permit semaphore); LLM-bound jobs hold a permit for the
@@ -60,24 +55,33 @@ pub fn llm_gate() -> &'static LlmGate {
 pub fn bootstrap(config: &MemoryConfig) -> Result<(usize, usize)> {
     let purged = purge_retired_jobs(config)?;
     let recovered = recover_stale_locks(config)?;
+    crate::memory::queue::store::repair_pending_hints(config)?;
+    Ok((purged, recovered))
+}
+
+#[cfg(feature = "tokio")]
+pub(crate) async fn bootstrap_async(config: &MemoryConfig) -> Result<(usize, usize)> {
+    let purged = crate::memory::queue::store::purge_retired_jobs_async(config).await?;
+    let recovered = crate::memory::queue::store_settle::recover_stale_locks_async(config).await?;
+    crate::memory::queue::store::repair_pending_hints_async(config).await?;
     Ok((purged, recovered))
 }
 
 /// Claim and run a single job. Returns `true` when work was processed, `false`
 /// when no eligible row was available.
 ///
-/// The job's configured lease starts counting at claim
-/// time, before the LLM gate is acquired below — a job that waits a long time
-/// for a free permit eats into its own lease window before its handler even
-/// starts.
-///
-/// See [`LlmGate::acquire`] for the blocking-wait caveat: this function calls
-/// it from inside an `async fn`, which is the exact pattern that caveat warns
-/// about. On a `current_thread` runtime, two concurrent `run_once` calls can
-/// deadlock (one holds the only permit and needs the executor to finish its
-/// handler and drop it; the other blocks the only executor thread inside
-/// `acquire`).
+/// LLM-bound jobs use [`LlmGate::try_acquire`] and defer when no permit is
+/// available, so this async entry point does not block a Tokio executor while
+/// waiting for capacity. All queue-state reads, writes, and settlements use
+/// the async versioned-store path, including on current-thread runtimes.
 pub async fn run_once(config: &MemoryConfig, delegates: &dyn QueueDelegates) -> Result<bool> {
+    if config.storage().is_ok() {
+        crate::memory::ingest::pipeline::dispatch_pending_extract_jobs_async(
+            config,
+            &crate::memory::ingest::QueueJobSink,
+        )
+        .await?;
+    }
     let gate = {
         let mut gates = CONFIGURED_LLM_GATES.lock();
         Arc::clone(
@@ -94,7 +98,10 @@ async fn run_once_with_gate(
     delegates: &dyn QueueDelegates,
     gate: &LlmGate,
 ) -> Result<bool> {
-    let Some(job) = claim_next(config, config.queue.lock_duration_ms)? else {
+    let Some(job) =
+        crate::memory::queue::store::claim_next_async(config, config.queue.lock_duration_ms)
+            .await?
+    else {
         return Ok(false);
     };
 
@@ -102,12 +109,21 @@ async fn run_once_with_gate(
     // handler; non-LLM jobs (AppendBuffer, FlushStale) run without one.
     let permit: Option<Permit> = if job.kind.is_llm_bound() {
         let Some(permit) = gate.try_acquire() else {
-            mark_deferred(
+            crate::memory::queue::store_settle::mark_deferred_async(
                 config,
                 &job,
                 chrono::Utc::now().timestamp_millis() + LLM_GATE_RETRY_MS,
                 "llm concurrency gate busy",
-            )?;
+            )
+            .await?;
+            if job.kind == JobKind::ReembedBackfill
+                && matches!(
+                    crate::memory::queue::store::get_job_async(config, &job.id).await?,
+                    Some(current) if current.status == JobStatus::Ready
+                )
+            {
+                set_backfill_in_progress(true);
+            }
             return Ok(true);
         };
         Some(permit)
@@ -118,12 +134,13 @@ async fn run_once_with_gate(
     let result = handlers::plan_job(config, &job, delegates).await;
     drop(permit);
 
-    settle_planned_job(config, &job, result)?;
+    settle_planned_job_async(config, &job, result, delegates).await?;
     Ok(true)
 }
 
 /// Translate a handler plan into the matching store settlement call. Successful
-/// follow-up enqueues commit in the same transaction as `mark_done`.
+/// follow-ups and staged domain changes commit with `mark_done` under the same
+/// owner-state head CAS.
 /// Errors from the settlement call itself (e.g. a busy database) propagate to
 /// the caller — the job's `running` row is then left for lease-expiry
 /// recovery rather than being retried inline here.
@@ -135,10 +152,14 @@ fn settle_job(config: &MemoryConfig, job: &Job, result: Result<JobOutcome>) -> R
         result.map(|outcome| handlers::JobPlan {
             outcome,
             follow_ups: Vec::new(),
+            expected: Vec::new(),
+            mutations: Vec::new(),
+            document_projection: None,
         }),
     )
 }
 
+#[cfg(test)]
 fn settle_planned_job(
     config: &MemoryConfig,
     job: &Job,
@@ -148,12 +169,23 @@ fn settle_planned_job(
         Ok(handlers::JobPlan {
             outcome: JobOutcome::Done,
             follow_ups,
+            expected,
+            mutations,
+            ..
         }) => {
             let arms_reembed = follow_ups
                 .iter()
                 .any(|follow_up| follow_up.kind == JobKind::ReembedBackfill);
-            let committed = mark_done_with_followups(config, job, &follow_ups)?;
-            if committed && arms_reembed {
+            let committed = crate::memory::queue::store_settle::mark_done_with_changes(
+                config,
+                job,
+                &follow_ups,
+                &expected,
+                &mutations,
+            )?;
+            if committed && job.kind == JobKind::ReembedBackfill {
+                set_backfill_in_progress(arms_reembed);
+            } else if committed && arms_reembed {
                 set_backfill_in_progress(true);
             }
 
@@ -181,11 +213,23 @@ fn settle_planned_job(
         }
         Ok(handlers::JobPlan {
             outcome: JobOutcome::Defer { until_ms, reason },
+            expected,
+            mutations,
             ..
         }) => {
             // Defer is normal operation (transient blocker) — does NOT burn the
             // failure budget; `mark_deferred` reverts the claim's attempts bump.
-            mark_deferred(config, job, until_ms, &reason)
+            let committed = crate::memory::queue::store_settle::mark_deferred_with_changes(
+                config, job, until_ms, &reason, &expected, &mutations,
+            )?;
+            if committed && job.kind == JobKind::ReembedBackfill {
+                let still_pending = matches!(
+                    crate::memory::queue::store::get_job(config, &job.id)?,
+                    Some(current) if current.status == JobStatus::Ready
+                );
+                set_backfill_in_progress(still_pending);
+            }
+            Ok(())
         }
         Err(err) => {
             // Preserve the full anyhow cause chain in `last_error` so a reader
@@ -226,73 +270,128 @@ fn settle_planned_job(
     }
 }
 
-/// Classify whether an error is transient SQLite write-lock contention
-/// (`SQLITE_BUSY` or `SQLITE_LOCKED`): back off and re-poll, don't escalate.
-pub fn is_sqlite_busy(err: &anyhow::Error) -> bool {
-    if let Some(rusqlite::Error::SqliteFailure(sqlite_err, _)) =
-        err.downcast_ref::<rusqlite::Error>()
-    {
-        return matches!(
-            sqlite_err.code,
-            rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
-        );
+async fn settle_planned_job_async(
+    config: &MemoryConfig,
+    job: &Job,
+    result: Result<handlers::JobPlan>,
+    delegates: &dyn QueueDelegates,
+) -> Result<()> {
+    match result {
+        Ok(handlers::JobPlan {
+            outcome: JobOutcome::Done,
+            follow_ups,
+            expected,
+            mutations,
+            document_projection,
+        }) => {
+            let arms_reembed = follow_ups
+                .iter()
+                .any(|follow_up| follow_up.kind == JobKind::ReembedBackfill);
+            let committed = crate::memory::queue::store_settle::mark_done_with_changes_async(
+                config,
+                job,
+                &follow_ups,
+                &expected,
+                &mutations,
+            )
+            .await?;
+            if committed && job.kind == JobKind::ReembedBackfill {
+                set_backfill_in_progress(arms_reembed);
+            } else if committed && arms_reembed {
+                set_backfill_in_progress(true);
+            }
+            if committed {
+                if let Some(projection) = document_projection {
+                    if let Err(error) = delegates
+                        .document_summaries_committed(
+                            config,
+                            &projection.tree_id,
+                            &projection.summaries,
+                        )
+                        .await
+                    {
+                        log::error!(
+                            "document summary projection failed after durable settlement for tree {}: {error:#}",
+                            projection.tree_id
+                        );
+                    }
+                }
+            }
+            // Post-seal rechecks are intentionally kept out of this async
+            // path until the tree store exposes its owner-state async read.
+            // The staged seal/append plan must carry any follow-up intent in
+            // the same CAS; a synchronous storage read cannot run on a
+            // current-thread executor.
+            Ok(())
+        }
+        Ok(handlers::JobPlan {
+            outcome: JobOutcome::Defer { until_ms, reason },
+            expected,
+            mutations,
+            ..
+        }) => {
+            let committed = crate::memory::queue::store_settle::mark_deferred_with_changes_async(
+                config, job, until_ms, &reason, &expected, &mutations,
+            )
+            .await?;
+            if committed && job.kind == JobKind::ReembedBackfill {
+                let still_pending = matches!(
+                    crate::memory::queue::store::get_job_async(config, &job.id).await?,
+                    Some(current) if current.status == JobStatus::Ready
+                );
+                set_backfill_in_progress(still_pending);
+            }
+            Ok(())
+        }
+        Err(err) => {
+            let message = format!("{err:#}");
+            let converted_pipeline_failure = err
+                .downcast_ref::<crate::memory::health::PipelineFailure>()
+                .map(|f| JobFailure {
+                    code: f.code.as_str(),
+                    class: f.class.as_str(),
+                });
+            let typed = err
+                .downcast_ref::<JobFailure>()
+                .or(converted_pipeline_failure.as_ref());
+            crate::memory::queue::store_settle::mark_failed_typed_async(
+                config, job, &message, typed,
+            )
+            .await?;
+            if job.kind == JobKind::ReembedBackfill
+                && matches!(
+                    crate::memory::queue::store::get_job_async(config, &job.id).await?,
+                    Some(current) if current.status == JobStatus::Failed
+                )
+            {
+                set_backfill_in_progress(false);
+            }
+            Ok(())
+        }
     }
-    let msg = format!("{err:#}").to_ascii_lowercase();
-    msg.contains("database is locked") || msg.contains("database table is locked")
 }
 
-/// Classify whether an error is a transient I/O failure that should be silently
-/// backed off (WAL truncate, the `-shm` cold-start family, `CANTOPEN`, the
-/// connection circuit breaker).
-pub fn is_sqlite_io_transient(err: &anyhow::Error) -> bool {
-    if let Some(rusqlite::Error::SqliteFailure(f, _)) = err.downcast_ref::<rusqlite::Error>() {
-        // 14 CANTOPEN, 1546 TRUNCATE, 4618 SHMOPEN, 4874 SHMSIZE, 5386 SHMMAP,
-        // 8714 IN_PAGE.
-        if matches!(f.extended_code, 14 | 1546 | 4618 | 4874 | 5386 | 8714) {
-            return true;
-        }
-        if f.code == rusqlite::ErrorCode::CannotOpen {
-            return true;
-        }
-    }
-    let msg = format!("{err:#}").to_ascii_lowercase();
-    msg.contains("circuit breaker open")
-        || msg.contains("disk i/o error")
-        || msg.contains("unable to open database file")
-        || msg.contains("xshmmap")
-        || msg.contains("truncate file")
+/// Return the typed storage category, including through `anyhow::Context`.
+#[cfg(any(feature = "tokio", test))]
+pub(crate) fn storage_error_kind(err: &anyhow::Error) -> Option<ErrorKind> {
+    err.downcast_ref::<StorageError>().map(StorageError::kind)
 }
 
-/// Classify `SQLITE_FULL` (disk full): a persistent host condition — back off
-/// long and stay silent until the user frees space.
-pub fn is_sqlite_disk_full(err: &anyhow::Error) -> bool {
-    if let Some(rusqlite::Error::SqliteFailure(sqlite_err, _)) =
-        err.downcast_ref::<rusqlite::Error>()
-    {
-        if sqlite_err.code == rusqlite::ErrorCode::DiskFull {
-            return true;
-        }
-    }
-    let msg = format!("{err:#}").to_ascii_lowercase();
-    msg.contains("database or disk is full")
-        || msg.contains("insertion failed because database is full")
+/// Whether a typed storage failure is retryable without changing the request.
+#[cfg(test)]
+pub(crate) fn is_retryable_storage_error(err: &anyhow::Error) -> bool {
+    matches!(
+        storage_error_kind(err),
+        Some(ErrorKind::Unavailable | ErrorKind::Conflict)
+    )
 }
 
-/// Classify `SQLITE_CORRUPT` / `SQLITE_NOTADB`: persistent on-disk damage that
-/// never clears on its own — a host should quarantine + rebuild, not re-poll.
-pub fn is_sqlite_corrupt(err: &anyhow::Error) -> bool {
-    if let Some(rusqlite::Error::SqliteFailure(sqlite_err, _)) =
-        err.downcast_ref::<rusqlite::Error>()
-    {
-        if matches!(
-            sqlite_err.code,
-            rusqlite::ErrorCode::DatabaseCorrupt | rusqlite::ErrorCode::NotADatabase
-        ) {
-            return true;
-        }
-    }
-    let msg = format!("{err:#}").to_ascii_lowercase();
-    msg.contains("database disk image is malformed") || msg.contains("file is not a database")
+/// Whether the error is a typed generic backend failure that the host must
+/// surface. The storage contract has no corruption category; diagnostic text
+/// is not used to guess one or trigger filesystem recovery.
+#[cfg(any(feature = "tokio", test))]
+pub(crate) fn is_fatal_storage_error(err: &anyhow::Error) -> bool {
+    matches!(storage_error_kind(err), Some(ErrorKind::Backend))
 }
 
 /// Classify a persistent **host-filesystem** I/O failure (EIO `5`, ENOSPC `28`,
@@ -301,9 +400,8 @@ pub fn is_sqlite_corrupt(err: &anyhow::Error) -> bool {
 /// clear on their own, so a host loop should back off long and page **once**
 /// rather than re-poll and flood (Sentry CORE-RUST-19J).
 ///
-/// Distinct from [`is_sqlite_disk_full`]: `SQLITE_FULL` arrives as a SQLite code
-/// and stays in that arm; this family is the raw OS error bubbling out of
-/// `create_dir_all` / `File` operations, often through anyhow context layers,
+/// This family is the raw OS error bubbling out of `create_dir_all` / `File`
+/// operations, often through anyhow context layers,
 /// so both the typed downcast and the flattened `(os error N)` text are checked.
 /// EACCES (`13`) and ENOENT (`2`) are deliberately excluded — those are genuine
 /// bugs that must keep reporting.

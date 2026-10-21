@@ -4,26 +4,20 @@ OpenHuman modules: `memory_conversations`, `memory_archivist`.
 
 ## Responsibility
 
-Conversation storage persists chat threads/messages as inspectable JSONL.
+Conversation storage persists thread and message events in the host-provided
+`StreamStore`, with a rebuildable `DocumentStore` projection for thread lists.
 Archivist converts selected conversation turns into cleaned tree leaves for
 semantic memory.
 
 ## Conversation Store
 
-Storage root:
+The host prepares the declared conversation index collection and injects its
+storage ports through `MemoryConfig`. Conversation streams are authoritative;
+the document index is only a rebuildable projection.
 
-```text
-<workspace>/memory/conversations/
-```
-
-Files:
-
-- `threads.jsonl`: append-only thread metadata log with upsert/delete entries.
-- `threads/<hex(thread_id)>.jsonl`: message records for each thread. Thread ids
-  can contain provider separators or user-controlled text, so TinyCortex
-  hex-encodes the UTF-8 thread id bytes before using them as filenames.
-
-A process-wide mutex serializes all on-disk mutations.
+A process-wide async lifecycle gate serializes transcript snapshots, mutations,
+deletion, and purge across store handles. Delete and rewrite checkpoints retain
+their monotonic stream offsets while truncating superseded message payloads.
 
 ## Conversation Types
 
@@ -105,9 +99,11 @@ human conversation. Clean natural-language transcript is the archival unit.
 
 ## Required Invariants
 
-- Conversation JSONL is transcript persistence, not semantic memory by itself.
+- Conversation streams are transcript persistence, not semantic memory by
+  themselves.
 - Ingestion into searchable memory is a separate archivist/tree operation.
-- Disk mutation is serialized.
+- Transcript operations are serialized across handles, including purge and
+  reads that could otherwise race prefix compaction.
 - Tool turns and tool-call JSON are removed before archival.
 - Archives should cite source session/thread ids.
 
@@ -118,7 +114,7 @@ src/memory/conversations/
 src/memory/archivist/
 ```
 
-Current TinyCortex ports the JSONL conversation store, inverted-index search,
+Current TinyCortex ports the stream-backed conversation store, inverted-index search,
 host-wired bus subscriber, archivist clean/compose helpers, per-turn episodic
 capture, and tree writer integration. The source-registry conversation reader is
 a separate legacy-thread reader over `<workspace>/threads/*.json`.

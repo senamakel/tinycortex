@@ -430,16 +430,14 @@ co-occurring entities, neighbors, and grouping by weight.
 
 ## Conversation Storage and Archivist
 
-`memory_conversations` stores thread metadata and message JSONL under:
-
-```text
-<workspace>/memory/conversations/
-```
-
-Thread metadata is appended to `threads.jsonl`; messages live in
-`threads/<hex(thread_id)>.jsonl` so arbitrary provider/thread ids never become
-raw path components. A process-wide mutex serializes disk mutation.
-This storage is transcript persistence, not semantic memory indexing.
+`memory_conversations` stores each conversation as an authoritative event
+stream in the host-provided `StreamStore`. A declared `DocumentStore`
+collection holds a rebuildable thread-list projection. Thread ids are encoded
+as stream names, not interpreted as filesystem paths. A process-wide async
+lifecycle gate serializes transcript snapshots and mutations across handles;
+deletion and transcript checkpoints truncate superseded message payloads while
+retaining their monotonic offset marker. This storage is transcript
+persistence, not semantic memory indexing.
 
 `memory_archivist` converts conversation turns into tree leaves:
 

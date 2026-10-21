@@ -1,9 +1,10 @@
 //! Job types for the async memory-tree pipeline.
 //!
-//! Each `Job` row in `mem_tree_jobs` stores its discriminator as a string
-//! `kind` plus a JSON-encoded `payload`. The strongly-typed payload structs
-//! below own (de)serialisation; handlers parse the payload by branching on
-//! [`JobKind`] and calling the matching `from_payload_json`.
+//! Each durable owner-state record in `memory_tree_jobs` stores its
+//! discriminator as a string `kind` plus a JSON-encoded `payload`. The
+//! strongly-typed payload structs below own (de)serialisation; handlers parse
+//! the payload by branching on [`JobKind`] and calling the matching
+//! `from_payload_json`.
 //!
 //! Ported from OpenHuman's `memory_queue::types`. The one substitution: the
 //! upstream typed-failure classifier lived in `memory_tree::health`
@@ -19,7 +20,7 @@ pub use super::payloads::{
     ReembedBackfillPayload, SealDocumentPayload, SealPayload,
 };
 
-/// Discriminator persisted in `mem_tree_jobs.kind`.
+/// Discriminator persisted in the `memory_tree_jobs` owner-state collection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum JobKind {
     /// Run LLM entity extraction over a single chunk and decide admission.
@@ -41,7 +42,7 @@ pub enum JobKind {
 }
 
 impl JobKind {
-    /// Snake-case wire string written to `mem_tree_jobs.kind`.
+    /// Snake-case wire string written to the durable job record.
     pub fn as_str(&self) -> &'static str {
         match self {
             JobKind::ExtractChunk => "extract_chunk",
@@ -67,7 +68,7 @@ impl JobKind {
             "topic_route" | "digest_daily" => {
                 return Err(anyhow!(
                     "retired JobKind '{s}' (global/topic trees removed)"
-                ))
+                ));
             }
             "reembed_backfill" => JobKind::ReembedBackfill,
             "seal_document" => JobKind::SealDocument,
@@ -118,10 +119,10 @@ pub enum JobOutcome {
     },
 }
 
-/// Lifecycle states persisted on `mem_tree_jobs.status`. Workers transition
+/// Lifecycle states persisted in the `memory_tree_jobs` owner-state records. Workers transition
 /// `ready → running → done|failed`. `Cancelled` settles a job outside the
-/// worker path — currently a failed row superseded by a newer one with the same
-/// `dedupe_key` during requeue (see `requeue_failed_where`).
+/// worker path when a failed row is superseded by a newer failed row with the
+/// same dedupe key during retry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JobStatus {
     /// Claimable: waiting for a worker (wire string `ready`).
@@ -140,7 +141,7 @@ pub enum JobStatus {
 }
 
 impl JobStatus {
-    /// Snake-case wire string written to `mem_tree_jobs.status`.
+    /// Snake-case wire string written to the durable job record.
     pub fn as_str(&self) -> &'static str {
         match self {
             JobStatus::Ready => "ready",
@@ -224,18 +225,18 @@ impl std::fmt::Display for JobFailure {
 
 impl std::error::Error for JobFailure {}
 
-/// One row in `mem_tree_jobs`. `payload_json` is left as a raw string so
-/// callers parse it lazily based on `kind`.
+/// One durable queue job. `payload_json` is left as a raw string so callers
+/// parse it lazily based on `kind`.
 #[derive(Clone, Debug)]
 pub struct Job {
-    /// Row id (primary key in `mem_tree_jobs`).
+    /// Durable job id.
     pub id: String,
     /// Job discriminator selecting the handler and payload shape.
     pub kind: JobKind,
     /// Raw JSON payload, parsed lazily by the handler based on `kind`.
     pub payload_json: String,
-    /// Optional dedupe key backing the partial unique index that suppresses
-    /// duplicate in-flight enqueues; `None` disables dedupe for this row.
+    /// Optional dedupe key used to suppress duplicate in-flight enqueues;
+    /// `None` disables dedupe for this job.
     pub dedupe_key: Option<String>,
     /// Current lifecycle state.
     pub status: JobStatus,
@@ -262,12 +263,23 @@ pub struct Job {
     pub started_at_ms: Option<i64>,
     /// UTC ms when the row reached a terminal status; `None` until settled.
     pub completed_at_ms: Option<i64>,
+    /// Monotonic durable claim generation. Handler writes compare this value
+    /// together with the state head, so an expired worker cannot publish after
+    /// a later delivery has claimed the same job.
+    pub lease_epoch: u64,
+    /// Queue-port receipt for the current delivery. Present only on a claimed
+    /// job; settlement acknowledges/nacks this hint after its state CAS.
+    pub queue_receipt: Option<tinystoragedrivers_types::Receipt>,
 }
 
 /// Caller-side bundle for `enqueue` — `Job` minus the persistence-only columns.
 /// Keeps producers from having to mint timestamps and ids by hand.
 #[derive(Clone, Debug)]
 pub struct NewJob {
+    /// Optional caller-stable queue hint id. Repeated publication of a durable
+    /// outbox intent uses this id so a lost enqueue acknowledgement cannot
+    /// create a second hint after the first one has already completed.
+    pub id: Option<String>,
     /// Job discriminator selecting the handler and payload shape.
     pub kind: JobKind,
     /// Raw JSON payload, parsed lazily by the handler based on `kind`.
@@ -281,10 +293,49 @@ pub struct NewJob {
     pub max_attempts: Option<u32>,
 }
 
+/// A durable source job imported from a previous TinyCortex store.
+///
+/// Unlike [`NewJob`], this preserves historical lifecycle and timestamps. A
+/// `Running` source job is recovered as `Ready` in the destination because its
+/// old lease/queue receipt cannot be reused; attempts and `started_at_ms` remain
+/// as history. Terminal source jobs remain terminal and are never republished.
+#[derive(Clone, Debug)]
+pub struct ImportedJob {
+    /// Stable source job identifier.
+    pub id: String,
+    /// Job discriminator selecting the destination handler.
+    pub kind: JobKind,
+    /// Serialized job payload, preserved byte-for-byte.
+    pub payload_json: String,
+    /// Optional active-work dedupe key.
+    pub dedupe_key: Option<String>,
+    /// Historical lifecycle state. `Running` is recovered to `Ready`.
+    pub status: JobStatus,
+    /// Historical attempts already spent before import.
+    pub attempts: u32,
+    /// Historical retry budget.
+    pub max_attempts: u32,
+    /// Historical availability time in UTC milliseconds.
+    pub available_at_ms: i64,
+    /// Original row creation time in UTC milliseconds.
+    pub created_at_ms: i64,
+    /// Original first-claim time, when recorded.
+    pub started_at_ms: Option<i64>,
+    /// Original terminal time, when recorded.
+    pub completed_at_ms: Option<i64>,
+    /// Last historical diagnostic, when present.
+    pub last_error: Option<String>,
+    /// Typed failure code, when present.
+    pub failure_reason: Option<String>,
+    /// Typed failure class, when present.
+    pub failure_class: Option<String>,
+}
+
 impl NewJob {
     /// Build a [`JobKind::ExtractChunk`] enqueue request.
     pub fn extract_chunk(p: &ExtractChunkPayload) -> Result<Self> {
         Ok(Self {
+            id: None,
             kind: JobKind::ExtractChunk,
             payload_json: serde_json::to_string(p)?,
             dedupe_key: Some(p.dedupe_key()),
@@ -296,6 +347,7 @@ impl NewJob {
     /// Build a [`JobKind::AppendBuffer`] enqueue request.
     pub fn append_buffer(p: &AppendBufferPayload) -> Result<Self> {
         Ok(Self {
+            id: None,
             kind: JobKind::AppendBuffer,
             payload_json: serde_json::to_string(p)?,
             dedupe_key: Some(p.dedupe_key()),
@@ -307,6 +359,7 @@ impl NewJob {
     /// Build a [`JobKind::Seal`] enqueue request.
     pub fn seal(p: &SealPayload) -> Result<Self> {
         Ok(Self {
+            id: None,
             kind: JobKind::Seal,
             payload_json: serde_json::to_string(p)?,
             dedupe_key: Some(p.dedupe_key()),
@@ -320,6 +373,7 @@ impl NewJob {
     /// `Utc::now()` reading so the dedupe key is boundary-safe.
     pub fn flush_stale(p: &FlushStalePayload, date_iso: &str, hour_block: u32) -> Result<Self> {
         Ok(Self {
+            id: None,
             kind: JobKind::FlushStale,
             payload_json: serde_json::to_string(p)?,
             dedupe_key: Some(p.dedupe_key(date_iso, hour_block)),
@@ -331,6 +385,7 @@ impl NewJob {
     /// Build a [`JobKind::ReembedBackfill`] enqueue request.
     pub fn reembed_backfill(p: &ReembedBackfillPayload) -> Result<Self> {
         Ok(Self {
+            id: None,
             kind: JobKind::ReembedBackfill,
             payload_json: serde_json::to_string(p)?,
             dedupe_key: Some(p.dedupe_key()),
@@ -342,6 +397,7 @@ impl NewJob {
     /// Build a [`JobKind::SealDocument`] enqueue request.
     pub fn seal_document(p: &SealDocumentPayload) -> Result<Self> {
         Ok(Self {
+            id: None,
             kind: JobKind::SealDocument,
             payload_json: serde_json::to_string(p)?,
             dedupe_key: Some(p.dedupe_key()),

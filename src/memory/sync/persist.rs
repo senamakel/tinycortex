@@ -7,9 +7,10 @@
 //! observe after the fact.
 //!
 //! [`KvSkillDocSink`] closes that gap with a durable, inspectable reference
-//! sink backed by the [`KvStore`]. Every document becomes one `kv_namespace`
-//! row, so a host — or a debug viewer — can browse exactly what a sync run
-//! ingested without re-running it (and without a live Composio key).
+//! sink backed by the host's [`KvStore`] port. Every document becomes one
+//! namespaced owner record, so a host — or a debug viewer — can browse exactly
+//! what a sync run ingested without re-running it (and without a live Composio
+//! key).
 //!
 //! ## Layout
 //!
@@ -18,9 +19,8 @@
 //! - key: `document_id` (e.g. `gmail:18f2…`)
 //! - value: the full JSON-serialised [`SkillDocument`]
 //!
-//! One row per document keeps deletes O(1) and lets a reader enumerate a
-//! toolkit's documents with a single namespace scan
-//! (`SELECT … WHERE namespace = 'skilldoc:gmail'`).
+//! One record per document keeps deletes direct and lets a reader enumerate a
+//! toolkit's documents with a namespace listing.
 //!
 //! ## Safety
 //!
@@ -33,21 +33,16 @@
 //! the underlying store rejects the write, and the error surfaces here rather
 //! than being silently dropped.
 
-use std::path::Path;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 
+use crate::memory::config::MemoryConfig;
 use crate::memory::store::KvStore;
 use crate::memory::sync::traits::{SkillDocSink, SkillDocument};
 
 /// KV namespace prefix under which skill documents are stored.
 pub const SKILLDOC_NS_PREFIX: &str = "skilldoc:";
-
-/// Canonical on-disk path for the skill-document KV store, relative to a
-/// workspace root. Kept alongside the memory tree so all sync artifacts for a
-/// workspace live under `memory_tree/`.
-pub const SKILL_DOCS_DB: &str = "memory_tree/skill_docs.db";
 
 /// Durable [`SkillDocSink`] that persists every [`SkillDocument`] as one row in
 /// a [`KvStore`], so a host or debug viewer can inspect ingested memory.
@@ -65,13 +60,9 @@ impl KvSkillDocSink {
         Self { kv }
     }
 
-    /// Open (or create) the canonical skill-document store under `workspace`
-    /// (`<workspace>/memory_tree/skill_docs.db`). Parent directories are
-    /// created as needed by the underlying [`KvStore::open`].
-    pub fn open_in_workspace(workspace: &Path) -> anyhow::Result<Self> {
-        let db_path = workspace.join(SKILL_DOCS_DB);
-        let kv = KvStore::open(&db_path)?;
-        Ok(Self::new(Arc::new(kv)))
+    /// Attach to the prepared owner KV port selected by the host.
+    pub fn from_config(config: &MemoryConfig) -> anyhow::Result<Self> {
+        Ok(Self::new(Arc::new(KvStore::from_config(config)?)))
     }
 
     /// Borrow the backing store (e.g. to read documents back for inspection).
@@ -93,7 +84,8 @@ impl SkillDocSink for KvSkillDocSink {
         let value = serde_json::to_value(&document)
             .map_err(|error| anyhow::anyhow!("serialize skill doc {key}: {error}"))?;
         self.kv
-            .set_namespace(&namespace, &key, &value)
+            .set_namespace_async(&namespace, &key, &value)
+            .await
             .map_err(|error| anyhow::anyhow!("persist skill doc {key}: {error}"))?;
         Ok(())
     }
@@ -101,7 +93,8 @@ impl SkillDocSink for KvSkillDocSink {
     async fn delete(&self, namespace_skill_id: &str, document_id: &str) -> anyhow::Result<()> {
         let namespace = Self::namespace_for(namespace_skill_id);
         self.kv
-            .delete_namespace(&namespace, document_id)
+            .delete_namespace_async(&namespace, document_id)
+            .await
             .map_err(|error| anyhow::anyhow!("delete skill doc {document_id}: {error}"))?;
         Ok(())
     }

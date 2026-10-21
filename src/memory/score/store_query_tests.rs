@@ -1,31 +1,48 @@
 use super::*;
+use crate::memory::chunks::test_support::host_config;
+use crate::memory::score::extract::EntityKind;
+use crate::memory::score::resolver::CanonicalEntity;
 
-fn config() -> (tempfile::TempDir, MemoryConfig) {
+fn fixture() -> (tempfile::TempDir, MemoryConfig) {
     let temp = tempfile::tempdir().unwrap();
-    let config = MemoryConfig::new(temp.path());
+    let config = host_config(temp.path());
     (temp, config)
 }
 
-fn insert_entity(config: &MemoryConfig, entity: &str, node: &str, timestamp_ms: i64, score: f64) {
-    with_connection(config, |connection| {
-        connection.execute(
-            "INSERT INTO mem_tree_entity_index
-             (entity_id, node_id, node_kind, entity_kind, surface, score, timestamp_ms, tree_id, is_user)
-             VALUES (?1, ?2, 'leaf', 'topic', ?1, ?3, ?4, NULL, 0)",
-            rusqlite::params![entity, node, score, timestamp_ms],
-        )?;
-        Ok(())
-    })
-    .unwrap();
+fn entity(id: &str, score: f32) -> CanonicalEntity {
+    CanonicalEntity {
+        canonical_id: format!("topic:{id}"),
+        kind: EntityKind::Topic,
+        surface: id.to_owned(),
+        span_start: 0,
+        span_end: id.len() as u32,
+        score,
+    }
 }
 
 #[test]
 fn lookup_entity_in_window_filters_orders_and_limits() {
-    let (_temp, config) = config();
-    insert_entity(&config, "topic:x", "old", 10, 0.2);
-    insert_entity(&config, "topic:x", "mid", 20, 0.4);
-    insert_entity(&config, "topic:x", "new", 30, 0.6);
-    insert_entity(&config, "topic:y", "other", 25, 0.9);
+    let (_temp, config) = fixture();
+    for (node, timestamp) in [("old", 10), ("mid", 20), ("new", 30)] {
+        crate::memory::score::store::index_entity(
+            &config,
+            &entity("x", 0.5),
+            node,
+            "leaf",
+            timestamp,
+            None,
+        )
+        .unwrap();
+    }
+    crate::memory::score::store::index_entity(
+        &config,
+        &entity("y", 0.9),
+        "other",
+        "leaf",
+        25,
+        None,
+    )
+    .unwrap();
 
     let hits = lookup_entity_in_window(&config, "topic:x", Some(15), Some(35), Some(1)).unwrap();
     assert_eq!(hits.len(), 1);
@@ -34,10 +51,16 @@ fn lookup_entity_in_window_filters_orders_and_limits() {
 
 #[test]
 fn list_entity_ids_for_node_is_distinct_and_deterministic() {
-    let (_temp, config) = config();
-    insert_entity(&config, "topic:a", "node", 10, 0.4);
-    insert_entity(&config, "topic:b", "node", 20, 0.9);
-
+    let (_temp, config) = fixture();
+    crate::memory::score::store::index_entities(
+        &config,
+        &[entity("a", 0.4), entity("b", 0.9)],
+        "node",
+        "leaf",
+        10,
+        None,
+    )
+    .unwrap();
     assert_eq!(
         list_entity_ids_for_node(&config, "node").unwrap(),
         vec!["topic:b", "topic:a"]

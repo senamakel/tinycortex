@@ -14,6 +14,7 @@
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::fmt;
 
 pub use crate::memory::config::{INPUT_TOKEN_BUDGET, OUTPUT_TOKEN_BUDGET, SUMMARY_FANOUT};
 
@@ -41,8 +42,30 @@ pub enum TreeKind {
     Flavoured,
 }
 
+/// A tree insert lost its owner-state compare-and-swap because the ID or
+/// `(kind, scope)` key was already present. Callers may re-read the scope to
+/// return a concurrently created tree.
+#[derive(Debug)]
+pub(crate) struct TreeInsertConflict {
+    pub(crate) kind: TreeKind,
+    pub(crate) scope: String,
+}
+
+impl fmt::Display for TreeInsertConflict {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "tree insert conflict for kind={} scope={}",
+            self.kind.as_str(),
+            self.scope
+        )
+    }
+}
+
+impl std::error::Error for TreeInsertConflict {}
+
 impl TreeKind {
-    /// Stable lowercase form used in SQL discriminator columns and ids.
+    /// Stable lowercase form used in owner-state values and ids.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Source => "source",
@@ -76,7 +99,7 @@ pub enum TreeStatus {
 }
 
 impl TreeStatus {
-    /// Stable lowercase form used as the SQL discriminator value.
+    /// Stable lowercase form used in serialized owner-state values.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Active => "active",
@@ -84,7 +107,7 @@ impl TreeStatus {
         }
     }
 
-    /// Inverse of [`Self::as_str`] — parse from the SQL discriminator.
+    /// Inverse of [`Self::as_str`] — parse a serialized owner-state value.
     pub fn parse(s: &str) -> Result<Self, String> {
         match s {
             "active" => Ok(Self::Active),
@@ -101,7 +124,7 @@ impl TreeStatus {
 /// current top node at that level.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Tree {
-    /// Stable tree id (primary key).
+    /// Stable tree id used by owner-state keys.
     pub id: String,
     /// Discriminator for the tree family; see [`TreeKind`].
     pub kind: TreeKind,
@@ -132,7 +155,7 @@ pub struct Tree {
 /// lower-level summary ids. The relation is fixed at seal time.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SummaryNode {
-    /// Stable node id (primary key).
+    /// Stable summary id used by owner-state keys.
     pub id: String,
     /// Owning [`Tree::id`].
     pub tree_id: String,
@@ -163,9 +186,8 @@ pub struct SummaryNode {
     pub sealed_at: DateTime<Utc>,
     /// Tombstone flag — summaries are immutable, this stays `false` on new seals.
     pub deleted: bool,
-    /// Optional summary-content embedding for semantic rerank. `None` on reads
-    /// where the blob column is NULL (the engine persists embeddings to the
-    /// per-model sidecar table, leaving this legacy column NULL).
+    /// Optional summary-content embedding for semantic rerank. New owner-state
+    /// records keep vectors in a per-signature sidecar, not in this field.
     #[serde(default)]
     pub embedding: Option<Vec<f32>>,
     /// Document identity this node belongs to, for document source trees.
@@ -247,7 +269,7 @@ pub struct EntityIndexStats {
     pub graph_centrality: Option<f32>,
 }
 
-/// Row persisted in `mem_tree_entity_hotness`.
+/// Entity hotness counters persisted in the owner-state collection.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct HotnessCounters {
     /// Canonical entity id this row tracks (primary key).

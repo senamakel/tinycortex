@@ -34,25 +34,21 @@ impl Shutdown {
 
 /// Backoff tuning for the worker loop.
 ///
-/// Mirrors OpenHuman's "back off, don't page" policy: transient SQLite
-/// conditions are re-polled after a kind-specific delay, and persistent host
-/// conditions (a full disk, a dying/read-only mount) back off long. Corruption
-/// is fatal (the loop returns an error so the host can quarantine + rebuild) and
-/// has no backoff knob.
+/// Typed storage conflicts and temporary unavailability are re-polled after
+/// category-specific delays. Persistent host-filesystem failures back off long;
+/// generic storage backend failures are returned to the host.
 #[derive(Clone, Debug)]
 pub struct WorkerLoopConfig {
     /// Pause after a poll that found no claimable work.
     pub idle_backoff: Duration,
-    /// Pause after transient write-lock contention (`SQLITE_BUSY`/`LOCKED`).
-    pub busy_backoff: Duration,
-    /// Pause after a transient I/O condition (WAL/shm cold-start, `CANTOPEN`).
-    pub io_backoff: Duration,
-    /// Pause after `SQLITE_FULL` (disk full): a persistent host condition.
-    pub disk_full_backoff: Duration,
+    /// Pause after a typed storage precondition conflict.
+    pub conflict_backoff: Duration,
+    /// Pause after a typed temporary storage unavailability.
+    pub unavailable_backoff: Duration,
     /// Pause after a persistent host-filesystem failure (EIO/ENOSPC/EROFS
     /// surfaced as a `std::io::Error` — a dying SD card or full/read-only
-    /// mount). Like `disk_full_backoff`, these never clear on their own, so back
-    /// off long rather than re-poll and flood.
+    /// mount). These never clear on their own, so back off long rather than
+    /// re-poll and flood.
     pub host_io_backoff: Duration,
     /// Pause after any other error before retrying.
     pub error_backoff: Duration,
@@ -62,9 +58,8 @@ impl Default for WorkerLoopConfig {
     fn default() -> Self {
         Self {
             idle_backoff: Duration::from_millis(250),
-            busy_backoff: Duration::from_millis(100),
-            io_backoff: Duration::from_secs(1),
-            disk_full_backoff: Duration::from_secs(30),
+            conflict_backoff: Duration::from_millis(100),
+            unavailable_backoff: Duration::from_secs(1),
             host_io_backoff: Duration::from_secs(30),
             error_backoff: Duration::from_millis(500),
         }

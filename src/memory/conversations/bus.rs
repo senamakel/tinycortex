@@ -1,5 +1,5 @@
 //! Event-bus subscriber that mirrors inbound channel messages into the
-//! workspace-backed conversation store, so non-web channels (Slack, Telegram,
+//! host-backed conversation store, so non-web channels (Slack, Telegram,
 //! etc.) persist alongside UI-driven threads.
 //!
 //! ## What was abstracted from OpenHuman
@@ -20,19 +20,17 @@
 //! The conversation-history-key derivation is reproduced inline so persisted
 //! thread ids stay byte-identical to OpenHuman's.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{Arc, OnceLock, RwLock};
 
 use async_trait::async_trait;
 use chrono::Utc;
 use serde_json::json;
 
-use super::{
-    append_message, ensure_thread, get_messages, list_threads, ConversationMessage,
-    CreateConversationThread,
-};
+use super::{ConversationMessage, CreateConversationThread};
 
-static CONVERSATION_PERSISTENCE_WORKSPACE: OnceLock<Arc<RwLock<PathBuf>>> = OnceLock::new();
+static CONVERSATION_PERSISTENCE_STORE: OnceLock<Arc<RwLock<super::ConversationStore>>> =
+    OnceLock::new();
 static CONVERSATION_PERSISTENCE_REGISTERED: OnceLock<()> = OnceLock::new();
 
 /// A channel turn the persistence subscriber knows how to mirror into the
@@ -113,57 +111,57 @@ pub trait ConversationEventBus {
 /// Register the long-lived channel conversation persistence subscriber on the
 /// supplied bus.
 ///
-/// This bridges typed channel events onto the workspace-backed JSONL
-/// conversation store so non-web channels persist alongside UI threads. The
-/// workspace binding is shared and rebindable: calling this again with a new
-/// `workspace_dir` repoints the already-registered subscriber without
-/// double-subscribing.
+/// This bridges typed channel events onto the configured host-backed
+/// conversation store so non-web channels persist alongside UI threads.
+/// Calling this again rebinds the single subscriber to the supplied prepared
+/// config without double-subscribing.
 pub fn register_conversation_persistence_subscriber(
     bus: &dyn ConversationEventBus,
-    workspace_dir: PathBuf,
-) {
-    let workspace = CONVERSATION_PERSISTENCE_WORKSPACE
-        .get_or_init(|| Arc::new(RwLock::new(workspace_dir.clone())));
-    if let Ok(mut guard) = workspace.write() {
-        *guard = workspace_dir;
+    config: &crate::memory::config::MemoryConfig,
+) -> anyhow::Result<()> {
+    let store = super::ConversationStore::open(config)?;
+    let shared =
+        CONVERSATION_PERSISTENCE_STORE.get_or_init(|| Arc::new(RwLock::new(store.clone())));
+    if let Ok(mut guard) = shared.write() {
+        *guard = store;
     }
 
     if CONVERSATION_PERSISTENCE_REGISTERED.get().is_some() {
-        return;
+        return Ok(());
     }
 
     let subscriber: Arc<dyn ChannelEventHandler> = Arc::new(
-        ConversationPersistenceSubscriber::new_shared(Arc::clone(workspace)),
+        ConversationPersistenceSubscriber::new_shared(Arc::clone(shared)),
     );
     if bus.subscribe_conversation_persistence(subscriber) {
         let _ = CONVERSATION_PERSISTENCE_REGISTERED.set(());
     }
+    Ok(())
 }
 
-/// Subscriber that persists channel turns into the workspace conversation
-/// store. Holds a rebindable workspace binding so a host that switches the
-/// active workspace can repoint it without re-subscribing.
+/// Subscriber that persists channel turns into a rebindable prepared
+/// conversation store.
 pub struct ConversationPersistenceSubscriber {
-    workspace_dir: Arc<RwLock<PathBuf>>,
+    store: Arc<RwLock<super::ConversationStore>>,
 }
 
 impl ConversationPersistenceSubscriber {
-    /// Construct a subscriber bound to a fixed workspace directory.
-    pub fn new(workspace_dir: PathBuf) -> Self {
-        Self {
-            workspace_dir: Arc::new(RwLock::new(workspace_dir)),
-        }
+    /// Construct a subscriber bound to an opened host configuration.
+    pub fn new(config: &crate::memory::config::MemoryConfig) -> anyhow::Result<Self> {
+        Ok(Self {
+            store: Arc::new(RwLock::new(super::ConversationStore::open(config)?)),
+        })
     }
 
-    fn new_shared(workspace_dir: Arc<RwLock<PathBuf>>) -> Self {
-        Self { workspace_dir }
+    fn new_shared(store: Arc<RwLock<super::ConversationStore>>) -> Self {
+        Self { store }
     }
 
-    fn workspace_dir_snapshot(&self) -> Result<PathBuf, String> {
-        self.workspace_dir
+    fn store_snapshot(&self) -> Result<super::ConversationStore, String> {
+        self.store
             .read()
             .map(|guard| guard.clone())
-            .map_err(|error| format!("workspace binding poisoned: {error}"))
+            .map_err(|error| format!("conversation store binding poisoned: {error}"))
     }
 }
 
@@ -174,10 +172,11 @@ impl ChannelEventHandler for ConversationPersistenceSubscriber {
     }
 
     async fn handle(&self, event: &ChannelEvent) {
-        let my_workspace = match self.workspace_dir_snapshot() {
-            Ok(dir) => dir,
+        let store = match self.store_snapshot() {
+            Ok(store) => store,
             Err(_) => return,
         };
+        let workspace = store.workspace().to_path_buf();
         let descriptor = match event {
             ChannelEvent::Received {
                 channel,
@@ -190,7 +189,7 @@ impl ChannelEventHandler for ConversationPersistenceSubscriber {
             } => {
                 // Drop events targeting a different workspace than the one this
                 // subscriber is currently bound to (workspace-switch race).
-                if *workspace_dir != my_workspace {
+                if *workspace_dir != workspace {
                     return;
                 }
                 ChannelTurnDescriptor {
@@ -217,7 +216,7 @@ impl ChannelEventHandler for ConversationPersistenceSubscriber {
                 success,
                 workspace_dir,
             } => {
-                if *workspace_dir != my_workspace {
+                if *workspace_dir != workspace {
                     return;
                 }
                 ChannelTurnDescriptor {
@@ -237,7 +236,7 @@ impl ChannelEventHandler for ConversationPersistenceSubscriber {
         // Persistence failures are non-fatal: a dropped channel turn must not
         // crash the bus handler. (OpenHuman logged here; this crate has no
         // logging facade, so the error is intentionally swallowed.)
-        let _ = persist_channel_turn(&my_workspace, descriptor);
+        let _ = persist_channel_turn(&store, descriptor).await;
     }
 }
 
@@ -273,15 +272,12 @@ struct ChannelTurnDescriptor<'a> {
 /// create-or-touch the channel thread, then append the message if it hasn't
 /// already been persisted.
 ///
-/// Idempotent per `(role, message_id)`: the dedup check reads back the
-/// thread's full message list and skips the append if `{role}:{message_id}`
-/// is already present, so redelivery of the same event is a no-op. That
-/// dedup check re-reads every message in the thread on every call — cheap for
-/// short-lived channel threads, O(n) per turn (O(n²) over a thread's
-/// lifetime) for long-running ones.
+/// Idempotent per `(role, message_id)`: the owner stream CAS checks the
+/// thread's current message IDs and appends only if this event has not already
+/// been committed, so concurrent redelivery also becomes a no-op.
 ///
-fn persist_channel_turn(
-    workspace_dir: &Path,
+async fn persist_channel_turn(
+    store: &super::ConversationStore,
     descriptor: ChannelTurnDescriptor<'_>,
 ) -> Result<(), String> {
     let collision_safe_id = persisted_channel_thread_id(
@@ -297,7 +293,9 @@ fn persist_channel_turn(
         descriptor.thread_ts,
     );
     let thread_id = if legacy_id != collision_safe_id
-        && list_threads(workspace_dir.to_path_buf())?
+        && store
+            .list_threads_async()
+            .await?
             .iter()
             .any(|thread| thread.id == legacy_id)
     {
@@ -313,9 +311,8 @@ fn persist_channel_turn(
     );
     let created_at = Utc::now().to_rfc3339();
 
-    ensure_thread(
-        workspace_dir.to_path_buf(),
-        CreateConversationThread {
+    store
+        .ensure_thread_async(CreateConversationThread {
             id: thread_id.clone(),
             title,
             created_at: created_at.clone(),
@@ -324,39 +321,33 @@ fn persist_channel_turn(
             // later touches, `None` preserves any labels the user assigned.
             labels: None,
             personality_id: None,
-        },
-    )?;
+        })
+        .await?;
 
     let persisted_message_id = format!("{}:{}", descriptor.role, descriptor.message_id);
-    if get_messages(workspace_dir.to_path_buf(), &thread_id)?
-        .iter()
-        .any(|message| message.id == persisted_message_id)
-    {
-        return Ok(());
-    }
-
-    append_message(
-        workspace_dir.to_path_buf(),
-        &thread_id,
-        ConversationMessage {
-            id: persisted_message_id,
-            content: descriptor.content.to_string(),
-            message_type: "text".to_string(),
-            extra_metadata: json!({
-                "scope": "channel",
-                "channel": descriptor.channel,
-                "channelSender": descriptor.sender,
-                "replyTarget": descriptor.reply_target,
-                "threadTs": descriptor.thread_ts,
-                "sourceEvent": descriptor.source,
-                "success": descriptor.success,
-                "elapsedMs": descriptor.elapsed_ms,
-                "sourceMessageId": descriptor.message_id,
-            }),
-            sender: descriptor.role.to_string(),
-            created_at,
-        },
-    )?;
+    store
+        .append_message_idempotent_async(
+            &thread_id,
+            ConversationMessage {
+                id: persisted_message_id,
+                content: descriptor.content.to_string(),
+                message_type: "text".to_string(),
+                extra_metadata: json!({
+                    "scope": "channel",
+                    "channel": descriptor.channel,
+                    "channelSender": descriptor.sender,
+                    "replyTarget": descriptor.reply_target,
+                    "threadTs": descriptor.thread_ts,
+                    "sourceEvent": descriptor.source,
+                    "success": descriptor.success,
+                    "elapsedMs": descriptor.elapsed_ms,
+                    "sourceMessageId": descriptor.message_id,
+                }),
+                sender: descriptor.role.to_string(),
+                created_at,
+            },
+        )
+        .await?;
     Ok(())
 }
 

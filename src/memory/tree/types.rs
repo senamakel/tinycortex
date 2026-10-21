@@ -19,7 +19,7 @@ pub trait SealObserver: Send + Sync {
         &self,
         _tree: &Tree,
         _node: &SummaryNode,
-        _content_path: &str,
+        _content_path: Option<&str>,
         _reason: &str,
     ) -> Result<()> {
         Ok(())

@@ -6,18 +6,16 @@
 //!
 //! - [`content`]       — markdown content store (YAML front-matter, atomic
 //!   writes, `content_path`/`content_sha256` pointers, Obsidian-vault paths).
-//! - [`vectors`]       — SQLite-backed packed-`f32` cosine vector DB.
-//! - [`kv`]            — global + namespace JSON key-value store.
+//! - [`vectors`]       — host-document-backed packed-`f32` cosine vector store.
+//! - [`kv`]            — host-port global + namespace JSON key-value store.
 //! - [`entity_index`] — entity occurrence index over tree nodes.
 //! - [`safety`]       — secret / PII detection guard used by KV writes.
 //!
 //! ## Concurrency contract
 //!
-//! [`KvStore`], [`VectorStore`], and [`EntityIndex`] each hold their SQLite
-//! connection behind a `parking_lot::Mutex`, so calls into one instance
-//! serialize cleanly. Their SQLite connections use a 15-second busy timeout,
-//! allowing independent handles to the same database file to tolerate brief
-//! write contention instead of failing immediately with `SQLITE_BUSY`.
+//! Persistent collections are supplied by the host through the storage ports;
+//! these domain stores do not open their own database connections. KV writes
+//! use optimistic compare-and-swap.
 
 /// Markdown content store: source-of-truth files with YAML front matter,
 /// atomic writes, and `content_path`/`content_sha256` provenance pointers.
@@ -29,12 +27,15 @@ pub mod kv;
 mod memory_trait;
 /// Secret / PII detection guard applied before KV writes are persisted.
 pub mod safety;
+/// Opaque engine-owned values stored without user-memory PII rewriting.
+#[cfg(any(feature = "persona", feature = "sync"))]
+pub(crate) mod state_kv;
 /// Starter in-memory reference backend used by the smoke test.
 #[allow(clippy::module_inception)]
 pub mod store;
 /// Core memory contract types ([`StoreError`], [`MemoryRecord`], etc.).
 pub mod types;
-/// SQLite-backed packed-`f32` cosine vector DB and embedding backends.
+/// Host-document-backed packed-`f32` cosine vector store and embedding backends.
 pub mod vectors;
 
 pub use store::{InMemoryMemoryStore, MemoryStore};

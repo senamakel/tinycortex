@@ -14,7 +14,9 @@ use crate::memory::config::MemoryConfig;
 use crate::memory::score::extract::CompositeExtractor;
 use crate::memory::tree::bucket_seal::{append_leaf, LabelStrategy, LeafRef};
 use crate::memory::tree::flush::force_flush_tree;
-use crate::memory::tree::registry::get_or_create_tree_with_ask;
+use crate::memory::tree::registry::{
+    get_or_create_tree_with_ask, get_or_create_tree_with_ask_async,
+};
 use crate::memory::tree::store::{archive_tree, Tree, TreeKind};
 use crate::memory::tree::summarise::Summariser;
 
@@ -152,6 +154,11 @@ impl<'a> TreeFactory<'a> {
         get_or_create_tree_with_ask(config, self.kind(), self.scope(), self.ask())
     }
 
+    /// Async counterpart to [`get_or_create`](Self::get_or_create).
+    pub async fn get_or_create_async(&self, config: &MemoryConfig) -> Result<Tree> {
+        get_or_create_tree_with_ask_async(config, self.kind(), self.scope(), self.ask()).await
+    }
+
     /// Append one leaf using this profile's default labeling policy.
     pub async fn insert_leaf(
         &self,
@@ -159,7 +166,7 @@ impl<'a> TreeFactory<'a> {
         leaf: &LeafRef,
         summariser: &dyn Summariser,
     ) -> Result<Vec<String>> {
-        let tree = self.get_or_create(config)?;
+        let tree = self.get_or_create_async(config).await?;
         let strategy = self.label_strategy();
         append_leaf(config, &tree, leaf, summariser, &strategy).await
     }
@@ -174,7 +181,7 @@ impl<'a> TreeFactory<'a> {
         config: &MemoryConfig,
         summariser: &dyn Summariser,
     ) -> Result<Vec<String>> {
-        let tree = self.get_or_create(config)?;
+        let tree = self.get_or_create_async(config).await?;
         let strategy = self.label_strategy();
         force_flush_tree(config, &tree.id, None, summariser, &strategy).await
     }

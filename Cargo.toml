@@ -39,15 +39,13 @@ exclude = [
 ]
 
 [features]
-# Dependency-light, fully synchronous core. No heavyweight native or async
-# dependencies are pulled in by default; every heavy capability is opt-in below.
+# Dependency-light synchronous core. Storage ports are bridged through a small
+# Tokio runtime; optional async capabilities remain gated below.
 default = []
 
 # Async background worker loops for the job queue (`memory::queue::runtime`).
-# Turns `tokio` into a real (optional) dependency rather than a test-only one so
-# a host can run the append/seal/flush pipeline as always-on loops instead of
-# driving `run_once` by hand.
-tokio = ["dep:tokio"]
+# Keeps the named feature contract for hosts that opt into always-on workers.
+tokio = ["tokio/time"]
 
 # Git-backed source snapshots / diffs / checkpoints (`memory::diff`). Gates the
 # heavy native `git2`/libgit2 dependency; with the feature off the whole `diff`
@@ -56,16 +54,16 @@ git-diff = ["dep:git2"]
 
 # reqwest-based embedding / LLM HTTP providers (`memory::providers`). Pulls in
 # the reqwest stack and needs an async runtime, so it implies `tokio`.
-providers-http = ["dep:reqwest", "tokio"]
+providers-http = ["dep:reqwest", "tokio", "tokio/time"]
 
 # Live source synchronization (Composio HTTP pipelines and workspace scans).
 # Host schedulers, credentials, RPC, and event buses remain outside the crate.
-sync = ["dep:reqwest", "dep:tracing", "tokio"]
+sync = ["dep:reqwest", "dep:tracing", "tokio", "tokio/time", "tokio/process", "tokio/net"]
 
 # Persona distillation surface (`memory::persona`): ingests local coding-agent
 # history, instruction files, and git commits into a durable persona memory
 # layer (doc 06). Adds NO new dependencies — readers reuse `serde_json`,
-# `walkdir`, `rusqlite`, `sha2` from core; the git-history reader additionally
+# `walkdir`, and `sha2` from core; the git-history reader additionally
 # requires the `git-diff` feature. A live run also wants `providers-http` for
 # the OpenRouter reference provider, but the pipeline depends only on the
 # `ChatProvider` / `Summariser` / `EmbeddingBackend` traits.
@@ -85,13 +83,12 @@ wiki-git = ["dep:git2", "dep:hex"]
 # detection is host desktop policy and lives in the host, not here.
 obsidian = []
 
-# Contact resolution and scoring (`memory::people`): a SQLite store of people,
+# Contact resolution and scoring (`memory::people`): a TSD-backed store of people,
 # handle aliases and interactions, a deterministic handle → `PersonId` resolver,
 # and a recency × frequency × reciprocity × depth scorer.
 #
-# Implies `tokio` because the store shares its connection as an
-# `Arc<tokio::sync::Mutex<Connection>>` across tasks. It adds no other
-# dependency — `rusqlite`, `chrono`, `uuid` and `serde` are already core.
+# Implies `tokio` because the store uses async host-supplied document ports.
+# It adds no other dependency; the generic document API/types are already core.
 people = ["tokio"]
 
 # The macOS system address book (`memory::people::address_book`) as a seed
@@ -118,12 +115,15 @@ chrono = { version = "0.4", features = ["serde"] }
 parking_lot = "0.12"
 rand = "0.10"
 regex = "1"
-rusqlite = { version = "0.40", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 schemars = "1"
 sha2 = "0.10"
 thiserror = "2"
+# Host-supplied storage contracts. The engine owns these ports, not their
+# implementations; production opens them from the host's scoped bundle.
+tinystoragedrivers-api = { git = "https://github.com/senamakel/tinystoragedrivers", tag = "v2.0.2" }
+tinystoragedrivers-types = { git = "https://github.com/senamakel/tinystoragedrivers", tag = "v2.0.2" }
 # Provider-neutral inference contracts. Pinned until TinyInference is
 # published; embedding hosts may patch this exact git source so the host and
 # TinyCortex share one `EmbeddingModel` trait identity without pulling in an
@@ -139,9 +139,9 @@ uuid = { version = "1", features = ["serde", "v4"] }
 walkdir = "2"
 
 # ── Optional, feature-gated dependencies ────────────────────────────────────
-# Native-linking deps are pinned to OpenHuman's versions so the host and the
-# crate link one bundled SQLite and one libgit2. Keep in lockstep with the host
-# root Cargo.toml when either side bumps.
+# Native-linking production dependencies are pinned to OpenHuman's versions so
+# the host and crate link one libgit2. Keep in lockstep with the host root
+# Cargo.toml when either side bumps. Bundled SQLite is dev-only for import tests.
 # git2 links libgit2 (heavy native build) — only for the `git-diff` feature.
 git2 = { version = "0.21", default-features = false, features = [
     "vendored-libgit2",
@@ -157,21 +157,10 @@ reqwest = { version = "0.12", default-features = false, features = [
 tracing = { version = "0.1", optional = true }
 # Hex-encodes summary read-pointer ids into git tag names (`wiki-git`).
 hex = { version = "0.4", optional = true }
-# tokio powers the optional background worker loops (`tokio` feature). It is
-# also listed under dev-dependencies so the async test suite always compiles.
-tokio = { version = "1", features = [
-    "rt",
-    "rt-multi-thread",
-    "macros",
-    "time",
-    "sync",
-    # `process` powers the GitHub source reader's `gh` / `git` subprocess calls
-    # (`memory::sources::readers::github`, behind the `sync` feature).
-    "process",
-    # `net` powers the web-page reader's DNS-resolution SSRF guard
-    # (`tokio::net::lookup_host`, behind the `sync` feature).
-    "net",
-], optional = true }
+# Minimal Tokio runtime used by the synchronous storage bridge. Optional
+# capabilities opt in to `time`, `process`, or `net` above. It is also listed
+# under dev-dependencies so async tests compile independently of features.
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync"] }
 
 # macOS system address book, read by `memory::people::address_book` behind the
 # `contacts` feature. Declared under a `cfg(target_os = "macos")` target table
@@ -197,13 +186,21 @@ block2 = { version = "0.6", optional = true }
 
 [dev-dependencies]
 dotenvy = "0.15"
+# SQLite is only used by legacy workspace import integration tests. Keep its
+# bundled native library out of every consumer's normal dependency graph.
+rusqlite = { version = "0.40", features = ["bundled"] }
 tempfile = "3"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+tinystoragedrivers-testkit = { git = "https://github.com/senamakel/tinystoragedrivers", tag = "v2.0.2" }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "net"] }
 wiremock = "0.6"
 
 [[test]]
 name = "composio_sync_mock"
 required-features = ["sync"]
+
+[[test]]
+name = "legacy_people_import"
+required-features = ["people"]
 
 [[test]]
 name = "composio_sync_live"
@@ -213,6 +210,11 @@ required-features = ["sync"]
 [[test]]
 name = "persona_e2e"
 required-features = ["persona", "providers-http", "git-diff"]
+
+# Typed readback of the authentic v0.1.3 file-state migration fixture.
+[[test]]
+name = "legacy_file_state_import"
+required-features = ["sync", "persona"]
 
 # Runnable persona distillation harness (doc 06).
 # `OPENROUTER_API_KEY=... cargo run --example persona_harness --features persona,providers-http,git-diff -- backfill`

@@ -3,25 +3,18 @@ use crate::memory::config::MemoryConfig;
 use crate::memory::queue::gate::DEFAULT_LLM_PERMITS;
 use crate::memory::queue::handlers::ReembedProgress;
 use crate::memory::queue::store::DEFAULT_LOCK_DURATION_MS;
-use crate::memory::queue::store::{count_by_status, enqueue, get_job};
+use crate::memory::queue::store::{
+    count_by_status_async, enqueue, enqueue_async, get_job, get_job_async,
+};
 use crate::memory::queue::test_support::RecordingDelegates;
 use crate::memory::queue::types::{FlushStalePayload, JobStatus, NewJob, ReembedBackfillPayload};
 use tempfile::TempDir;
+use tinystoragedrivers_types::{ErrorKind, StorageError};
 
 fn test_config() -> (TempDir, MemoryConfig) {
     let tmp = TempDir::new().unwrap();
-    let cfg = MemoryConfig::new(tmp.path());
+    let cfg = crate::memory::chunks::test_support::host_config(tmp.path());
     (tmp, cfg)
-}
-
-fn sqlite_failure(code: rusqlite::ErrorCode, extended: i32, msg: &str) -> anyhow::Error {
-    anyhow::Error::from(rusqlite::Error::SqliteFailure(
-        rusqlite::ffi::Error {
-            code,
-            extended_code: extended,
-        },
-        Some(msg.into()),
-    ))
 }
 
 #[tokio::test]
@@ -29,6 +22,30 @@ async fn run_once_returns_false_when_queue_is_empty() {
     let (_tmp, cfg) = test_config();
     let d = RecordingDelegates::admitting();
     assert!(!run_once(&cfg, &d).await.unwrap());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn run_once_processes_a_job_on_a_current_thread_runtime() {
+    let (_tmp, cfg) = test_config();
+    let delegates = RecordingDelegates::admitting();
+    let new_job = NewJob::flush_stale(&FlushStalePayload::default(), "current-thread", 0).unwrap();
+    let id = crate::memory::queue::store::enqueue_async(&cfg, &new_job)
+        .await
+        .unwrap()
+        .expect("enqueued");
+
+    assert!(run_once(&cfg, &delegates).await.unwrap());
+    let job = crate::memory::queue::store::get_job_async(&cfg, &id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(job.status, JobStatus::Done);
+    assert_eq!(
+        crate::memory::queue::store::count_by_status_async(&cfg, JobStatus::Done)
+            .await
+            .unwrap(),
+        1
+    );
 }
 
 #[tokio::test]
@@ -44,18 +61,22 @@ async fn run_once_parks_unparseable_payload_as_unrecoverable() {
     // it on the FIRST failure rather than burning the retry budget. FlushStale is
     // deliberately not LLM-bound, so this test never touches the shared LLM gate.
     let poison = NewJob {
+        id: None,
         kind: JobKind::FlushStale,
         payload_json: "{ this is not valid json".into(),
         dedupe_key: None,
         available_at_ms: None,
         max_attempts: Some(5),
     };
-    let id = enqueue(&cfg, &poison).unwrap().expect("enqueued");
+    let id = enqueue_async(&cfg, &poison)
+        .await
+        .unwrap()
+        .expect("enqueued");
 
     // One worker step: claim → parse fails → settle.
     assert!(run_once(&cfg, &d).await.unwrap());
 
-    let job = get_job(&cfg, &id).unwrap().unwrap();
+    let job = get_job_async(&cfg, &id).await.unwrap().unwrap();
     assert_eq!(
         job.status,
         JobStatus::Failed,
@@ -65,10 +86,10 @@ async fn run_once_parks_unparseable_payload_as_unrecoverable() {
 
     // self_heal (requeue_transient_failed) must NOT resurrect it — that was the
     // infinite-requeue-every-tick bug (QI-2).
-    let requeued = scheduler::self_heal(&cfg).unwrap();
+    let requeued = scheduler::self_heal_async(&cfg).await.unwrap();
     assert_eq!(requeued, 0, "unrecoverable poison job must stay parked");
     assert_eq!(
-        get_job(&cfg, &id).unwrap().unwrap().status,
+        get_job_async(&cfg, &id).await.unwrap().unwrap().status,
         JobStatus::Failed
     );
 }
@@ -83,6 +104,7 @@ fn pipeline_failure_downcast_fails_fast_as_unrecoverable() {
 
     let (_tmp, cfg) = test_config();
     let poison = NewJob {
+        id: None,
         kind: JobKind::FlushStale,
         payload_json: "{}".into(),
         dedupe_key: None,
@@ -117,18 +139,27 @@ async fn run_once_claims_and_completes_a_flush_stale_job() {
     let (_tmp, cfg) = test_config();
     let d = RecordingDelegates::admitting();
     let new_job = NewJob::flush_stale(&FlushStalePayload::default(), "2026-05-24", 3).unwrap();
-    let id = enqueue(&cfg, &new_job).unwrap().expect("enqueued");
+    let id = enqueue_async(&cfg, &new_job)
+        .await
+        .unwrap()
+        .expect("enqueued");
 
     assert!(run_once(&cfg, &d).await.unwrap());
-    let job = get_job(&cfg, &id).unwrap().unwrap();
+    let job = get_job_async(&cfg, &id).await.unwrap().unwrap();
     assert_eq!(job.status, JobStatus::Done);
     assert!(job.completed_at_ms.is_some());
     assert!(job.locked_until_ms.is_none());
-    assert_eq!(count_by_status(&cfg, JobStatus::Done).unwrap(), 1);
+    assert_eq!(
+        count_by_status_async(&cfg, JobStatus::Done).await.unwrap(),
+        1
+    );
 }
 
 #[tokio::test]
 async fn run_once_reschedules_reembed_jobs_that_defer() {
+    let _flag_guard = crate::memory::queue::test_support::BACKFILL_FLAG_TEST_LOCK
+        .lock()
+        .await;
     let (_tmp, cfg) = test_config();
     let mut d = RecordingDelegates::admitting();
     d.signature = "provider=test;model=x;dims=3".into();
@@ -139,10 +170,13 @@ async fn run_once_reschedules_reembed_jobs_that_defer() {
         signature: d.signature.clone(),
     })
     .unwrap();
-    let id = enqueue(&cfg, &new_job).unwrap().expect("enqueued");
+    let id = enqueue_async(&cfg, &new_job)
+        .await
+        .unwrap()
+        .expect("enqueued");
 
     assert!(run_once(&cfg, &d).await.unwrap());
-    let job = get_job(&cfg, &id).unwrap().unwrap();
+    let job = get_job_async(&cfg, &id).await.unwrap().unwrap();
     assert_eq!(job.status, JobStatus::Ready);
     assert_eq!(job.attempts, 0, "defer reverts the claim attempt bump");
     assert!(job.started_at_ms.is_none());
@@ -152,7 +186,7 @@ async fn run_once_reschedules_reembed_jobs_that_defer() {
 
 #[test]
 fn terminal_reembed_failure_clears_process_backfill_flag() {
-    let _flag_guard = crate::memory::queue::test_support::BACKFILL_FLAG_TEST_LOCK.lock();
+    let _flag_guard = crate::memory::queue::test_support::BACKFILL_FLAG_TEST_LOCK.blocking_lock();
     let (_tmp, cfg) = test_config();
     let mut new_job = NewJob::reembed_backfill(&ReembedBackfillPayload {
         signature: "provider=test;model=terminal;dims=3".into(),
@@ -173,8 +207,55 @@ fn terminal_reembed_failure_clears_process_backfill_flag() {
 }
 
 #[test]
+fn committed_reembed_defer_keeps_backfill_hint_until_completion() {
+    let _flag_guard = crate::memory::queue::test_support::BACKFILL_FLAG_TEST_LOCK.blocking_lock();
+    let (_tmp, cfg) = test_config();
+    let new_job = NewJob::reembed_backfill(&ReembedBackfillPayload {
+        signature: "provider=test;model=defer;dims=3".into(),
+    })
+    .unwrap();
+    let id = enqueue(&cfg, &new_job).unwrap().unwrap();
+    let first_claim = claim_next(&cfg, DEFAULT_LOCK_DURATION_MS).unwrap().unwrap();
+
+    crate::memory::queue::worker::settle_planned_job(
+        &cfg,
+        &first_claim,
+        Ok(crate::memory::queue::handlers::JobPlan {
+            outcome: JobOutcome::Defer {
+                until_ms: chrono::Utc::now().timestamp_millis(),
+                reason: "more rows remain".into(),
+            },
+            follow_ups: Vec::new(),
+            expected: Vec::new(),
+            mutations: Vec::new(),
+            document_projection: None,
+        }),
+    )
+    .unwrap();
+    assert!(crate::memory::queue::ops::backfill_in_progress());
+
+    crate::memory::queue::store::update_test_record(&cfg, &id, |record| {
+        record.available_at_ms = 0;
+    })
+    .unwrap();
+    let second_claim = claim_next(&cfg, DEFAULT_LOCK_DURATION_MS).unwrap().unwrap();
+    crate::memory::queue::worker::settle_planned_job(
+        &cfg,
+        &second_claim,
+        Ok(crate::memory::queue::handlers::JobPlan {
+            outcome: JobOutcome::Done,
+            follow_ups: Vec::new(),
+            expected: Vec::new(),
+            mutations: Vec::new(),
+            document_projection: None,
+        }),
+    )
+    .unwrap();
+    assert!(!crate::memory::queue::ops::backfill_in_progress());
+}
+
+#[test]
 fn completed_seal_rearms_same_level_when_live_buffer_still_crosses_gate() {
-    use crate::memory::chunks::with_connection;
     use crate::memory::queue::types::SealPayload;
 
     let (_tmp, mut cfg) = test_config();
@@ -197,15 +278,14 @@ fn completed_seal_rearms_same_level_when_live_buffer_still_crosses_gate() {
 
     // Models content appended after the handler took and consumed its own
     // snapshot, while this job's active dedupe key still suppressed producers.
-    with_connection(&cfg, |conn| {
-        conn.execute(
-            "INSERT INTO mem_tree_buffers
-                (tree_id, level, item_ids_json, token_sum, oldest_at_ms, updated_at_ms)
-             VALUES (?1, 0, '[\"late-chunk\"]', 10, 1, 1)",
-            rusqlite::params![payload.tree_id],
-        )?;
-        Ok(())
-    })
+    crate::memory::tree::append_to_buffer(
+        &cfg,
+        &payload.tree_id,
+        0,
+        "late-chunk",
+        10,
+        chrono::Utc::now(),
+    )
     .unwrap();
 
     settle_job(&cfg, &claimed, Ok(JobOutcome::Done)).unwrap();
@@ -225,13 +305,16 @@ fn completed_seal_rearms_same_level_when_live_buffer_still_crosses_gate() {
 async fn run_once_holds_an_llm_permit_for_llm_bound_jobs() {
     // While a single worker is sequential, the gate must still be acquired and
     // released around the llm-bound handler so it ends free.
+    let _flag_guard = crate::memory::queue::test_support::BACKFILL_FLAG_TEST_LOCK
+        .lock()
+        .await;
     let (_tmp, cfg) = test_config();
     let d = RecordingDelegates::admitting();
     let new_job = NewJob::reembed_backfill(&ReembedBackfillPayload {
         signature: "sig".into(),
     })
     .unwrap();
-    enqueue(&cfg, &new_job).unwrap().unwrap();
+    enqueue_async(&cfg, &new_job).await.unwrap().unwrap();
     assert!(run_once(&cfg, &d).await.unwrap());
     assert_eq!(
         llm_gate().available_permits(),
@@ -242,6 +325,9 @@ async fn run_once_holds_an_llm_permit_for_llm_bound_jobs() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn run_once_defers_instead_of_blocking_when_llm_gate_is_full() {
+    let _flag_guard = crate::memory::queue::test_support::BACKFILL_FLAG_TEST_LOCK
+        .lock()
+        .await;
     let (_tmp, cfg) = test_config();
     let d = RecordingDelegates::admitting();
     let gate = crate::memory::queue::gate::LlmGate::new(1);
@@ -250,12 +336,12 @@ async fn run_once_defers_instead_of_blocking_when_llm_gate_is_full() {
         signature: "sig".into(),
     })
     .unwrap();
-    let id = enqueue(&cfg, &new_job).unwrap().unwrap();
+    let id = enqueue_async(&cfg, &new_job).await.unwrap().unwrap();
 
     // This would deadlock a current-thread runtime if the worker used the
     // gate's blocking acquire path.
     assert!(run_once_with_gate(&cfg, &d, &gate).await.unwrap());
-    let job = get_job(&cfg, &id).unwrap().unwrap();
+    let job = get_job_async(&cfg, &id).await.unwrap().unwrap();
     assert_eq!(job.status, JobStatus::Ready);
     assert_eq!(job.attempts, 0);
     assert_eq!(gate.available_permits(), 0);
@@ -264,140 +350,57 @@ async fn run_once_defers_instead_of_blocking_when_llm_gate_is_full() {
 
 #[test]
 fn bootstrap_purges_retired_and_recovers_locks() {
-    use crate::memory::chunks::with_connection;
-    use rusqlite::params;
     let (_tmp, cfg) = test_config();
-    with_connection(&cfg, |conn| {
-        conn.execute(
-            "INSERT INTO mem_tree_jobs (id, kind, payload_json, status, attempts,
-                max_attempts, available_at_ms, created_at_ms)
-             VALUES ('job:r', 'topic_route', '{}', 'ready', 0, 5, 0, 0)",
-            params![],
-        )?;
-        Ok(())
-    })
+    crate::memory::queue::store::insert_test_record(
+        &cfg,
+        &crate::memory::queue::store::JobRecord {
+            id: "job:r".into(),
+            kind: "topic_route".into(),
+            payload_json: "{}".into(),
+            dedupe_key: None,
+            status: JobStatus::Ready.as_str().into(),
+            attempts: 0,
+            max_attempts: 5,
+            available_at_ms: 0,
+            locked_until_ms: None,
+            last_error: None,
+            failure_reason: None,
+            failure_class: None,
+            created_at_ms: 0,
+            started_at_ms: None,
+            completed_at_ms: None,
+            hint_generation: 0,
+            lease_epoch: 0,
+            lease_token: None,
+        },
+    )
     .unwrap();
     let (purged, _recovered) = bootstrap(&cfg).unwrap();
     assert_eq!(purged, 1);
 }
 
-// ── SQLite error classifiers (ported verbatim) ───────────────────────────────
+// ── Typed storage failure classification ────────────────────────────────────
 
 #[test]
-fn is_sqlite_busy_matches_busy_and_locked() {
-    assert!(is_sqlite_busy(&sqlite_failure(
-        rusqlite::ErrorCode::DatabaseBusy,
-        5,
-        "database is locked"
-    )));
-    assert!(is_sqlite_busy(&sqlite_failure(
-        rusqlite::ErrorCode::DatabaseLocked,
-        6,
-        "database table is locked"
-    )));
-}
+fn storage_failures_are_classified_by_typed_kind_through_context() {
+    let unavailable = anyhow::Error::new(StorageError::unavailable("host is restarting"))
+        .context("read owner queue state");
+    let conflict = anyhow::Error::new(StorageError::conflict("owner head advanced"));
+    let backend = anyhow::Error::new(StorageError::backend("generic storage failure"));
+    let unrelated = anyhow::anyhow!("database disk image is malformed");
 
-#[test]
-fn is_sqlite_busy_matches_through_context_and_text() {
-    let wrapped = sqlite_failure(rusqlite::ErrorCode::DatabaseBusy, 5, "database is locked")
-        .context("Failed to claim next mem_tree_jobs row")
-        .context("with_connection closure failed");
-    assert!(is_sqlite_busy(&wrapped));
-    assert!(is_sqlite_busy(&anyhow::anyhow!(
-        "Failed to claim next mem_tree_jobs row: database is locked"
-    )));
-}
-
-#[test]
-fn is_sqlite_busy_negatives() {
-    assert!(!is_sqlite_busy(&sqlite_failure(
-        rusqlite::ErrorCode::ConstraintViolation,
-        19,
-        "UNIQUE constraint failed"
-    )));
-    assert!(!is_sqlite_busy(&anyhow::anyhow!("upstream 500")));
-}
-
-#[test]
-fn is_sqlite_io_transient_matches_family() {
-    assert!(is_sqlite_io_transient(&sqlite_failure(
-        rusqlite::ErrorCode::SystemIoFailure,
-        1546,
-        "disk I/O error"
-    )));
-    for ext in [4618, 4874, 5386, 8714] {
-        assert!(is_sqlite_io_transient(&sqlite_failure(
-            rusqlite::ErrorCode::SystemIoFailure,
-            ext,
-            "sqlite io failure"
-        )));
-    }
-    assert!(is_sqlite_io_transient(&sqlite_failure(
-        rusqlite::ErrorCode::CannotOpen,
-        14,
-        "unable to open database file"
-    )));
-    assert!(is_sqlite_io_transient(&anyhow::anyhow!(
-        "memory_tree_db circuit breaker open: too many init failures"
-    )));
-    assert!(!is_sqlite_io_transient(&sqlite_failure(
-        rusqlite::ErrorCode::ConstraintViolation,
-        19,
-        "UNIQUE constraint failed"
-    )));
-}
-
-#[test]
-fn is_sqlite_disk_full_matches_code_context_text() {
-    assert!(is_sqlite_disk_full(&sqlite_failure(
-        rusqlite::ErrorCode::DiskFull,
-        13,
-        "database or disk is full"
-    )));
-    let wrapped = sqlite_failure(
-        rusqlite::ErrorCode::DiskFull,
-        13,
-        "database or disk is full",
-    )
-    .context("Failed to claim next mem_tree_jobs row");
-    assert!(is_sqlite_disk_full(&wrapped));
-    assert!(is_sqlite_disk_full(&anyhow::anyhow!(
-        "row: database or disk is full: Error code 13: Insertion failed because database is full"
-    )));
-    assert!(!is_sqlite_disk_full(&sqlite_failure(
-        rusqlite::ErrorCode::DatabaseBusy,
-        5,
-        "database is locked"
-    )));
-}
-
-#[test]
-fn is_sqlite_corrupt_matches_code_notadb_context_text() {
-    assert!(is_sqlite_corrupt(&sqlite_failure(
-        rusqlite::ErrorCode::DatabaseCorrupt,
-        11,
-        "database disk image is malformed"
-    )));
-    assert!(is_sqlite_corrupt(&sqlite_failure(
-        rusqlite::ErrorCode::NotADatabase,
-        26,
-        "file is not a database"
-    )));
-    let wrapped = sqlite_failure(
-        rusqlite::ErrorCode::DatabaseCorrupt,
-        11,
-        "database disk image is malformed",
-    )
-    .context("Failed to claim next mem_tree_jobs row");
-    assert!(is_sqlite_corrupt(&wrapped));
-    assert!(is_sqlite_corrupt(&anyhow::anyhow!(
-        "row: database disk image is malformed"
-    )));
-    assert!(!is_sqlite_corrupt(&sqlite_failure(
-        rusqlite::ErrorCode::DiskFull,
-        13,
-        "database or disk is full"
-    )));
+    assert_eq!(
+        storage_error_kind(&unavailable),
+        Some(ErrorKind::Unavailable)
+    );
+    assert_eq!(storage_error_kind(&conflict), Some(ErrorKind::Conflict));
+    assert_eq!(storage_error_kind(&backend), Some(ErrorKind::Backend));
+    assert!(is_retryable_storage_error(&unavailable));
+    assert!(is_retryable_storage_error(&conflict));
+    assert!(!is_fatal_storage_error(&unavailable));
+    assert!(!is_fatal_storage_error(&conflict));
+    assert!(is_fatal_storage_error(&backend));
+    assert!(!is_fatal_storage_error(&unrelated));
 }
 
 /// EIO (`5`), ENOSPC (`28`), and EROFS (`30`) are the persistent, user-only-
@@ -417,7 +420,7 @@ fn is_host_io_error_matches_family_code_context_text() {
     // downcast must still find it through the anyhow context chain.
     let wrapped = anyhow::Error::from(std::io::Error::from_raw_os_error(5))
         .context("Failed to create memory_tree dir: /home/x/workspace/memory_tree")
-        .context("with_connection closure failed");
+        .context("storage operation failed");
     assert!(is_host_io_error(&wrapped));
     // Text fallback: no io::Error to downcast (flattened to a plain string), the
     // os-error-number anchor still classifies it.
@@ -427,9 +430,8 @@ fn is_host_io_error_matches_family_code_context_text() {
     )));
 }
 
-/// EACCES (`13`, a permission bug), ENOENT (`2`), `SQLITE_FULL` (its own arm),
-/// and unrelated errors must NOT be swallowed as host I/O — they are real bugs
-/// or handled elsewhere and must keep reporting.
+/// EACCES (`13`), ENOENT (`2`), and unrelated errors must not be swallowed as
+/// host I/O — they are real bugs or handled elsewhere and must keep reporting.
 #[test]
 fn is_host_io_error_negatives() {
     assert!(!is_host_io_error(&anyhow::Error::from(
@@ -437,12 +439,6 @@ fn is_host_io_error_negatives() {
     )));
     assert!(!is_host_io_error(&anyhow::Error::from(
         std::io::Error::from_raw_os_error(2)
-    )));
-    // SQLITE_FULL stays in is_sqlite_disk_full's arm, not here.
-    assert!(!is_host_io_error(&sqlite_failure(
-        rusqlite::ErrorCode::DiskFull,
-        13,
-        "database or disk is full"
     )));
     assert!(!is_host_io_error(&anyhow::anyhow!(
         "upstream returned 500: internal server error"

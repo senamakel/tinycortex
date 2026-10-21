@@ -16,9 +16,10 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use tinycortex::memory::config::{MemoryConfig, SecretString};
 use tinycortex::memory::persona::config::PersonaConfig;
-use tinycortex::memory::persona::state::FileStateStore;
+use tinycortex::memory::persona::state::KvStateStore;
 use tinycortex::memory::persona::{Pipeline, RunMode};
 use tinycortex::memory::providers::{OpenRouterConfig, OpenRouterProvider};
+use tinystoragedrivers_types::Scope;
 
 /// A digest response the mock returns for every chat call (JSON-mode digests and
 /// plain-text folds alike accept it).
@@ -140,15 +141,26 @@ fn provider(server: &MockServer, persona: &PersonaConfig) -> OpenRouterProvider 
     .unwrap()
 }
 
+async fn host_config(workspace: &Path) -> MemoryConfig {
+    let scope = Scope::new(&format!("tinycortex-persona-{}", uuid::Uuid::new_v4()))
+        .expect("valid test storage scope");
+    MemoryConfig::open_with_storage(
+        workspace,
+        tinystoragedrivers_testkit::memory_storage(&scope),
+    )
+    .await
+    .unwrap()
+}
+
 #[tokio::test]
 async fn backfill_produces_structured_pack_within_budget() {
     let server = mock_openrouter().await;
     let sources = build_fixtures();
     let ws = TempDir::new().unwrap();
-    let config = MemoryConfig::new(ws.path());
+    let config = host_config(ws.path()).await;
     let persona = persona_config(sources.path());
     let prov = provider(&server, &persona);
-    let store = FileStateStore::open_in_workspace(ws.path()).unwrap();
+    let store = KvStateStore::from_config(&config).unwrap();
 
     let pipeline = Pipeline {
         config: &config,
@@ -186,12 +198,12 @@ async fn incremental_resume_after_partial_backfill() {
     let server = mock_openrouter().await;
     let sources = build_fixtures();
     let ws = TempDir::new().unwrap();
-    let config = MemoryConfig::new(ws.path());
+    let config = host_config(ws.path()).await;
     let mut persona = persona_config(sources.path());
     // Partial: only one session may digest, forcing a checkpoint.
     persona.run_budget.max_sessions = 1;
     let prov = provider(&server, &persona);
-    let store = FileStateStore::open_in_workspace(ws.path()).unwrap();
+    let store = KvStateStore::from_config(&config).unwrap();
 
     let first = {
         let pipeline = Pipeline {
@@ -235,10 +247,10 @@ async fn offline_compile_only_needs_no_provider() {
     let server = mock_openrouter().await;
     let sources = build_fixtures();
     let ws = TempDir::new().unwrap();
-    let config = MemoryConfig::new(ws.path());
+    let config = host_config(ws.path()).await;
     let persona = persona_config(sources.path());
     let prov = provider(&server, &persona);
-    let store = FileStateStore::open_in_workspace(ws.path()).unwrap();
+    let store = KvStateStore::from_config(&config).unwrap();
 
     {
         let pipeline = Pipeline {
@@ -260,7 +272,8 @@ async fn offline_compile_only_needs_no_provider() {
         summariser: &concat,
         store: &store,
     };
-    let path = pipeline.compile_only().unwrap();
+    let path = std::thread::scope(|scope| scope.spawn(|| pipeline.compile_only()).join().unwrap())
+        .unwrap();
     let pack = std::fs::read_to_string(path).unwrap();
     assert!(pack.contains("## Directives"));
 }

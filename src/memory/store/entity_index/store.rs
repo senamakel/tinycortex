@@ -1,33 +1,24 @@
-//! SQLite persistence for the entity occurrence index.
-//!
-//! Owns the `mem_tree_entity_index` table: an inverted index
-//! `entity_id → node_id` so retrieval can resolve entity-scoped queries in
-//! O(lookup). Ported from OpenHuman's `memory_tree::score::store` (the entity
-//! CRUD only — the per-chunk score rationale table stays with the scorer).
-//!
-//! The `is_user` self-identity check is abstracted behind [`SelfIdentity`]: the
-//! storage primitive must not depend on the host's identity registry, so it
-//! takes an injectable resolver that defaults to [`NoSelfIdentity`] (always
-//! `false`).
+//! Host-storage facade for the entity occurrence index.
 
-use std::path::Path;
 use std::sync::Arc;
 
-use parking_lot::Mutex;
-use rusqlite::{params, Connection, Transaction};
+use anyhow::{Context, Result};
 
+use super::transaction::{
+    stage_node_occurrences, stage_upsert_node_entities, stage_upsert_node_entities_async,
+    EntityOccurrence,
+};
 use super::types::{CanonicalEntity, EntityHit, EntityKind};
+use crate::memory::chunks::versioned;
+use crate::memory::config::MemoryConfig;
 
 /// Resolves whether a canonical entity refers to the local user / self.
-///
-/// Abstracts the host's identity registry away from storage. Hosts plug a real
-/// implementation; tests and registry-less hosts use [`NoSelfIdentity`].
 pub trait SelfIdentity: Send + Sync {
-    /// Returns `true` when `(kind, surface)` matches a self-identity.
+    /// Returns true when `(kind, surface)` matches a self-identity.
     fn is_self(&self, kind: EntityKind, surface: &str) -> bool;
 }
 
-/// A [`SelfIdentity`] that never matches — the default for registry-less hosts.
+/// A host identity resolver that never marks an entity as the user.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct NoSelfIdentity;
 
@@ -37,138 +28,35 @@ impl SelfIdentity for NoSelfIdentity {
     }
 }
 
-/// Schema for the entity occurrence index.
-///
-/// Primary key `(entity_id, node_id)` makes re-indexing the same association a
-/// no-op update (idempotent). Indexes back both query directions.
-const SCHEMA_SQL: &str = "
-    CREATE TABLE IF NOT EXISTS mem_tree_entity_index (
-        entity_id    TEXT    NOT NULL,
-        node_id      TEXT    NOT NULL,
-        node_kind    TEXT    NOT NULL,
-        entity_kind  TEXT    NOT NULL,
-        surface      TEXT    NOT NULL,
-        score        REAL    NOT NULL,
-        timestamp_ms INTEGER NOT NULL,
-        tree_id      TEXT,
-        is_user      INTEGER NOT NULL DEFAULT 0,
-        PRIMARY KEY (entity_id, node_id)
-    );
-    CREATE INDEX IF NOT EXISTS idx_entity_index_entity ON mem_tree_entity_index(entity_id);
-    CREATE INDEX IF NOT EXISTS idx_entity_index_node ON mem_tree_entity_index(node_id);
-";
-
-const OWNED_CONNECTION_PRAGMAS: &str = "
-    PRAGMA journal_mode = WAL;
-    PRAGMA synchronous = NORMAL;
-    PRAGMA busy_timeout = 15000;
-";
-
-pub(super) const UPSERT_SQL: &str = "INSERT OR REPLACE INTO mem_tree_entity_index (
-    entity_id, node_id, node_kind, entity_kind, surface,
-    score, timestamp_ms, tree_id, is_user
- ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)";
-
-pub(super) const UPSERT_PRESERVE_USER_SQL: &str = "INSERT INTO mem_tree_entity_index (
-    entity_id, node_id, node_kind, entity_kind, surface,
-    score, timestamp_ms, tree_id, is_user
- ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
- ON CONFLICT(entity_id, node_id) DO UPDATE SET
-    node_kind = excluded.node_kind,
-    entity_kind = excluded.entity_kind,
-    surface = excluded.surface,
-    score = excluded.score,
-    timestamp_ms = excluded.timestamp_ms,
-    tree_id = excluded.tree_id,
-    is_user = MAX(mem_tree_entity_index.is_user, excluded.is_user)";
-
-/// SQLite-backed entity occurrence index.
-///
-/// Thread-safe: the connection is behind a `parking_lot::Mutex`.
+/// Entity-index operations over already-prepared host storage.
 pub struct EntityIndex {
-    conn: Arc<Mutex<Connection>>,
+    config: MemoryConfig,
     identity: Arc<dyn SelfIdentity>,
 }
 
 impl EntityIndex {
-    /// Wrap the engine's shared chunk-database connection with the default
-    /// no-op identity resolver.
-    pub fn for_memory_config(config: &crate::memory::config::MemoryConfig) -> anyhow::Result<Self> {
+    /// Bind to the prepared host storage bundle with the default no-op identity.
+    pub fn for_memory_config(config: &MemoryConfig) -> Result<Self> {
         Self::for_memory_config_with_identity(config, Arc::new(NoSelfIdentity))
     }
 
-    /// Wrap the engine's shared chunk-database connection with a host-provided
-    /// identity resolver.
+    /// Bind to prepared host storage with a host-provided self-identity resolver.
     pub fn for_memory_config_with_identity(
-        config: &crate::memory::config::MemoryConfig,
+        config: &MemoryConfig,
         identity: Arc<dyn SelfIdentity>,
-    ) -> anyhow::Result<Self> {
-        Self::from_shared_connection(crate::memory::chunks::shared_connection(config)?, identity)
-    }
-
-    /// Open (or create) an index at `db_path` with the default no-op identity.
-    pub fn open(db_path: &Path) -> anyhow::Result<Self> {
-        Self::open_with_identity(db_path, Arc::new(NoSelfIdentity))
-    }
-
-    /// Open (or create) an index at `db_path` with a custom identity resolver.
-    pub fn open_with_identity(
-        db_path: &Path,
-        identity: Arc<dyn SelfIdentity>,
-    ) -> anyhow::Result<Self> {
-        if let Some(parent) = db_path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let conn = Connection::open(db_path)?;
-        Self::init_owned_connection(&conn)?;
+    ) -> Result<Self> {
+        config.storage()?;
         Ok(Self {
-            conn: Arc::new(Mutex::new(conn)),
+            config: config.clone(),
             identity,
         })
     }
 
-    /// Open an in-memory index (useful for tests).
-    pub fn open_in_memory() -> anyhow::Result<Self> {
-        Self::open_in_memory_with_identity(Arc::new(NoSelfIdentity))
-    }
-
-    /// Open an in-memory index with a custom identity resolver.
-    pub fn open_in_memory_with_identity(identity: Arc<dyn SelfIdentity>) -> anyhow::Result<Self> {
-        let conn = Connection::open_in_memory()?;
-        Self::init_owned_connection(&conn)?;
-        Ok(Self {
-            conn: Arc::new(Mutex::new(conn)),
-            identity,
-        })
-    }
-
-    /// Use a connection owned and configured by the embedding application.
-    ///
-    /// Only the entity-index schema is installed. Connection pragmas and
-    /// transaction policy remain owned by the caller.
-    pub fn from_shared_connection(
-        conn: Arc<Mutex<Connection>>,
-        identity: Arc<dyn SelfIdentity>,
-    ) -> anyhow::Result<Self> {
-        conn.lock().execute_batch(SCHEMA_SQL)?;
-        Ok(Self { conn, identity })
-    }
-
-    fn init_owned_connection(conn: &Connection) -> anyhow::Result<()> {
-        conn.execute_batch(OWNED_CONNECTION_PRAGMAS)?;
-        conn.execute_batch(SCHEMA_SQL)?;
-        Ok(())
-    }
-
-    /// Resolve `is_user` for a single-occurrence entity via the configured
-    /// [`SelfIdentity`] resolver.
     fn is_user(&self, entity: &CanonicalEntity) -> bool {
         self.identity.is_self(entity.kind, &entity.surface)
     }
 
     /// Index one `(entity, node)` association.
-    ///
-    /// Idempotent on the composite primary key `(entity_id, node_id)`.
     pub fn index_entity(
         &self,
         entity: &CanonicalEntity,
@@ -176,27 +64,18 @@ impl EntityIndex {
         node_kind: &str,
         timestamp_ms: i64,
         tree_id: Option<&str>,
-    ) -> anyhow::Result<()> {
-        let is_user = self.is_user(entity);
-        let conn = self.conn.lock();
-        conn.execute(
-            UPSERT_SQL,
-            params![
-                entity.canonical_id,
-                node_id,
-                node_kind,
-                entity.kind.as_str(),
-                entity.surface,
-                entity.score,
-                timestamp_ms,
-                tree_id,
-                is_user as i32,
-            ],
-        )?;
-        Ok(())
+    ) -> Result<()> {
+        self.index_entities(
+            std::slice::from_ref(entity),
+            node_id,
+            node_kind,
+            timestamp_ms,
+            tree_id,
+        )
+        .map(|_| ())
     }
 
-    /// Batch-index all entities extracted from a node, in one transaction.
+    /// Add or update occurrences for one node and increment its co-occurrence edges.
     pub fn index_entities(
         &self,
         entities: &[CanonicalEntity],
@@ -204,40 +83,106 @@ impl EntityIndex {
         node_kind: &str,
         timestamp_ms: i64,
         tree_id: Option<&str>,
-    ) -> anyhow::Result<usize> {
-        if entities.is_empty() {
-            return Ok(0);
-        }
-        let conn = self.conn.lock();
-        let tx = conn.unchecked_transaction()?;
-        {
-            let mut stmt = tx.prepare(UPSERT_SQL)?;
-            for e in entities {
-                stmt.execute(params![
-                    e.canonical_id,
-                    node_id,
-                    node_kind,
-                    e.kind.as_str(),
-                    e.surface,
-                    e.score,
-                    timestamp_ms,
-                    tree_id,
-                    self.identity.is_self(e.kind, &e.surface) as i32,
-                ])?;
+    ) -> Result<usize> {
+        let occurrences = entities
+            .iter()
+            .map(|entity| EntityOccurrence {
+                entity_id: entity.canonical_id.clone(),
+                node_id: node_id.to_owned(),
+                node_kind: node_kind.to_owned(),
+                entity_kind: entity.kind.as_str().to_owned(),
+                surface: entity.surface.clone(),
+                score: entity.score,
+                timestamp_ms,
+                tree_id: tree_id.map(str::to_owned),
+                is_user: self.is_user(entity),
+            })
+            .collect::<Vec<_>>();
+        for _ in 0..8 {
+            let staged = stage_upsert_node_entities(
+                &self.config,
+                node_id,
+                occurrences.clone(),
+                timestamp_ms,
+            )?;
+            if versioned::commit_if_state_matches(
+                &self.config,
+                &staged.expected,
+                &[],
+                &staged.changes,
+            )? {
+                return Ok(entities.len());
             }
         }
-        tx.commit()?;
-        Ok(entities.len())
+        anyhow::bail!("entity-index update conflicted repeatedly for node {node_id}")
     }
 
-    /// Index summary-node entities by canonical id only.
-    ///
-    /// Summary-level entity metadata is LLM-derived: the summariser emits a
-    /// curated list of canonical ids without per-occurrence span/surface data.
-    /// The `"<kind>"` prefix (before the first `:`) is written into
-    /// `entity_kind` so [`lookup_entity`](Self::lookup_entity) keeps round-tripping
-    /// through [`EntityKind::parse`] on mixed leaf/summary rows; the full
-    /// canonical id is stored as a stable `surface` placeholder.
+    /// Async counterpart to [`Self::index_entity`] for current-thread callers.
+    pub async fn index_entity_async(
+        &self,
+        entity: &CanonicalEntity,
+        node_id: &str,
+        node_kind: &str,
+        timestamp_ms: i64,
+        tree_id: Option<&str>,
+    ) -> Result<()> {
+        self.index_entities_async(
+            std::slice::from_ref(entity),
+            node_id,
+            node_kind,
+            timestamp_ms,
+            tree_id,
+        )
+        .await
+        .map(|_| ())
+    }
+
+    /// Async counterpart to [`Self::index_entities`] for current-thread callers.
+    pub async fn index_entities_async(
+        &self,
+        entities: &[CanonicalEntity],
+        node_id: &str,
+        node_kind: &str,
+        timestamp_ms: i64,
+        tree_id: Option<&str>,
+    ) -> Result<usize> {
+        let occurrences = entities
+            .iter()
+            .map(|entity| EntityOccurrence {
+                entity_id: entity.canonical_id.clone(),
+                node_id: node_id.to_owned(),
+                node_kind: node_kind.to_owned(),
+                entity_kind: entity.kind.as_str().to_owned(),
+                surface: entity.surface.clone(),
+                score: entity.score,
+                timestamp_ms,
+                tree_id: tree_id.map(str::to_owned),
+                is_user: self.is_user(entity),
+            })
+            .collect::<Vec<_>>();
+        for _ in 0..8 {
+            let staged = stage_upsert_node_entities_async(
+                &self.config,
+                node_id,
+                occurrences.clone(),
+                timestamp_ms,
+            )
+            .await?;
+            if versioned::commit_if_state_matches_async(
+                &self.config,
+                &staged.expected,
+                &[],
+                &staged.changes,
+            )
+            .await?
+            {
+                return Ok(entities.len());
+            }
+        }
+        anyhow::bail!("entity-index update conflicted repeatedly for node {node_id}")
+    }
+
+    /// Replace summary occurrences, storing each canonical id as its surface.
     pub fn index_summary_entity_ids(
         &self,
         entity_ids: &[String],
@@ -245,139 +190,105 @@ impl EntityIndex {
         score: f32,
         timestamp_ms: i64,
         tree_id: Option<&str>,
-    ) -> anyhow::Result<usize> {
-        if entity_ids.is_empty() {
-            return Ok(0);
-        }
-        let conn = self.conn.lock();
-        let tx = conn.unchecked_transaction()?;
-        {
-            let mut stmt = tx.prepare(UPSERT_SQL)?;
-            for canonical_id in entity_ids {
-                let entity_kind = match canonical_id.split_once(':') {
-                    Some((kind, _)) => kind,
-                    None => canonical_id.as_str(),
-                };
-                let is_user = canonical_id_is_user(self.identity.as_ref(), canonical_id);
-                stmt.execute(params![
-                    canonical_id,
-                    node_id,
-                    "summary",
+    ) -> Result<usize> {
+        let occurrences = entity_ids
+            .iter()
+            .map(|entity_id| {
+                let entity_kind = entity_id
+                    .split_once(':')
+                    .map_or(entity_id.as_str(), |(kind, _)| kind)
+                    .to_owned();
+                let is_user = canonical_id_is_user(self.identity.as_ref(), entity_id);
+                EntityOccurrence {
+                    entity_id: entity_id.clone(),
+                    node_id: node_id.to_owned(),
+                    node_kind: "summary".to_owned(),
                     entity_kind,
-                    canonical_id,
+                    surface: entity_id.clone(),
                     score,
                     timestamp_ms,
-                    tree_id,
-                    is_user as i32,
-                ])?;
+                    tree_id: tree_id.map(str::to_owned),
+                    is_user,
+                }
+            })
+            .collect::<Vec<_>>();
+        for _ in 0..8 {
+            let staged = stage_upsert_node_entities(
+                &self.config,
+                node_id,
+                occurrences.clone(),
+                timestamp_ms,
+            )?;
+            if versioned::commit_if_state_matches(
+                &self.config,
+                &staged.expected,
+                &[],
+                &staged.changes,
+            )? {
+                return Ok(entity_ids.len());
             }
         }
-        tx.commit()?;
-        Ok(entity_ids.len())
+        anyhow::bail!("summary entity-index update conflicted repeatedly for node {node_id}")
     }
 
-    /// Remove all index rows for a node. Used before re-indexing a re-scored
-    /// node so entities dropped from the new extraction don't leak (an
-    /// `INSERT OR REPLACE` never deletes).
-    pub fn clear_entity_index_for_node(&self, node_id: &str) -> anyhow::Result<usize> {
-        let conn = self.conn.lock();
-        let n = conn.execute(
-            "DELETE FROM mem_tree_entity_index WHERE node_id = ?1",
-            params![node_id],
-        )?;
-        Ok(n)
+    /// Remove all indexed occurrences for one node.
+    pub fn clear_entity_index_for_node(&self, node_id: &str) -> Result<usize> {
+        for _ in 0..8 {
+            let staged = stage_node_occurrences(&self.config, node_id, std::iter::empty())?;
+            let removed = staged
+                .changes
+                .iter()
+                .filter(|change| {
+                    change.collection == crate::memory::chunks::collections::ENTITY_INDEX
+                        && change.value.is_none()
+                })
+                .count();
+            if versioned::commit_if_state_matches(
+                &self.config,
+                &staged.expected,
+                &[],
+                &staged.changes,
+            )? {
+                return Ok(removed);
+            }
+        }
+        anyhow::bail!("entity-index clear conflicted repeatedly for node {node_id}")
     }
 
     /// Find all nodes indexed against `entity_id`, newest first.
-    pub fn lookup_entity(
-        &self,
-        entity_id: &str,
-        limit: Option<usize>,
-    ) -> anyhow::Result<Vec<EntityHit>> {
-        // Clamp to i64::MAX before casting so callers can't wrap a large usize
-        // into a negative LIMIT and bypass it.
-        let limit = limit.unwrap_or(100).min(i64::MAX as usize) as i64;
-        let conn = self.conn.lock();
-        let mut stmt = conn.prepare(
-            "SELECT entity_id, node_id, node_kind, entity_kind, surface,
-                    score, timestamp_ms, tree_id, is_user
-             FROM mem_tree_entity_index
-             WHERE entity_id = ?1
-             ORDER BY timestamp_ms DESC
-             LIMIT ?2",
-        )?;
-        let rows = stmt
-            .query_map(params![entity_id, limit], |row| {
-                let kind_s: String = row.get(3)?;
-                let entity_kind = EntityKind::parse(&kind_s).map_err(|e| {
-                    rusqlite::Error::FromSqlConversionFailure(
-                        3,
-                        rusqlite::types::Type::Text,
-                        e.into(),
-                    )
-                })?;
-                let is_user_int: i32 = row.get(8)?;
+    pub fn lookup_entity(&self, entity_id: &str, limit: Option<usize>) -> Result<Vec<EntityHit>> {
+        crate::memory::score::store::lookup_entity(&self.config, entity_id, limit)?
+            .into_iter()
+            .map(|hit| {
                 Ok(EntityHit {
-                    entity_id: row.get(0)?,
-                    node_id: row.get(1)?,
-                    node_kind: row.get(2)?,
-                    entity_kind,
-                    surface: row.get(4)?,
-                    score: row.get(5)?,
-                    timestamp_ms: row.get(6)?,
-                    tree_id: row.get(7)?,
-                    is_user: is_user_int != 0,
+                    entity_id: hit.entity_id,
+                    node_id: hit.node_id,
+                    node_kind: hit.node_kind,
+                    entity_kind: EntityKind::parse(hit.entity_kind.as_str())
+                        .map_err(anyhow::Error::msg)
+                        .context("decode entity kind")?,
+                    surface: hit.surface,
+                    score: hit.score,
+                    timestamp_ms: hit.timestamp_ms,
+                    tree_id: hit.tree_id,
+                    is_user: hit.is_user,
                 })
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok(rows)
+            })
+            .collect()
     }
 
-    /// All distinct canonical entity ids associated with `node_id`, ordered by
-    /// score (desc) then recency. Used by topic-routing to pick which topic
-    /// trees a node should fan into.
-    pub fn list_entity_ids_for_node(&self, node_id: &str) -> anyhow::Result<Vec<String>> {
-        let conn = self.conn.lock();
-        let mut stmt = conn.prepare(
-            "SELECT DISTINCT entity_id
-               FROM mem_tree_entity_index
-              WHERE node_id = ?1
-              ORDER BY score DESC, timestamp_ms DESC, entity_id ASC",
-        )?;
-        let rows = stmt
-            .query_map(params![node_id], |row| row.get::<_, String>(0))?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok(rows)
+    /// List the distinct entity ids associated with a node.
+    pub fn list_entity_ids_for_node(&self, node_id: &str) -> Result<Vec<String>> {
+        crate::memory::score::store::list_entity_ids_for_node(&self.config, node_id)
     }
 
-    /// Count rows in the entity index (for tests / diagnostics).
-    pub fn count_entity_index(&self) -> anyhow::Result<u64> {
-        let conn = self.conn.lock();
-        let n: i64 = conn.query_row("SELECT COUNT(*) FROM mem_tree_entity_index", [], |r| {
-            r.get(0)
-        })?;
-        Ok(n.max(0) as u64)
-    }
-
-    /// Run a closure with the raw transaction, for callers that need to fold
-    /// entity indexing into a larger atomic write. The closure receives a
-    /// [`Transaction`] and may call
-    /// [`crate::memory::store::entity_index::index_entities_tx`].
-    pub fn with_transaction<T>(
-        &self,
-        f: impl FnOnce(&Transaction<'_>) -> anyhow::Result<T>,
-    ) -> anyhow::Result<T> {
-        let conn = self.conn.lock();
-        let tx = conn.unchecked_transaction()?;
-        let out = f(&tx)?;
-        tx.commit()?;
-        Ok(out)
+    /// Count indexed occurrence rows (manifests are excluded).
+    pub fn count_entity_index(&self) -> Result<u64> {
+        crate::memory::score::store::count_entity_index(&self.config)
     }
 }
 
-/// Resolve `is_user` for a summary canonical id (`"<kind>:<value>"`), returning
-/// `false` for malformed ids or non-matchable kinds.
-pub(super) fn canonical_id_is_user(identity: &dyn SelfIdentity, canonical_id: &str) -> bool {
+fn canonical_id_is_user(identity: &dyn SelfIdentity, canonical_id: &str) -> bool {
     let Some((kind_str, value)) = canonical_id.split_once(':') else {
         return false;
     };

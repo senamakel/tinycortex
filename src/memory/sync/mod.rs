@@ -13,7 +13,9 @@ pub mod traits;
 pub mod workspace;
 
 pub use audit::{
-    append_audit_entry, estimate_cost_usd, read_audit_log, RealCostAccumulator, SyncAuditEntry,
+    append_audit_entry, append_audit_entry_async, estimate_cost_usd,
+    import_legacy_audit_entries_async, read_audit_log, read_audit_log_async, RealCostAccumulator,
+    SyncAuditEntry,
 };
 pub use composio::{
     create_connection_link, generate_entity_id, get_connection_status, list_auth_configs,
@@ -26,7 +28,7 @@ pub use composio::{
 pub use dispatcher::{SyncDispatcher, SyncRunResult};
 pub use github::GithubRepoSyncPipeline;
 pub use periodic::{due_workspace_sources, effective_interval_secs, DEFAULT_SYNC_INTERVAL_SECS};
-pub use persist::{KvSkillDocSink, SKILLDOC_NS_PREFIX, SKILL_DOCS_DB};
+pub use persist::{KvSkillDocSink, SKILLDOC_NS_PREFIX};
 pub use rebuild::{
     needs_rebuild, raw_coverage, rebuild_tree_from_raw, rebuild_tree_from_raw_with_audit,
     RawCoverage, RawFileRef, RebuildOutcome,

@@ -1,25 +1,52 @@
 //! Types for the on-demand ingest orchestration: the job-sink seam, per-call
 //! options, and the result summary.
 
-use anyhow::Result;
-use rusqlite::Transaction;
-
 use crate::memory::chunks::RawRef;
-use crate::memory::queue::types::{ExtractChunkPayload, NewJob};
+use crate::memory::config::MemoryConfig;
+use anyhow::Result;
+
+/// Durable queue intent included in the owner-scoped ingest commit.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub(crate) struct ExtractJobIntent {
+    pub(crate) id: String,
+    pub(crate) chunk_id: String,
+    pub(crate) max_attempts: u32,
+    #[serde(default)]
+    pub(crate) published: bool,
+}
+
+/// Result of publishing a durable queue intent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QueuePublication {
+    /// A new queue hint was created.
+    Published,
+    /// The same hint was already accepted, usually after a lost acknowledgement.
+    AlreadyPublished,
+    /// This sink intentionally declines queue work; the durable intent stays pending.
+    Declined,
+}
 
 /// Sink for the tree jobs the ingest path produces.
 ///
-/// Implementations enqueue against the caller-owned chunk-database transaction
-/// so chunk lifecycle and queue visibility commit atomically.
+/// Implementations publish a queue hint after the job intent is committed to
+/// the host document store. The durable intent is authoritative; the queue is
+/// an at-least-once hint and a failed publication can be retried safely.
+#[async_trait::async_trait]
 pub trait TreeJobSink: Send + Sync {
-    /// Enqueue an `extract_chunk` job for `chunk_id` inside `tx`. Returns true
-    /// when a new job was created and false for a deliberate no-op or dedupe.
-    fn enqueue_extract_tx(
+    /// Publish an `extract_chunk` queue hint for one committed intent. Repeated
+    /// calls carry the same `intent_id`, allowing adapters to suppress replay.
+    async fn enqueue_extract(
         &self,
-        tx: &Transaction<'_>,
+        config: &MemoryConfig,
+        intent_id: &str,
         chunk_id: &str,
         default_max_attempts: u32,
-    ) -> Result<bool>;
+    ) -> Result<QueuePublication>;
+
+    /// Whether this sink wants newly committed extract intents at all.
+    fn accepts_extract_jobs(&self) -> bool {
+        true
+    }
 }
 
 /// A no-op [`TreeJobSink`] that drops every job. Useful when a caller only wants
@@ -27,34 +54,55 @@ pub trait TreeJobSink: Send + Sync {
 #[derive(Debug, Default, Clone, Copy)]
 pub struct NullJobSink;
 
+#[async_trait::async_trait]
 impl TreeJobSink for NullJobSink {
-    fn enqueue_extract_tx(
+    async fn enqueue_extract(
         &self,
-        _tx: &Transaction<'_>,
+        _config: &MemoryConfig,
+        _intent_id: &str,
         _chunk_id: &str,
         _default_max_attempts: u32,
-    ) -> Result<bool> {
-        Ok(false)
+    ) -> Result<QueuePublication> {
+        Ok(QueuePublication::Declined)
+    }
+
+    fn accepts_extract_jobs(&self) -> bool {
+        false
     }
 }
 
-/// Production sink backed by the durable SQLite queue.
+/// Production sink backed by the versioned owner queue.
+///
+/// The owner job record is authoritative; the host queue receives only its
+/// repairable `job_id` hint. Stable intent ids make outbox replay idempotent
+/// without requiring the host queue to implement deduplication.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct QueueJobSink;
 
+#[async_trait::async_trait]
 impl TreeJobSink for QueueJobSink {
-    fn enqueue_extract_tx(
+    async fn enqueue_extract(
         &self,
-        tx: &Transaction<'_>,
+        config: &MemoryConfig,
+        intent_id: &str,
         chunk_id: &str,
         default_max_attempts: u32,
-    ) -> Result<bool> {
-        let job = NewJob::extract_chunk(&ExtractChunkPayload {
-            chunk_id: chunk_id.to_string(),
-        })?;
+    ) -> Result<QueuePublication> {
+        let payload = crate::memory::queue::types::ExtractChunkPayload {
+            chunk_id: chunk_id.to_owned(),
+        };
+        let mut job = crate::memory::queue::types::NewJob::extract_chunk(&payload)?;
+        job.id = Some(intent_id.to_owned());
+        job.max_attempts = Some(default_max_attempts);
         Ok(
-            crate::memory::queue::store::enqueue_tx_with_default(tx, &job, default_max_attempts)?
-                .is_some(),
+            if crate::memory::queue::store::enqueue_async(config, &job)
+                .await?
+                .is_some()
+            {
+                QueuePublication::Published
+            } else {
+                QueuePublication::AlreadyPublished
+            },
         )
     }
 }

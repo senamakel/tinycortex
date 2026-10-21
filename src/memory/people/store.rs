@@ -1,581 +1,502 @@
-//! SQLite-backed store for people + handle aliases + interactions.
+//! Host-backed, versioned store for people, handle aliases, and interactions.
 //!
-//! Connection is wrapped in `Arc<Mutex<Connection>>` so handlers and tests
-//! can share ownership across tokio tasks; operations are synchronous and
-//! fast (all single-row CRUD or small aggregates).
+//! All logical records are committed through the memory owner's captured-head
+//! compare-and-swap. A person and its initial aliases therefore become visible
+//! together, even though TSD's document port exposes conditional single-record
+//! writes rather than a cross-record transaction.
 
-use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::cmp::Reverse;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock, RwLock};
 
+use anyhow::{anyhow, bail, Context, Result};
 use chrono::{DateTime, TimeZone, Utc};
-use rusqlite::{params, Connection, OptionalExtension, Result as SqlResult};
-use tokio::sync::Mutex;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
-use crate::memory::people::migrations;
+use crate::memory::chunks::versioned::{self, StateChange};
+use crate::memory::config::MemoryConfig;
 use crate::memory::people::types::{Handle, Interaction, Person, PersonId};
 
-pub type ConnHandle = Arc<Mutex<Connection>>;
-type PersonRow = (
-    String,
-    Option<String>,
-    Option<String>,
-    Option<String>,
-    i64,
-    i64,
-);
+pub(crate) const PEOPLE: &str = "memory_people";
+pub(crate) const PEOPLE_HANDLES: &str = "memory_people_handles";
+pub(crate) const PEOPLE_INTERACTIONS: &str = "memory_people_interactions";
 
-/// Process-global handle to the `PeopleStore`, tagged with the workspace it is
-/// bound to. Controller handlers are free functions with no `&self`, so they
-/// fetch the store via `get()`. Seeded at core boot and re-bound on active-user
-/// switch via [`init_from_workspace`]. Absent at test time unless a test seeds
-/// it; most tests construct stores directly with `open_in_memory`.
+const WRITE_RETRIES: usize = 12;
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct HandleRecord {
+    pub(crate) kind: String,
+    pub(crate) value: String,
+    pub(crate) person_id: PersonId,
+    /// Historical alias insertion time in Unix seconds.
+    pub(crate) created_at: i64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct InteractionRecord {
+    pub(crate) id: String,
+    pub(crate) interaction: Interaction,
+}
+
+/// Process-global handle to the active workspace's configured people store.
+/// Hosts bind it with [`init`] only after preparing their memory storage.
 #[derive(Clone)]
 struct GlobalPeopleStore {
-    workspace_dir: PathBuf,
     store: Arc<PeopleStore>,
 }
 
-type GlobalStoreSlot = RwLock<Option<GlobalPeopleStore>>;
+static GLOBAL: OnceLock<RwLock<Option<GlobalPeopleStore>>> = OnceLock::new();
 
-static GLOBAL: OnceLock<GlobalStoreSlot> = OnceLock::new();
-
-fn global_slot() -> &'static GlobalStoreSlot {
-    GLOBAL.get_or_init(GlobalStoreSlot::default)
+fn global_slot() -> &'static RwLock<Option<GlobalPeopleStore>> {
+    GLOBAL.get_or_init(Default::default)
 }
 
-/// Initialise or re-bind the process-global people store from a workspace
-/// directory, opening `<workspace>/people/people.db` (schema migrations run on
-/// open).
+/// Create a people store bound to the supplied prepared host configuration.
 ///
-/// Safe to call repeatedly.
-/// A call for the **same** workspace returns the existing store; a call for a
-/// **different** workspace replaces the global handle so a post-login
-/// active-user switch (or `restart_core_process`, which restarts the embedded
-/// core in the same Tauri process) does not keep people controllers/tools
-/// reading and writing the pre-login (or a previous user's) workspace.
+/// The configuration must have been opened with [`MemoryConfig::open_with_storage`]
+/// or otherwise have completed `prepare_storage`. This function never creates
+/// a local database or selects a storage engine.
+pub fn for_config(config: &MemoryConfig) -> Result<Arc<PeopleStore>> {
+    Ok(Arc::new(PeopleStore::open(config)?))
+}
+
+/// Bind or rebind the process-global people store to the prepared host storage.
 ///
-/// Wired into core boot (`src/core/jsonrpc.rs`) and the active-user rebind
-/// sites (`credentials::ops`, `app_state::ops`) alongside `memory::global`.
-/// Without the boot seed every people controller / `people_*` tool fails with
-/// "people store not initialised" (Sentry TAURI-RUST-8NM); without the rebind
-/// they'd write the wrong workspace after login (#4378).
-pub fn init_from_workspace(workspace_dir: &Path) -> Result<Arc<PeopleStore>, String> {
-    let slot = global_slot();
-    if let Some(existing) = slot
-        .read()
-        .map_err(|e| format!("[people:store] read lock poisoned: {e}"))?
-        .as_ref()
-    {
-        if existing.workspace_dir == workspace_dir {
-            log::debug!("[people:store] already initialised for current workspace");
-            return Ok(Arc::clone(&existing.store));
-        }
-    }
-
-    let db_path = workspace_dir.join("people").join("people.db");
-    let store = Arc::new(
-        PeopleStore::open_at(&db_path).map_err(|e| format!("people store open failed: {e}"))?,
-    );
-
-    let mut guard = slot
+/// Every call adopts the supplied configuration. Workspace paths do not
+/// identify a storage backend, so they cannot safely be used to reuse a handle.
+pub fn init(config: &MemoryConfig) -> Result<Arc<PeopleStore>> {
+    let mut slot = global_slot()
         .write()
-        .map_err(|e| format!("[people:store] write lock poisoned: {e}"))?;
-    // Re-check under the write lock: a concurrent caller may have seeded the
-    // same workspace while we were opening — reuse theirs. A different-workspace
-    // entry is replaced (rebind).
-    if let Some(existing) = guard.as_ref() {
-        if existing.workspace_dir == workspace_dir {
-            return Ok(Arc::clone(&existing.store));
-        }
-    }
-    log::info!(
-        "[people:store] bound store workspace={}",
-        workspace_dir.display()
-    );
-    *guard = Some(GlobalPeopleStore {
-        workspace_dir: workspace_dir.to_path_buf(),
+        .map_err(|_| anyhow!("[people:store] global write lock poisoned"))?;
+    let store = for_config(config)?;
+    *slot = Some(GlobalPeopleStore {
         store: Arc::clone(&store),
     });
     Ok(store)
 }
 
-pub fn get() -> Result<Arc<PeopleStore>, &'static str> {
+/// Return the active process-global people store after the host has bound it.
+pub fn get() -> Result<Arc<PeopleStore>> {
     global_slot()
         .read()
-        .ok()
-        .and_then(|guard| guard.as_ref().map(|entry| Arc::clone(&entry.store)))
-        .ok_or("people store not initialised — core startup hasn't completed")
+        .map_err(|_| anyhow!("[people:store] global read lock poisoned"))?
+        .as_ref()
+        .map(|entry| Arc::clone(&entry.store))
+        .ok_or_else(|| anyhow!("people store not initialised — host startup hasn't completed"))
 }
 
-/// Per-workspace store cache keyed by workspace dir. Backs [`for_workspace`],
-/// the context-scoped accessor (the host's context-scoped `CoreContext::people`).
-/// Distinct from the single `GLOBAL` slot above (which tracks the one
-/// active-user workspace for the legacy free-function handlers): this map lets
-/// multiple workspaces' stores coexist in one process, which is what per-context
-/// isolation (Phase 3) needs.
-static STORES: OnceLock<RwLock<std::collections::HashMap<PathBuf, Arc<PeopleStore>>>> =
-    OnceLock::new();
-
-/// Open (or return the cached) people store for a specific workspace dir. Unlike
-/// [`get`], this is not tied to the single active-user global — two different
-/// workspaces resolve to two isolated stores, and the same workspace always
-/// resolves to the same cached `Arc`. Opening `<workspace>/people/people.db`
-/// runs schema migrations.
-pub fn for_workspace(workspace_dir: &Path) -> Result<Arc<PeopleStore>, String> {
-    let cache = STORES.get_or_init(Default::default);
-    if let Some(store) = cache
-        .read()
-        .map_err(|e| format!("[people:store] cache read lock poisoned: {e}"))?
-        .get(workspace_dir)
-    {
-        return Ok(Arc::clone(store));
-    }
-
-    let db_path = workspace_dir.join("people").join("people.db");
-    let store = Arc::new(
-        PeopleStore::open_at(&db_path).map_err(|e| format!("people store open failed: {e}"))?,
-    );
-
-    let mut guard = cache
-        .write()
-        .map_err(|e| format!("[people:store] cache write lock poisoned: {e}"))?;
-    // Re-check under the write lock: a concurrent caller may have opened the
-    // same workspace while we were opening — reuse theirs so callers always
-    // share one store per workspace.
-    let entry = guard
-        .entry(workspace_dir.to_path_buf())
-        .or_insert_with(|| Arc::clone(&store));
-    Ok(Arc::clone(entry))
-}
-
+/// A people store bound to one prepared, host-supplied memory configuration.
+#[derive(Clone)]
 pub struct PeopleStore {
-    pub conn: ConnHandle,
+    config: MemoryConfig,
 }
 
 impl PeopleStore {
-    pub fn open_in_memory() -> SqlResult<Self> {
-        let conn = Connection::open_in_memory()?;
-        migrations::run(&conn)?;
+    /// Bind to an already prepared host storage bundle.
+    pub fn open(config: &MemoryConfig) -> Result<Self> {
+        config
+            .storage()
+            .context("people store requires prepared host storage")?;
         Ok(Self {
-            conn: Arc::new(Mutex::new(conn)),
+            config: config.clone(),
         })
     }
 
-    pub fn open_at(path: &std::path::Path) -> SqlResult<Self> {
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        let conn = Connection::open(path)?;
-        migrations::run(&conn)?;
-        Ok(Self {
-            conn: Arc::new(Mutex::new(conn)),
-        })
-    }
-
-    /// Insert a new person and its initial set of handles, atomically.
-    pub async fn insert_person(&self, person: &Person, handles: &[Handle]) -> SqlResult<()> {
-        let conn = self.conn.clone();
-        let person = person.clone();
-        let handles: Vec<Handle> = handles.iter().map(|h| h.canonicalize()).collect();
-        tokio::task::spawn_blocking(move || {
-            let mut guard = conn.blocking_lock();
-            let tx = guard.transaction()?;
-            tx.execute(
-                "INSERT INTO people(id, display_name, primary_email, primary_phone, created_at, updated_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                params![
-                    person.id.to_string(),
-                    person.display_name,
-                    person.primary_email,
-                    person.primary_phone,
-                    person.created_at.timestamp(),
-                    person.updated_at.timestamp(),
-                ],
-            )?;
-            for h in &handles {
-                let (kind, value) = h.as_key();
-                tx.execute(
-                    "INSERT OR IGNORE INTO handle_aliases(kind, value, person_id, created_at) \
-                     VALUES (?1, ?2, ?3, CAST(strftime('%s','now') AS INTEGER))",
-                    params![kind, value, person.id.to_string()],
-                )?;
+    /// Insert a person and all currently unclaimed aliases atomically.
+    ///
+    /// Aliases are canonicalized before uniqueness checks. As in the previous
+    /// SQLite store, a handle already owned by another person is ignored while
+    /// the person row itself is still inserted.
+    pub async fn insert_person(&self, person: &Person, handles: &[Handle]) -> Result<()> {
+        for _ in 0..WRITE_RETRIES {
+            let (expected, changes) = stage_person_insert(&self.config, person, handles).await?;
+            if versioned::commit_if_state_matches_async(&self.config, &expected, &[], &changes)
+                .await?
+            {
+                return Ok(());
             }
-            tx.commit()
-        })
-        .await
-        .map_err(|e| rusqlite::Error::SqliteFailure(
-            rusqlite::ffi::Error {
-                code: rusqlite::ffi::ErrorCode::SystemIoFailure,
-                extended_code: 0,
-            },
-            Some(e.to_string()),
-        ))?
+        }
+        bail!("person insert did not commit within the retry budget")
     }
 
-    /// Resolve an existing canonical handle or insert a new person and alias
-    /// under one connection lock. Returns the database-authoritative id plus
-    /// whether this call created the row.
+    /// Resolve an existing canonical handle or insert a person and its alias
+    /// atomically. Concurrent resolvers for one handle return the winning ID.
     pub async fn resolve_or_insert_person(
         &self,
         person: &Person,
         handle: &Handle,
-    ) -> SqlResult<(PersonId, bool)> {
-        let conn = self.conn.clone();
-        let person = person.clone();
+    ) -> Result<(PersonId, bool)> {
         let handle = handle.canonicalize();
-        tokio::task::spawn_blocking(move || -> SqlResult<(PersonId, bool)> {
-            let mut guard = conn.blocking_lock();
-            let tx = guard.transaction()?;
-            let (kind, value) = handle.as_key();
-            let existing: Option<String> = tx
-                .query_row(
-                    "SELECT person_id FROM handle_aliases WHERE kind = ?1 AND value = ?2",
-                    params![kind, value],
-                    |row| row.get(0),
-                )
-                .optional()?;
-            if let Some(id) = existing {
-                let id = uuid::Uuid::parse_str(&id)
-                    .map(PersonId)
-                    .map_err(|e| rusqlite::Error::InvalidColumnName(e.to_string()))?;
-                return Ok((id, false));
+        let (kind, value) = handle.as_key();
+        let alias_key = handle_key(kind, value);
+        for _ in 0..WRITE_RETRIES {
+            if let Some(existing) =
+                versioned::read_state_async(&self.config, PEOPLE_HANDLES, &alias_key).await?
+            {
+                return Ok((decode_handle(&alias_key, existing)?.person_id, false));
             }
-
-            tx.execute(
-                "INSERT INTO people(id, display_name, primary_email, primary_phone, created_at, updated_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                params![
-                    person.id.to_string(),
-                    person.display_name,
-                    person.primary_email,
-                    person.primary_phone,
-                    person.created_at.timestamp(),
-                    person.updated_at.timestamp(),
-                ],
-            )?;
-            tx.execute(
-                "INSERT INTO handle_aliases(kind, value, person_id, created_at) \
-                 VALUES (?1, ?2, ?3, CAST(strftime('%s','now') AS INTEGER))",
-                params![kind, value, person.id.to_string()],
-            )?;
-            tx.commit()?;
-            Ok((person.id, true))
-        })
-        .await
-        .map_err(|e| {
-            rusqlite::Error::SqliteFailure(
-                rusqlite::ffi::Error {
-                    code: rusqlite::ffi::ErrorCode::SystemIoFailure,
-                    extended_code: 0,
+            let person_key = person.id.to_string();
+            if versioned::read_state_async(&self.config, PEOPLE, &person_key)
+                .await?
+                .is_some()
+            {
+                bail!("person {} already exists", person.id);
+            }
+            let mut stored_person = person.clone();
+            stored_person.handles.clear();
+            stored_person.created_at = seconds_precision(stored_person.created_at);
+            stored_person.updated_at = seconds_precision(stored_person.updated_at);
+            let expected = [
+                StateChange {
+                    collection: PEOPLE_HANDLES.to_owned(),
+                    key: alias_key.clone(),
+                    value: None,
                 },
-                Some(e.to_string()),
-            )
-        })?
+                StateChange {
+                    collection: PEOPLE.to_owned(),
+                    key: person_key.clone(),
+                    value: None,
+                },
+            ];
+            let changes = [
+                StateChange {
+                    collection: PEOPLE.to_owned(),
+                    key: person_key,
+                    value: Some(serde_json::to_value(stored_person)?),
+                },
+                StateChange {
+                    collection: PEOPLE_HANDLES.to_owned(),
+                    key: alias_key.clone(),
+                    value: Some(serde_json::to_value(HandleRecord {
+                        kind: kind.to_owned(),
+                        value: value.to_owned(),
+                        person_id: person.id,
+                        created_at: Utc::now().timestamp(),
+                    })?),
+                },
+            ];
+            if versioned::commit_if_state_matches_async(&self.config, &expected, &[], &changes)
+                .await?
+            {
+                return Ok((person.id, true));
+            }
+        }
+        bail!("handle resolution conflicted with concurrent writes")
     }
 
-    /// Attach a handle alias to an existing person. Idempotent via
-    /// `INSERT OR IGNORE` on `(kind, value)`.
-    pub async fn add_alias(&self, person_id: PersonId, handle: Handle) -> SqlResult<()> {
-        let conn = self.conn.clone();
+    /// Attach a canonical handle alias to an existing person. An alias already
+    /// claimed by any person remains an idempotent no-op, matching SQLite's
+    /// `INSERT OR IGNORE` behavior.
+    pub async fn add_alias(&self, person_id: PersonId, handle: Handle) -> Result<()> {
         let handle = handle.canonicalize();
-        tokio::task::spawn_blocking(move || {
-            let guard = conn.blocking_lock();
-            let (kind, value) = handle.as_key();
-            guard.execute(
-                "INSERT OR IGNORE INTO handle_aliases(kind, value, person_id, created_at) \
-                 VALUES (?1, ?2, ?3, CAST(strftime('%s','now') AS INTEGER))",
-                params![kind, value, person_id.to_string()],
-            )?;
-            Ok(())
-        })
-        .await
-        .map_err(|e| {
-            rusqlite::Error::SqliteFailure(
-                rusqlite::ffi::Error {
-                    code: rusqlite::ffi::ErrorCode::SystemIoFailure,
-                    extended_code: 0,
-                },
-                Some(e.to_string()),
-            )
-        })?
-    }
-
-    /// Resolve a canonicalized handle to a `PersonId`, or `None` if unknown.
-    pub async fn lookup(&self, handle: &Handle) -> SqlResult<Option<PersonId>> {
-        let conn = self.conn.clone();
-        let handle = handle.canonicalize();
-        tokio::task::spawn_blocking(move || {
-            let guard = conn.blocking_lock();
-            let (kind, value) = handle.as_key();
-            let id: Option<String> = guard
-                .query_row(
-                    "SELECT person_id FROM handle_aliases WHERE kind = ?1 AND value = ?2",
-                    params![kind, value],
-                    |row| row.get(0),
-                )
-                .optional()?;
-            Ok(id.and_then(|s| uuid::Uuid::parse_str(&s).ok().map(PersonId)))
-        })
-        .await
-        .map_err(|e| {
-            rusqlite::Error::SqliteFailure(
-                rusqlite::ffi::Error {
-                    code: rusqlite::ffi::ErrorCode::SystemIoFailure,
-                    extended_code: 0,
-                },
-                Some(e.to_string()),
-            )
-        })?
-    }
-
-    /// Load a person and all their aliases.
-    pub async fn get(&self, person_id: PersonId) -> SqlResult<Option<Person>> {
-        let conn = self.conn.clone();
-        tokio::task::spawn_blocking(move || -> SqlResult<Option<Person>> {
-            let guard = conn.blocking_lock();
-            let row: Option<PersonRow> =
-                guard
-                    .query_row(
-                        "SELECT id, display_name, primary_email, primary_phone, created_at, updated_at \
-                         FROM people WHERE id = ?1",
-                        params![person_id.to_string()],
-                        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
-                    )
-                    .optional()?;
-            let Some((id_str, display_name, primary_email, primary_phone, created, updated)) = row
+        let (kind, value) = handle.as_key();
+        let key = handle_key(kind, value);
+        for _ in 0..WRITE_RETRIES {
+            if let Some(existing) =
+                versioned::read_state_async(&self.config, PEOPLE_HANDLES, &key).await?
+            {
+                decode_handle(&key, existing)?;
+                return Ok(());
+            }
+            let person_key = person_id.to_string();
+            let Some(person) =
+                versioned::read_state_async(&self.config, PEOPLE, &person_key).await?
             else {
-                return Ok(None);
+                bail!("person {person_id} does not exist")
             };
-            let id = uuid::Uuid::parse_str(&id_str)
-                .map(PersonId)
-                .map_err(|e| rusqlite::Error::InvalidColumnName(e.to_string()))?;
-            let handles = load_handles(&guard, &id)?;
-            Ok(Some(Person {
-                id,
-                display_name,
-                primary_email,
-                primary_phone,
-                handles,
-                created_at: ts_to_dt(created),
-                updated_at: ts_to_dt(updated),
-            }))
-        })
-        .await
-        .map_err(|e| rusqlite::Error::SqliteFailure(
-            rusqlite::ffi::Error {
-                code: rusqlite::ffi::ErrorCode::SystemIoFailure,
-                extended_code: 0,
-            },
-            Some(e.to_string()),
-        ))?
-    }
-
-    /// List all people (unordered — scorer applies ranking separately).
-    pub async fn list(&self) -> SqlResult<Vec<Person>> {
-        let conn = self.conn.clone();
-        tokio::task::spawn_blocking(move || -> SqlResult<Vec<Person>> {
-            let guard = conn.blocking_lock();
-            let mut stmt = guard.prepare(
-                "SELECT id, display_name, primary_email, primary_phone, created_at, updated_at \
-                 FROM people ORDER BY display_name",
-            )?;
-            let rows = stmt.query_map([], |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, Option<String>>(1)?,
-                    r.get::<_, Option<String>>(2)?,
-                    r.get::<_, Option<String>>(3)?,
-                    r.get::<_, i64>(4)?,
-                    r.get::<_, i64>(5)?,
-                ))
-            })?;
-            let mut out = Vec::new();
-            for r in rows {
-                let (id_str, display_name, primary_email, primary_phone, created, updated) = r?;
-                let id = uuid::Uuid::parse_str(&id_str)
-                    .map(PersonId)
-                    .map_err(|e| rusqlite::Error::InvalidColumnName(e.to_string()))?;
-                let handles = load_handles(&guard, &id)?;
-                out.push(Person {
-                    id,
-                    display_name,
-                    primary_email,
-                    primary_phone,
-                    handles,
-                    created_at: ts_to_dt(created),
-                    updated_at: ts_to_dt(updated),
-                });
-            }
-            Ok(out)
-        })
-        .await
-        .map_err(|e| {
-            rusqlite::Error::SqliteFailure(
-                rusqlite::ffi::Error {
-                    code: rusqlite::ffi::ErrorCode::SystemIoFailure,
-                    extended_code: 0,
+            let expected = [
+                StateChange {
+                    collection: PEOPLE.to_owned(),
+                    key: person_key,
+                    value: Some(person),
                 },
-                Some(e.to_string()),
-            )
-        })?
-    }
-
-    /// Record a single interaction.
-    pub async fn record_interaction(&self, i: Interaction) -> SqlResult<()> {
-        let conn = self.conn.clone();
-        tokio::task::spawn_blocking(move || {
-            let guard = conn.blocking_lock();
-            guard.execute(
-                "INSERT INTO interactions(person_id, ts, is_outbound, length) \
-                 VALUES (?1, ?2, ?3, ?4)",
-                params![
-                    i.person_id.to_string(),
-                    i.ts.timestamp(),
-                    if i.is_outbound { 1_i64 } else { 0_i64 },
-                    i.length as i64,
-                ],
-            )?;
-            Ok(())
-        })
-        .await
-        .map_err(|e| {
-            rusqlite::Error::SqliteFailure(
-                rusqlite::ffi::Error {
-                    code: rusqlite::ffi::ErrorCode::SystemIoFailure,
-                    extended_code: 0,
+                StateChange {
+                    collection: PEOPLE_HANDLES.to_owned(),
+                    key: key.clone(),
+                    value: None,
                 },
-                Some(e.to_string()),
-            )
-        })?
-    }
-
-    /// Fetch all interactions for a person, newest first.
-    pub async fn interactions_for(&self, person_id: PersonId) -> SqlResult<Vec<Interaction>> {
-        let conn = self.conn.clone();
-        tokio::task::spawn_blocking(move || -> SqlResult<Vec<Interaction>> {
-            let guard = conn.blocking_lock();
-            let mut stmt = guard.prepare(
-                "SELECT ts, is_outbound, length FROM interactions \
-                 WHERE person_id = ?1 ORDER BY ts DESC",
-            )?;
-            let rows = stmt.query_map(params![person_id.to_string()], |r| {
-                Ok((
-                    r.get::<_, i64>(0)?,
-                    r.get::<_, i64>(1)?,
-                    r.get::<_, i64>(2)?,
-                ))
-            })?;
-            let mut out = Vec::new();
-            for r in rows {
-                let (ts, is_out, length) = r?;
-                out.push(Interaction {
+            ];
+            let changes = [StateChange {
+                collection: PEOPLE_HANDLES.to_owned(),
+                key: key.clone(),
+                value: Some(serde_json::to_value(HandleRecord {
+                    kind: kind.to_owned(),
+                    value: value.to_owned(),
                     person_id,
-                    ts: ts_to_dt(ts),
-                    is_outbound: is_out != 0,
-                    length: length.max(0) as u32,
-                });
+                    created_at: Utc::now().timestamp(),
+                })?),
+            }];
+            if versioned::commit_if_state_matches_async(&self.config, &expected, &[], &changes)
+                .await?
+            {
+                return Ok(());
             }
-            Ok(out)
-        })
-        .await
-        .map_err(|e| {
-            rusqlite::Error::SqliteFailure(
-                rusqlite::ffi::Error {
-                    code: rusqlite::ffi::ErrorCode::SystemIoFailure,
-                    extended_code: 0,
-                },
-                Some(e.to_string()),
-            )
-        })?
+        }
+        bail!("handle alias write conflicted with concurrent changes")
     }
 
-    /// Fetch interactions for several people in one query, keyed by person id.
+    /// Resolve a canonicalized handle to its person ID, or return `None`.
+    pub async fn lookup(&self, handle: &Handle) -> Result<Option<PersonId>> {
+        let handle = handle.canonicalize();
+        let (kind, value) = handle.as_key();
+        let key = handle_key(kind, value);
+        versioned::read_state_async(&self.config, PEOPLE_HANDLES, &key)
+            .await?
+            .map(|value| decode_handle(&key, value).map(|record| record.person_id))
+            .transpose()
+    }
+
+    /// Load a person and all its aliases in canonical `(kind, value)` order.
+    pub async fn get(&self, person_id: PersonId) -> Result<Option<Person>> {
+        let key = person_id.to_string();
+        let Some(value) = versioned::read_state_async(&self.config, PEOPLE, &key).await? else {
+            return Ok(None);
+        };
+        let mut person: Person = serde_json::from_value(value)
+            .with_context(|| format!("invalid people record for {person_id}"))?;
+        if person.id != person_id {
+            bail!("people record key does not match person ID {person_id}")
+        }
+        person.handles = self.handles_for(person_id).await?;
+        Ok(Some(person))
+    }
+
+    /// List people ordered by optional display name, with aliases attached.
+    pub async fn list(&self) -> Result<Vec<Person>> {
+        let records = versioned::list_state_async(&self.config, PEOPLE).await?;
+        let mut people = Vec::with_capacity(records.len());
+        for (key, value) in records {
+            let mut person: Person = serde_json::from_value(value)
+                .with_context(|| format!("invalid people record at key {key}"))?;
+            if person.id.to_string() != key {
+                bail!("people record key does not match person ID {}", person.id)
+            }
+            person.handles = self.handles_for(person.id).await?;
+            people.push(person);
+        }
+        people.sort_by(|left, right| left.display_name.cmp(&right.display_name));
+        Ok(people)
+    }
+
+    /// Record one interaction for an existing person.
+    pub async fn record_interaction(&self, interaction: Interaction) -> Result<()> {
+        self.record_interaction_with_id(interaction, uuid::Uuid::new_v4().to_string())
+            .await
+    }
+
+    /// Record one imported interaction under a stable source row identifier.
+    /// Repeating the same import is idempotent; a reused ID with different
+    /// content fails closed.
+    pub async fn record_interaction_with_id(
+        &self,
+        interaction: Interaction,
+        source_id: String,
+    ) -> Result<()> {
+        let owner_key = interaction.person_id.to_string();
+        let interaction = Interaction {
+            ts: seconds_precision(interaction.ts),
+            ..interaction
+        };
+        let id = format!("legacy:{source_id}");
+        let key = format!("{}:{id}", interaction.person_id);
+        for _ in 0..WRITE_RETRIES {
+            let Some(person) =
+                versioned::read_state_async(&self.config, PEOPLE, &owner_key).await?
+            else {
+                bail!("person {} does not exist", interaction.person_id)
+            };
+            if let Some(existing) =
+                versioned::read_state_async(&self.config, PEOPLE_INTERACTIONS, &key).await?
+            {
+                let existing: InteractionRecord = serde_json::from_value(existing)
+                    .context("decode existing imported interaction")?;
+                anyhow::ensure!(
+                    existing.id == id && existing.interaction == interaction,
+                    "interaction source ID was reused with different content"
+                );
+                return Ok(());
+            }
+            let expected = [StateChange {
+                collection: PEOPLE.to_owned(),
+                key: owner_key.clone(),
+                value: Some(person),
+            }];
+            let changes = [StateChange {
+                collection: PEOPLE_INTERACTIONS.to_owned(),
+                key: key.clone(),
+                value: Some(serde_json::to_value(InteractionRecord {
+                    id: id.clone(),
+                    interaction: interaction.clone(),
+                })?),
+            }];
+            if versioned::commit_if_state_matches_async(&self.config, &expected, &[], &changes)
+                .await?
+            {
+                return Ok(());
+            }
+        }
+        bail!("interaction insert conflicted with concurrent changes")
+    }
+
+    /// Fetch interactions for a person, newest first.
+    pub async fn interactions_for(&self, person_id: PersonId) -> Result<Vec<Interaction>> {
+        let records = versioned::list_state_async(&self.config, PEOPLE_INTERACTIONS).await?;
+        let mut interactions = Vec::new();
+        for (key, value) in records {
+            let record: InteractionRecord = serde_json::from_value(value)
+                .with_context(|| format!("invalid interaction record at key {key}"))?;
+            validate_interaction_key(&key, &record)?;
+            if record.interaction.person_id != person_id {
+                continue;
+            }
+            interactions.push(record.interaction);
+        }
+        interactions.sort_by_key(|interaction| Reverse(interaction.ts));
+        Ok(interactions)
+    }
+
+    /// Fetch interactions for several people, newest first per person.
     pub async fn batch_interactions_for(
         &self,
         person_ids: &[PersonId],
-    ) -> SqlResult<HashMap<PersonId, Vec<Interaction>>> {
+    ) -> Result<HashMap<PersonId, Vec<Interaction>>> {
         if person_ids.is_empty() {
             return Ok(HashMap::new());
         }
-        let conn = self.conn.clone();
-        let ids: Vec<PersonId> = person_ids.to_vec();
-        tokio::task::spawn_blocking(move || -> SqlResult<HashMap<PersonId, Vec<Interaction>>> {
-            let guard = conn.blocking_lock();
-            let placeholders = std::iter::repeat_n("?", ids.len())
-                .collect::<Vec<_>>()
-                .join(",");
-            let sql = format!(
-                "SELECT person_id, ts, is_outbound, length FROM interactions \
-                 WHERE person_id IN ({placeholders}) ORDER BY person_id, ts DESC"
-            );
-            let id_strings: Vec<String> = ids.iter().map(ToString::to_string).collect();
-            let mut stmt = guard.prepare(&sql)?;
-            let rows = stmt.query_map(rusqlite::params_from_iter(id_strings.iter()), |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, i64>(1)?,
-                    r.get::<_, i64>(2)?,
-                    r.get::<_, i64>(3)?,
-                ))
-            })?;
-            let mut out: HashMap<PersonId, Vec<Interaction>> = HashMap::new();
-            for r in rows {
-                let (id_str, ts, is_out, length) = r?;
-                let person_id = uuid::Uuid::parse_str(&id_str)
-                    .map(PersonId)
-                    .map_err(|e| rusqlite::Error::InvalidColumnName(e.to_string()))?;
-                out.entry(person_id).or_default().push(Interaction {
-                    person_id,
-                    ts: ts_to_dt(ts),
-                    is_outbound: is_out != 0,
-                    length: length.max(0) as u32,
-                });
+        let requested: HashSet<_> = person_ids.iter().copied().collect();
+        let records = versioned::list_state_async(&self.config, PEOPLE_INTERACTIONS).await?;
+        let mut out: HashMap<PersonId, Vec<Interaction>> = HashMap::new();
+        for (key, value) in records {
+            let record: InteractionRecord = serde_json::from_value(value)
+                .with_context(|| format!("invalid interaction record at key {key}"))?;
+            validate_interaction_key(&key, &record)?;
+            if requested.contains(&record.interaction.person_id) {
+                out.entry(record.interaction.person_id)
+                    .or_default()
+                    .push(record.interaction);
             }
-            Ok(out)
-        })
-        .await
-        .map_err(|e| {
-            rusqlite::Error::SqliteFailure(
-                rusqlite::ffi::Error {
-                    code: rusqlite::ffi::ErrorCode::SystemIoFailure,
-                    extended_code: 0,
-                },
-                Some(e.to_string()),
-            )
-        })?
+        }
+        for interactions in out.values_mut() {
+            interactions.sort_by_key(|interaction| Reverse(interaction.ts));
+        }
+        Ok(out)
+    }
+
+    async fn handles_for(&self, person_id: PersonId) -> Result<Vec<Handle>> {
+        let records = versioned::list_state_async(&self.config, PEOPLE_HANDLES).await?;
+        let mut handles = Vec::new();
+        for (key, value) in records {
+            let record = decode_handle(&key, value)?;
+            if record.person_id != person_id {
+                continue;
+            }
+            let handle = match record.kind.as_str() {
+                "imessage" => Handle::IMessage(record.value),
+                "email" => Handle::Email(record.value),
+                "display_name" => Handle::DisplayName(record.value),
+                other => bail!("unknown people handle kind {other:?}"),
+            };
+            handles.push(handle);
+        }
+        handles.sort_by(|left, right| left.as_key().cmp(&right.as_key()));
+        Ok(handles)
     }
 }
 
-fn load_handles(conn: &Connection, id: &PersonId) -> SqlResult<Vec<Handle>> {
-    let mut stmt = conn.prepare(
-        "SELECT kind, value FROM handle_aliases WHERE person_id = ?1 ORDER BY kind, value",
-    )?;
-    let rows = stmt.query_map(params![id.to_string()], |r| {
-        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-    })?;
-    let mut out = Vec::new();
-    for r in rows {
-        let (kind, value) = r?;
-        let h = match kind.as_str() {
-            "imessage" => Handle::IMessage(value),
-            "email" => Handle::Email(value),
-            "display_name" => Handle::DisplayName(value),
-            other => {
-                return Err(rusqlite::Error::InvalidColumnName(format!(
-                    "unknown handle kind: {other}"
-                )));
-            }
-        };
-        out.push(h);
+async fn stage_person_insert(
+    config: &MemoryConfig,
+    person: &Person,
+    handles: &[Handle],
+) -> Result<(Vec<StateChange>, Vec<StateChange>)> {
+    let person_key = person.id.to_string();
+    if versioned::read_state_async(config, PEOPLE, &person_key)
+        .await?
+        .is_some()
+    {
+        bail!("person {} already exists", person.id)
     }
-    Ok(out)
+    let mut stored_person = person.clone();
+    stored_person.handles.clear();
+    stored_person.created_at = seconds_precision(stored_person.created_at);
+    stored_person.updated_at = seconds_precision(stored_person.updated_at);
+    let mut expected = vec![StateChange {
+        collection: PEOPLE.to_owned(),
+        key: person_key.clone(),
+        value: None,
+    }];
+    let mut changes = vec![StateChange {
+        collection: PEOPLE.to_owned(),
+        key: person_key,
+        value: Some(serde_json::to_value(stored_person)?),
+    }];
+    let mut seen = HashSet::new();
+    for handle in handles.iter().map(Handle::canonicalize) {
+        let (kind, value) = handle.as_key();
+        let key = handle_key(kind, value);
+        if !seen.insert(key.clone()) {
+            continue;
+        }
+        if let Some(current) = versioned::read_state_async(config, PEOPLE_HANDLES, &key).await? {
+            decode_handle(&key, current)?;
+            continue;
+        }
+        expected.push(StateChange {
+            collection: PEOPLE_HANDLES.to_owned(),
+            key: key.clone(),
+            value: None,
+        });
+        changes.push(StateChange {
+            collection: PEOPLE_HANDLES.to_owned(),
+            key,
+            value: Some(serde_json::to_value(HandleRecord {
+                kind: kind.to_owned(),
+                value: value.to_owned(),
+                person_id: person.id,
+                created_at: Utc::now().timestamp(),
+            })?),
+        });
+    }
+    Ok((expected, changes))
 }
 
-fn ts_to_dt(ts: i64) -> DateTime<Utc> {
-    Utc.timestamp_opt(ts, 0)
+fn handle_key(kind: &str, value: &str) -> String {
+    format!("{kind}:{value}")
+}
+
+pub(crate) fn interaction_key(record: &InteractionRecord) -> String {
+    format!("{}:{}", record.interaction.person_id, record.id)
+}
+
+fn validate_interaction_key(key: &str, record: &InteractionRecord) -> Result<()> {
+    anyhow::ensure!(
+        interaction_key(record) == key,
+        "interaction record key does not match its body at {key}"
+    );
+    Ok(())
+}
+
+fn decode_handle(key: &str, value: Value) -> Result<HandleRecord> {
+    let record: HandleRecord = serde_json::from_value(value)
+        .with_context(|| format!("invalid handle alias record at key {key}"))?;
+    let expected_key = handle_key(&record.kind, &record.value);
+    if expected_key != key {
+        bail!("handle alias record key does not match its body at {key}")
+    }
+    match record.kind.as_str() {
+        "imessage" | "email" | "display_name" => Ok(record),
+        other => bail!("unknown people handle kind {other:?}"),
+    }
+}
+
+fn seconds_precision(value: DateTime<Utc>) -> DateTime<Utc> {
+    Utc.timestamp_opt(value.timestamp(), 0)
         .single()
-        .unwrap_or_else(|| Utc.timestamp_opt(0, 0).unwrap())
+        .unwrap_or_else(|| {
+            Utc.timestamp_opt(0, 0)
+                .single()
+                .expect("Unix epoch is valid")
+        })
 }
 
 #[cfg(test)]

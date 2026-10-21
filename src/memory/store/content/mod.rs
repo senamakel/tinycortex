@@ -74,9 +74,9 @@ pub use raw::{
     RawItem, RawKind,
 };
 pub use read::{
-    read_chunk_body, read_chunk_file, read_summary_body, read_summary_file,
-    resolve_within_content_root, verify_chunk_file, verify_summary_file, ChunkFileContents,
-    VerifyResult,
+    read_chunk_body, read_chunk_file, read_summary_body, read_summary_body_async,
+    read_summary_file, resolve_within_content_root, verify_chunk_file, verify_summary_file,
+    ChunkFileContents, VerifyResult,
 };
 pub use tags::{entity_tag, slugify_tag_kind, slugify_tag_value, update_chunk_tags};
 

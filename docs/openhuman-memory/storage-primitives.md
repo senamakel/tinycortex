@@ -85,9 +85,13 @@ Important constants from OpenHuman:
 
 ## Vector Store
 
-The generic vector store persists packed `f32` embeddings and performs cosine
-search. On first open it records the embedding provider and dimension in
-`store_meta`, then rejects later opens with an incompatible dimension.
+The generic vector store persists each vector as a prepared host-document
+record. It stores the `f32` embedding as packed little-endian bytes, retains
+metadata as raw JSON until after top-K selection, and performs cosine search.
+The host prepares the store's collections before use. On first open the store
+records the provider name as provenance and the embedding dimension; later
+opens reject malformed metadata or a different dimension. Provider names do
+not gate reopening when dimensions match, preserving the historical contract.
 
 Chunk-tree embeddings use SQLite sidecar tables keyed by row id plus
 `model_signature` (`model@dim`). Each sidecar row stores the packed vector,

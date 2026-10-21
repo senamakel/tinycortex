@@ -1,6 +1,6 @@
-//! Shared test fixtures for the retrieval unit tests.
+//! Shared host-storage fixtures for the retrieval unit tests.
 //!
-//! Seeds a small SQLite store under a `tempfile::TempDir` and exposes helpers
+//! Seeds a testkit-backed owner store under a `tempfile::TempDir` and exposes helpers
 //! to insert chunks, scores, summary trees, and entity-index rows directly —
 //! bypassing the full ingest/seal pipeline so each retrieval primitive can be
 //! exercised against a hand-built fixture with inert (zero-vector) embeddings.
@@ -8,17 +8,14 @@
 use chrono::{DateTime, TimeZone, Utc};
 use tempfile::TempDir;
 
-use crate::memory::chunks::{
-    chunk_id, tree_active_signature, upsert_chunks, with_connection, Chunk, Metadata, SourceKind,
-    SourceRef,
-};
+use crate::memory::chunks::{chunk_id, upsert_chunks, Chunk, Metadata, SourceKind, SourceRef};
 use crate::memory::config::MemoryConfig;
 use crate::memory::score::extract::EntityKind;
 use crate::memory::score::resolver::CanonicalEntity;
 use crate::memory::score::signals::ScoreSignals;
 use crate::memory::score::store::{index_entities, upsert_score, ScoreRow};
 use crate::memory::tree::store::{
-    insert_summary_tx, insert_tree, set_summary_embedding_for_signature,
+    insert_tree, set_summary_embedding as write_summary_embedding, stage_summary_changes,
 };
 use crate::memory::tree::{SummaryNode, Tree, TreeKind, TreeStatus};
 
@@ -26,8 +23,14 @@ use crate::memory::tree::{SummaryNode, Tree, TreeKind, TreeStatus};
 /// be kept alive for the duration of the test (dropping it deletes the store).
 pub fn test_config() -> (TempDir, MemoryConfig) {
     let tmp = TempDir::new().unwrap();
-    let cfg = MemoryConfig::new(tmp.path());
+    let cfg = crate::memory::chunks::test_support::host_config(tmp.path());
     (tmp, cfg)
+}
+
+fn in_storage_thread<T: Send + 'static>(operation: impl FnOnce() -> T + Send + 'static) -> T {
+    std::thread::spawn(operation)
+        .join()
+        .expect("retrieval fixture storage operation")
 }
 
 /// A fixed epoch-millis timestamp for deterministic fixtures.
@@ -64,48 +67,63 @@ pub fn sample_chunk_at(source: &str, seq: u32, content: &str, ts: DateTime<Utc>)
 
 /// Persist chunks to the store.
 pub fn insert_chunks(cfg: &MemoryConfig, chunks: &[Chunk]) {
-    upsert_chunks(cfg, chunks).unwrap();
+    let cfg = cfg.clone();
+    let chunks = chunks.to_vec();
+    in_storage_thread(move || upsert_chunks(&cfg, &chunks).unwrap());
 }
 
 /// Upsert a score row for a chunk with the given total.
 pub fn insert_score(cfg: &MemoryConfig, chunk_id: &str, total: f32) {
-    upsert_score(
-        cfg,
-        &ScoreRow {
-            chunk_id: chunk_id.to_string(),
-            total,
-            signals: ScoreSignals::default(),
-            dropped: false,
-            reason: None,
-            computed_at_ms: 0,
-            llm_importance_reason: None,
-        },
-    )
-    .unwrap();
+    let cfg = cfg.clone();
+    let chunk_id = chunk_id.to_owned();
+    in_storage_thread(move || {
+        upsert_score(
+            &cfg,
+            &ScoreRow {
+                chunk_id: chunk_id.to_string(),
+                total,
+                signals: ScoreSignals::default(),
+                dropped: false,
+                reason: None,
+                computed_at_ms: 0,
+                llm_importance_reason: None,
+            },
+        )
+        .unwrap();
+    });
 }
 
 /// Insert a tree row.
 pub fn insert_tree_row(cfg: &MemoryConfig, tree: &Tree) {
-    insert_tree(cfg, tree).unwrap();
+    let cfg = cfg.clone();
+    let tree = tree.clone();
+    in_storage_thread(move || insert_tree(&cfg, &tree).unwrap());
 }
 
 /// Insert a summary node row (idempotent on primary key). Any `embedding` on
 /// the node is written to the active-signature sidecar.
 pub fn insert_summary(cfg: &MemoryConfig, node: &SummaryNode) {
-    let sig = tree_active_signature(cfg);
-    with_connection(cfg, |conn| {
-        let tx = conn.unchecked_transaction()?;
-        insert_summary_tx(&tx, node, &sig)?;
-        tx.commit()?;
-        Ok(())
-    })
-    .unwrap();
+    let cfg = cfg.clone();
+    let node = node.clone();
+    in_storage_thread(move || {
+        let signature = crate::memory::chunks::tree_active_signature(&cfg);
+        let staged = stage_summary_changes(&node, None, &signature).unwrap();
+        assert!(crate::memory::chunks::versioned::commit_if_state_matches(
+            &cfg,
+            &staged.expected,
+            &[],
+            &staged.changes,
+        )
+        .unwrap());
+    });
 }
 
 /// Write a summary's embedding to the active-signature sidecar table.
 pub fn set_summary_embedding(cfg: &MemoryConfig, summary_id: &str, vec: &[f32]) {
-    let sig = tree_active_signature(cfg);
-    set_summary_embedding_for_signature(cfg, summary_id, &sig, vec).unwrap();
+    let cfg = cfg.clone();
+    let summary_id = summary_id.to_owned();
+    let vec = vec.to_vec();
+    in_storage_thread(move || write_summary_embedding(&cfg, &summary_id, &vec).unwrap());
 }
 
 /// Index one entity occurrence against a node.
@@ -128,7 +146,21 @@ pub fn index_entity_occurrence(
         span_end: 0,
         score: 1.0,
     };
-    index_entities(cfg, &[entity], node_id, node_kind, timestamp_ms, tree_id).unwrap();
+    let cfg = cfg.clone();
+    let node_id = node_id.to_owned();
+    let node_kind = node_kind.to_owned();
+    let tree_id = tree_id.map(str::to_owned);
+    in_storage_thread(move || {
+        index_entities(
+            &cfg,
+            &[entity],
+            &node_id,
+            &node_kind,
+            timestamp_ms,
+            tree_id.as_deref(),
+        )
+        .unwrap();
+    });
 }
 
 /// A minimal active source tree rooted at `scope`.

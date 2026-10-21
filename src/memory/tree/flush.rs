@@ -46,7 +46,7 @@ pub async fn flush_stale_buffers_with_services(
 ) -> Result<usize> {
     let now = Utc::now();
     let cutoff = now - max_age;
-    let stale = store::list_stale_buffers(config, cutoff)?;
+    let stale = store::list_stale_buffers_async(config, cutoff).await?;
 
     // One batched fetch over the distinct tree_ids; missing rows are skipped.
     let distinct_tree_ids: Vec<String> = {
@@ -59,7 +59,7 @@ pub async fn flush_stale_buffers_with_services(
         }
         out
     };
-    let tree_by_id = store::get_trees_batch(config, &distinct_tree_ids)?;
+    let tree_by_id = store::get_trees_batch_async(config, &distinct_tree_ids).await?;
 
     let mut seals = 0;
     let mut failures = Vec::new();
@@ -67,10 +67,8 @@ pub async fn flush_stale_buffers_with_services(
         let Some(tree) = tree_by_id.get(&buf.tree_id) else {
             continue; // orphan buffer — tree row gone
         };
-        let sealed = cascade_all_from_with_services(
-            config, tree, buf.level, true, services, strategy, false,
-        )
-        .await;
+        let sealed =
+            cascade_all_from_with_services(config, tree, buf.level, true, services, strategy).await;
         match sealed {
             Ok(ids) => seals += ids.len(),
             Err(err) => failures.push(format!("{} level {}: {err:#}", buf.tree_id, buf.level)),
@@ -119,7 +117,8 @@ pub async fn force_flush_tree(
     strategy: &LabelStrategy,
 ) -> Result<Vec<String>> {
     let _ = now;
-    let tree = store::get_tree(config, tree_id)?
+    let tree = store::get_tree_async(config, tree_id)
+        .await?
         .ok_or_else(|| anyhow::anyhow!("no tree with id {tree_id}"))?;
     cascade_all_from(config, &tree, 0, true, summariser, strategy).await
 }

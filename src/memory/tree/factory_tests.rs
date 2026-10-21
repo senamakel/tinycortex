@@ -12,7 +12,7 @@ use crate::memory::tree::summarise::ConcatSummariser;
 
 fn test_config() -> (TempDir, MemoryConfig) {
     let tmp = TempDir::new().unwrap();
-    let cfg = MemoryConfig::new(tmp.path());
+    let cfg = crate::memory::chunks::test_support::host_config(tmp.path());
     (tmp, cfg)
 }
 
@@ -38,7 +38,13 @@ fn seed_chunk(cfg: &MemoryConfig, seq: u32, content: &str) -> Chunk {
         created_at: ts,
         partial_message: false,
     };
-    upsert_chunks(cfg, std::slice::from_ref(&chunk)).unwrap();
+    let cfg = cfg.clone();
+    let chunk_for_write = chunk.clone();
+    std::thread::spawn(move || {
+        upsert_chunks(&cfg, std::slice::from_ref(&chunk_for_write)).unwrap();
+    })
+    .join()
+    .unwrap();
     chunk
 }
 
@@ -129,12 +135,24 @@ async fn factory_insert_seal_and_archive_use_profile_scope() {
     let no_more_work = factory.seal_now(&cfg, &summariser).await.unwrap();
     assert!(no_more_work.is_empty());
 
-    let tree = factory.get_or_create(&cfg).unwrap();
+    let tree = crate::memory::tree::registry::get_or_create_tree_async(
+        &cfg,
+        factory.kind(),
+        factory.scope(),
+    )
+    .await
+    .unwrap();
     assert_eq!(tree.root_id.as_deref(), Some(immediate[0].as_str()));
-    assert_eq!(store::count_summaries(&cfg, &tree.id).unwrap(), 1);
+    assert_eq!(
+        store::count_summaries_async(&cfg, &tree.id).await.unwrap(),
+        1
+    );
 
-    factory.archive(&cfg).unwrap();
-    let archived = store::get_tree(&cfg, &tree.id).unwrap().unwrap();
+    store::archive_tree_async(&cfg, &tree.id).await.unwrap();
+    let archived = store::get_tree_async(&cfg, &tree.id)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(archived.status, TreeStatus::Archived);
 }
 
@@ -162,7 +180,19 @@ async fn seal_now_force_seals_under_budget_l0_buffer() {
     let sealed = factory.seal_now(&cfg, &summariser).await.unwrap();
     assert_eq!(sealed.len(), 1, "seal_now must force-seal the buffer");
 
-    let tree = factory.get_or_create(&cfg).unwrap();
-    assert_eq!(store::count_summaries(&cfg, &tree.id).unwrap(), 1);
-    assert!(store::get_buffer(&cfg, &tree.id, 0).unwrap().is_empty());
+    let tree = crate::memory::tree::registry::get_or_create_tree_async(
+        &cfg,
+        factory.kind(),
+        factory.scope(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        store::count_summaries_async(&cfg, &tree.id).await.unwrap(),
+        1
+    );
+    assert!(store::get_buffer_async(&cfg, &tree.id, 0)
+        .await
+        .unwrap()
+        .is_empty());
 }

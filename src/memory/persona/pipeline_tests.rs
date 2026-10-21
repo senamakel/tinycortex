@@ -6,9 +6,10 @@ use async_trait::async_trait;
 use std::io::Write;
 use tempfile::TempDir;
 
+use crate::memory::chunks::test_support::host_config;
 use crate::memory::config::MemoryConfig;
 use crate::memory::persona::config::PersonaConfig;
-use crate::memory::persona::state::FileStateStore;
+use crate::memory::persona::state::KvStateStore;
 use crate::memory::score::extract::{ChatPrompt, ChatProvider};
 use crate::memory::tree::summarise::ConcatSummariser;
 
@@ -134,7 +135,7 @@ fn setup() -> (TempDir, TempDir, MemoryConfig, PersonaConfig) {
     )
     .unwrap();
 
-    let cfg = MemoryConfig::new(ws.path());
+    let cfg = host_config(ws.path());
     let mut persona = PersonaConfig::with_home(src.path(), "me@example.com");
     persona.claude_code_root = Some(src.path().join("claude/projects"));
     persona.codex_root = None;
@@ -145,10 +146,10 @@ fn setup() -> (TempDir, TempDir, MemoryConfig, PersonaConfig) {
 
 #[tokio::test]
 async fn backfill_then_incremental_resume() {
-    let (ws, _src, cfg, persona) = setup();
+    let (_ws, _src, cfg, persona) = setup();
     let provider = MockChat;
     let summariser = ConcatSummariser::new();
-    let store = FileStateStore::open_in_workspace(ws.path()).unwrap();
+    let store = KvStateStore::from_config(&cfg).unwrap();
 
     let pipeline = Pipeline {
         config: &cfg,
@@ -184,11 +185,11 @@ async fn backfill_then_incremental_resume() {
 
 #[tokio::test]
 async fn budget_cutoff_checkpoints() {
-    let (ws, _src, cfg, mut persona) = setup();
+    let (_ws, _src, cfg, mut persona) = setup();
     persona.run_budget.max_sessions = 1; // only one transcript may digest
     let provider = MockChat;
     let summariser = ConcatSummariser::new();
-    let store = FileStateStore::open_in_workspace(ws.path()).unwrap();
+    let store = KvStateStore::from_config(&cfg).unwrap();
 
     let pipeline = Pipeline {
         config: &cfg,
@@ -210,11 +211,11 @@ async fn call_budget_exhaustion_checkpoints_and_resumes() {
     // call and two sessions (one window each, digested oldest-first), only the
     // first commits; the second hits the spent budget, does NOT commit, and is
     // re-digested on a later run once the budget refreshes.
-    let (ws, src, cfg, mut persona) = setup();
+    let (_ws, src, cfg, mut persona) = setup();
     persona.run_budget.max_llm_calls = 1;
     persona.digest_concurrency = 1; // deterministic oldest-first ordering
     let summariser = ConcatSummariser::new();
-    let store = FileStateStore::open_in_workspace(ws.path()).unwrap();
+    let store = KvStateStore::from_config(&cfg).unwrap();
 
     let report = Pipeline {
         config: &cfg,
@@ -272,23 +273,42 @@ async fn call_budget_exhaustion_checkpoints_and_resumes() {
     );
 }
 
-#[tokio::test]
-async fn compile_only_reassembles_without_llm() {
-    let (ws, _src, cfg, persona) = setup();
-    let provider = MockChat;
-    let summariser = ConcatSummariser::new();
-    let store = FileStateStore::open_in_workspace(ws.path()).unwrap();
-    let pipeline = Pipeline {
-        config: &cfg,
-        persona: &persona,
-        provider: &provider,
-        summariser: &summariser,
-        store: &store,
-    };
-    pipeline.run(RunMode::Backfill).await.unwrap();
+#[test]
+fn compile_only_reassembles_without_llm() {
+    let (_ws, _src, cfg, persona) = setup();
+    let path = std::thread::spawn(move || {
+        let provider = MockChat;
+        let summariser = ConcatSummariser::new();
+        let store = KvStateStore::from_config(&cfg).unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        {
+            let pipeline = Pipeline {
+                config: &cfg,
+                persona: &persona,
+                provider: &provider,
+                summariser: &summariser,
+                store: &store,
+            };
+            runtime.block_on(pipeline.run(RunMode::Backfill)).unwrap();
+        }
+        drop(runtime);
 
-    // compile_only reads the existing facet-tree roots and rewrites the pack.
-    let path = pipeline.compile_only().unwrap();
+        // compile_only is intentionally synchronous, so exercise it outside
+        // Tokio after the async backfill has completed.
+        let pipeline = Pipeline {
+            config: &cfg,
+            persona: &persona,
+            provider: &provider,
+            summariser: &summariser,
+            store: &store,
+        };
+        pipeline.compile_only().unwrap()
+    })
+    .join()
+    .unwrap();
     let pack = std::fs::read_to_string(path).unwrap();
     assert!(pack.contains("# Persona: me@example.com"));
     assert!(pack.contains("## Directives"));
@@ -298,9 +318,9 @@ async fn compile_only_reassembles_without_llm() {
 async fn hard_provider_failure_does_not_commit_cursor() {
     // A hard provider failure must NOT checkpoint the transcript, so a later run
     // with a working provider re-processes it (evidence isn't lost).
-    let (ws, _src, cfg, persona) = setup();
+    let (_ws, _src, cfg, persona) = setup();
     let summariser = ConcatSummariser::new();
-    let store = FileStateStore::open_in_workspace(ws.path()).unwrap();
+    let store = KvStateStore::from_config(&cfg).unwrap();
 
     let failing = FailChat;
     let first = Pipeline {
@@ -343,10 +363,10 @@ async fn systemic_truncation_withholds_commits_and_retries() {
     // — the fully-lost cursors must be WITHHELD, not committed. Committing them
     // would silently skip the whole backlog and require manual state deletion to
     // recover once the cause is fixed. The run is flagged and a later run retries.
-    let (ws, src, cfg, mut persona) = setup();
+    let (_ws, src, cfg, mut persona) = setup();
     persona.run_budget.max_llm_calls = 64; // decouple from the config default
     let summariser = ConcatSummariser::new();
-    let store = FileStateStore::open_in_workspace(ws.path()).unwrap();
+    let store = KvStateStore::from_config(&cfg).unwrap();
 
     let report = Pipeline {
         config: &cfg,
@@ -433,7 +453,7 @@ async fn fully_lost_session_commits_when_the_run_yields_observations() {
     )
     .unwrap();
 
-    let cfg = MemoryConfig::new(ws.path());
+    let cfg = host_config(ws.path());
     let mut persona = PersonaConfig::with_home(src.path(), "me@example.com");
     persona.claude_code_root = Some(src.path().join("claude/projects"));
     persona.codex_root = None;
@@ -443,7 +463,7 @@ async fn fully_lost_session_commits_when_the_run_yields_observations() {
     persona.run_budget.max_llm_calls = 64; // decouple from the config default
 
     let summariser = ConcatSummariser::new();
-    let store = FileStateStore::open_in_workspace(ws.path()).unwrap();
+    let store = KvStateStore::from_config(&cfg).unwrap();
 
     let report = Pipeline {
         config: &cfg,
@@ -504,10 +524,10 @@ async fn clean_empty_digest_commits_cursor() {
     // digest is genuinely done, so its cursor MUST commit and a later run skips it.
     // (Guards against over-correcting the truncation fix into a permanent retry of
     // low-signal sessions.)
-    let (ws, src, cfg, mut persona) = setup();
+    let (_ws, src, cfg, mut persona) = setup();
     persona.run_budget.max_llm_calls = 64; // decouple from the config default
     let summariser = ConcatSummariser::new();
-    let store = FileStateStore::open_in_workspace(ws.path()).unwrap();
+    let store = KvStateStore::from_config(&cfg).unwrap();
 
     let report = Pipeline {
         config: &cfg,
@@ -563,10 +583,10 @@ async fn clean_empty_digest_commits_cursor() {
 async fn removed_directive_drops_out_on_rerun() {
     // Editing an instruction file (removing a rule) must drop the stale rule
     // from the pack — directives are rebuilt fresh, not appended.
-    let (ws, src, cfg, persona) = setup();
+    let (_ws, src, cfg, persona) = setup();
     let provider = MockChat;
     let summariser = ConcatSummariser::new();
-    let store = FileStateStore::open_in_workspace(ws.path()).unwrap();
+    let store = KvStateStore::from_config(&cfg).unwrap();
     let claude_md = src.path().join("proj/CLAUDE.md");
 
     let first = Pipeline {

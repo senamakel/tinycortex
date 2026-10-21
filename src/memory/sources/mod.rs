@@ -2,16 +2,16 @@
 //!
 //! This domain owns the **"what feeds my memory?"** question: a typed registry
 //! of sources (Composio OAuth connections, local folders, GitHub repos, RSS
-//! feeds, Twitter queries, web pages, and agent conversations) persisted in
-//! `config.toml` under `[[memory_sources]]`.
+//! feeds, Twitter queries, web pages, and agent conversations). The host owns
+//! durable configuration and supplies it through [`SourceConfigPort`].
 //!
 //! It provides:
 //! - [`types`]: the [`MemorySourceEntry`] contract, [`SourceKind`] discriminator,
 //!   and reader output types ([`SourceItem`], [`SourceContent`], [`ContentType`]).
 //! - [`validation`]: required-field rules per kind and the shared
 //!   path-traversal guard for local readers.
-//! - [`registry`]: a TOML-backed [`SourceRegistry`] with the
-//!   load/modify/validate/save CRUD cycle.
+//! - [`registry`]: a [`SourceRegistry`] that validates and mutates source
+//!   entries through the host's revisioned configuration port.
 //! - [`readers`]: the [`SourceReader`] trait and the local folder/conversation
 //!   reader implementations.
 //!
@@ -30,7 +30,10 @@ pub mod types;
 pub mod validation;
 
 pub use readers::{is_locally_readable, reader_for, SourceReader};
-pub use registry::{memory_sync_defaults_for_toolkit, ComposioUpsertTarget, SourceRegistry};
+pub use registry::{
+    memory_sync_defaults_for_toolkit, ComposioUpsertTarget, SourceConfigPort, SourceConfigSnapshot,
+    SourceRegistry,
+};
 pub use types::{
     ContentType, MemorySourceEntry, MemorySourcePatch, SourceContent, SourceItem, SourceKind,
 };

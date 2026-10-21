@@ -1,0 +1,9 @@
+{"op":"upsert","thread_id":"legacy:conversation-alpha","title":"Alpha transcript","created_at":"2025-02-03T04:05:06Z","updated_at":"2025-02-03T04:05:06Z","parent_thread_id":"legacy:parent","labels":["general","research"],"personality_id":"persona-alpha"}
+{"op":"message_appended","thread_id":"legacy:conversation-alpha","last_message_at":"2025-02-03T04:06:00Z"}
+{"op":"message_appended","thread_id":"legacy:conversation-alpha","last_message_at":"2025-02-03T04:07:00Z"}
+{"op":"message_appended","thread_id":"legacy:conversation-alpha","last_message_at":"2025-02-03T04:08:00Z"}
+{"op":"upsert","thread_id":"legacy:conversation-beta","title":"Beta transcript","created_at":"2025-02-04T10:00:00Z","updated_at":"2025-02-04T10:00:00Z","labels":["tasks"]}
+{"op":"message_appended","thread_id":"legacy:conversation-beta","last_message_at":"2025-02-04T10:01:00Z"}
+{"op":"message_appended","thread_id":"legacy:conversation-beta","last_message_at":"2025-02-04T10:02:00Z"}
+{"op":"stats","thread_id":"legacy:conversation-alpha","message_count":3,"last_message_at":"2025-02-03T04:08:00Z"}
+{"op":"stats","thread_id":"legacy:conversation-beta","message_count":2,"last_message_at":"2025-02-04T10:02:00Z"}

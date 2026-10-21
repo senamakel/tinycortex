@@ -110,43 +110,95 @@ fn resolve_auth_config_falls_back_to_first_when_no_slug_match() {
     assert_eq!(resolve_auth_config_id(&json!({"items": []}), "gmail"), None);
 }
 
-#[test]
-fn entity_store_round_trips_and_reuses_ids() {
+#[tokio::test]
+async fn entity_store_round_trips_and_reuses_ids() {
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join(".composio-harness.json");
+    let config = crate::memory::chunks::test_support::host_config(dir.path());
 
-    let mut store = EntityStore::load(&path);
-    assert_eq!(store.get("gmail"), None);
+    let store = EntityStore::from_config(&config).unwrap();
+    assert_eq!(store.get("gmail").await.unwrap(), None);
 
     // First resolve for gmail with an explicit override adopts + persists it.
-    let gmail_id = store.entity_id_for("gmail", Some("my-entity")).unwrap();
+    let gmail_id = store
+        .entity_id_for("gmail", Some("my-entity"))
+        .await
+        .unwrap();
     assert_eq!(gmail_id, "my-entity");
 
     // A second toolkit with no override generates a fresh id.
-    let github_id = store.entity_id_for("github", None).unwrap();
+    let github_id = store.entity_id_for("github", None).await.unwrap();
     assert!(github_id.starts_with("tinycortex-"));
     assert_ne!(github_id, gmail_id);
 
-    // Reload from disk: both ids survived and are stable on re-resolve.
-    let mut reloaded = EntityStore::load(&path);
-    assert_eq!(reloaded.get("gmail"), Some("my-entity"));
-    assert_eq!(reloaded.get("github"), Some(github_id.as_str()));
+    // Reopen the adapter over the same host scope: values survive and remain stable.
+    let reloaded = EntityStore::from_config(&config).unwrap();
+    assert_eq!(
+        reloaded.get("gmail").await.unwrap().as_deref(),
+        Some("my-entity")
+    );
+    assert_eq!(
+        reloaded.get("github").await.unwrap().as_deref(),
+        Some(github_id.as_str())
+    );
     // Stored value wins even if a different override is passed on re-run.
     assert_eq!(
-        reloaded.entity_id_for("gmail", Some("different")).unwrap(),
+        reloaded
+            .entity_id_for("gmail", Some("different"))
+            .await
+            .unwrap(),
         "my-entity"
     );
+    assert!(!dir.path().join(".composio-harness.json").exists());
 }
 
-#[test]
-fn entity_store_load_tolerates_missing_and_corrupt_files() {
+#[tokio::test]
+async fn entity_store_missing_toolkit_is_empty() {
     let dir = tempfile::tempdir().unwrap();
-    let missing = dir.path().join("nope.json");
-    assert_eq!(EntityStore::load(&missing).get("gmail"), None);
+    let config = crate::memory::chunks::test_support::host_config(dir.path());
+    let store = EntityStore::from_config(&config).unwrap();
+    assert_eq!(store.get("gmail").await.unwrap(), None);
+}
 
-    let corrupt = dir.path().join("corrupt.json");
-    std::fs::write(&corrupt, "{ not json ").unwrap();
-    assert_eq!(EntityStore::load(&corrupt).get("gmail"), None);
+#[tokio::test]
+async fn entity_store_concurrent_initializers_reuse_the_winning_id() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = crate::memory::chunks::test_support::host_config(dir.path());
+    let left = EntityStore::from_config(&config).unwrap();
+    let right = left.clone();
+    let (left_id, right_id) = tokio::join!(
+        left.entity_id_for("gmail", Some("left")),
+        right.entity_id_for("gmail", Some("right")),
+    );
+    let left_id = left_id.unwrap();
+    let right_id = right_id.unwrap();
+    assert_eq!(left_id, right_id);
+    assert!(matches!(left_id.as_str(), "left" | "right"));
+}
+
+#[tokio::test]
+async fn legacy_entity_import_is_idempotent_and_conflicts_before_any_write() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = crate::memory::chunks::test_support::host_config(dir.path());
+    let store = EntityStore::from_config(&config).unwrap();
+    let entries = vec![
+        ("gmail".to_owned(), "entity@example.test".to_owned()),
+        ("slack".to_owned(), "slack-user".to_owned()),
+    ];
+
+    store.import_legacy_entities(&entries).await.unwrap();
+    store.import_legacy_entities(&entries).await.unwrap();
+    assert_eq!(
+        store.get("gmail").await.unwrap().as_deref(),
+        Some("entity@example.test")
+    );
+
+    store.set("slack", "advanced-slack-user").await.unwrap();
+    let conflicting = vec![
+        ("new-toolkit".to_owned(), "must-not-publish".to_owned()),
+        entries[1].clone(),
+    ];
+    assert!(store.import_legacy_entities(&conflicting).await.is_err());
+    assert_eq!(store.get("new-toolkit").await.unwrap(), None);
 }
 
 #[tokio::test]
