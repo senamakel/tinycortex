@@ -27,7 +27,7 @@ use async_trait::async_trait;
 use serde::de::DeserializeOwned;
 
 use crate::memory::chunks::collections::{
-    BUFFERS, CHUNKS, CHUNK_EMBEDDINGS, CHUNK_LIFECYCLE, CHUNK_REEMBED_SKIPS, ENTITY_EDGES,
+    BUFFERS, CHUNK_EMBEDDINGS, CHUNK_LIFECYCLE, CHUNK_REEMBED_SKIPS, ENTITY_EDGES,
     ENTITY_HOTNESS, ENTITY_INDEX, SCORES, SUMMARIES, SUMMARY_CONTENT_POINTERS, TREES,
 };
 use crate::memory::chunks::versioned::StateChange;
@@ -118,8 +118,6 @@ pub enum ReembedProgress {
 pub enum JobStateCollection {
     /// Per-chunk lifecycle status.
     ChunkLifecycle,
-    /// Immutable chunk versions and current chunk values.
-    Chunks,
     /// Chunk admission and extraction scores.
     ChunkScores,
     /// Tree roots and scope bindings.
@@ -146,7 +144,6 @@ impl JobStateCollection {
     fn name(self) -> &'static str {
         match self {
             Self::ChunkLifecycle => CHUNK_LIFECYCLE,
-            Self::Chunks => CHUNKS,
             Self::ChunkScores => SCORES,
             Self::Trees => TREES,
             Self::Summaries => SUMMARIES,

@@ -1,6 +1,8 @@
 use super::*;
 use crate::memory::chunks::test_support::host_config;
+use crate::memory::chunks::{upsert_chunks, Chunk, Metadata, SourceKind};
 use crate::memory::config::MemoryConfig;
+use chrono::{TimeZone, Utc};
 use tempfile::TempDir;
 
 fn test_config() -> (TempDir, MemoryConfig) {
@@ -44,6 +46,19 @@ fn sample_entity(id: &str) -> CanonicalEntity {
     }
 }
 
+fn sample_chunk(id: &str) -> Chunk {
+    let timestamp = Utc.timestamp_millis_opt(1_700_000_000_000).unwrap();
+    Chunk {
+        id: id.to_owned(),
+        content: "chunk fixture".into(),
+        metadata: Metadata::point_in_time(SourceKind::Chat, "room", "owner", timestamp),
+        token_count: 2,
+        seq_in_source: 0,
+        created_at: timestamp,
+        partial_message: false,
+    }
+}
+
 #[test]
 fn upsert_then_get_score() {
     let (_tmp, cfg) = test_config();
@@ -71,6 +86,7 @@ fn upsert_score_idempotent() {
 async fn queue_score_planner_returns_owner_mutations_without_persisting_them() {
     let (_tmp, cfg) = test_config();
     let row = sample_row("planned-chunk", false);
+    upsert_chunks(&cfg, &[sample_chunk(&row.chunk_id)]).unwrap();
     let result = crate::memory::score::ScoreResult {
         chunk_id: row.chunk_id.clone(),
         total: row.total,
@@ -98,6 +114,34 @@ async fn queue_score_planner_returns_owner_mutations_without_persisting_them() {
         .await
         .unwrap()
         .is_empty());
+}
+
+#[tokio::test]
+async fn queue_score_planner_refuses_missing_or_deleted_chunks() {
+    let (_tmp, cfg) = test_config();
+    let row = sample_row("missing-chunk", false);
+    let result = crate::memory::score::ScoreResult {
+        chunk_id: row.chunk_id.clone(),
+        total: row.total,
+        signals: row.signals.clone(),
+        kept: true,
+        drop_reason: None,
+        extracted: Default::default(),
+        canonical_entities: vec![],
+    };
+    assert!(
+        plan_score_persistence_for_queue(&cfg, &result, 123, Some("source"))
+            .await
+            .is_err()
+    );
+
+    upsert_chunks(&cfg, &[sample_chunk(&row.chunk_id)]).unwrap();
+    crate::memory::chunks::set_chunk_lifecycle_status(&cfg, &row.chunk_id, "deleted").unwrap();
+    assert!(
+        plan_score_persistence_for_queue(&cfg, &result, 123, Some("source"))
+            .await
+            .is_err()
+    );
 }
 
 #[test]

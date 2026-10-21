@@ -10,7 +10,7 @@ use std::collections::{HashMap, HashSet};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
-use crate::memory::chunks::collections::{ENTITY_INDEX, SCORES};
+use crate::memory::chunks::collections::{CHUNK_LIFECYCLE, ENTITY_INDEX, SCORES};
 use crate::memory::chunks::versioned::{self, StateChange};
 use crate::memory::config::MemoryConfig;
 use crate::memory::queue::{JobMutation, JobStateCollection};
@@ -188,6 +188,26 @@ pub async fn plan_score_persistence_for_queue(
     timestamp_ms: i64,
     tree_id: Option<&str>,
 ) -> Result<Vec<JobMutation>> {
+    let chunks = versioned::get_chunks_batch_async(
+        config,
+        std::slice::from_ref(&result.chunk_id),
+    )
+    .await?;
+    anyhow::ensure!(
+        chunks.contains_key(&result.chunk_id),
+        "cannot plan score persistence for missing chunk {}",
+        result.chunk_id
+    );
+    let lifecycle = versioned::read_state_async(config, CHUNK_LIFECYCLE, &result.chunk_id).await?;
+    anyhow::ensure!(
+        lifecycle
+            .as_ref()
+            .and_then(|value| value.get("status"))
+            .and_then(serde_json::Value::as_str)
+            != Some("deleted"),
+        "cannot plan score persistence for deleted chunk {}",
+        result.chunk_id
+    );
     let row = super::score_row(result);
     let staged = stage_score_and_entities_async(
         config,
@@ -202,7 +222,7 @@ pub async fn plan_score_persistence_for_queue(
         staged.expected.len() == staged.changes.len(),
         "score planner produced mismatched preconditions and changes"
     );
-    staged
+    let mut mutations = staged
         .expected
         .into_iter()
         .zip(staged.changes)
@@ -223,7 +243,17 @@ pub async fn plan_score_persistence_for_queue(
                 value: change.value,
             })
         })
-        .collect()
+        .collect::<Result<Vec<_>>>()?;
+    // Persisting the unchanged lifecycle value is a same-head existence guard:
+    // a concurrent deletion cannot let a stale extraction publish score or
+    // entity state after the chunk has been tombstoned.
+    mutations.push(JobMutation {
+        collection: JobStateCollection::ChunkLifecycle,
+        key: result.chunk_id.clone(),
+        expected: lifecycle.clone(),
+        value: lifecycle,
+    });
+    Ok(mutations)
 }
 
 /// Stage summary entities for an owner commit. Summary surfaces are stored as

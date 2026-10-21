@@ -18,7 +18,8 @@ use sha2::{Digest, Sha256};
 use tinystoragedrivers_types::{Filter, Precondition, Query, Sort, Version, WriteOptions};
 
 use super::collections::{
-    CHUNKS, CHUNK_CONTENT_POINTERS, CHUNK_VERSIONS, COMMIT_HEADS, OPERATIONS, STATE_VERSIONS,
+    CHUNKS, CHUNK_CONTENT_POINTERS, CHUNK_LIFECYCLE, CHUNK_VERSIONS, COMMIT_HEADS, OPERATIONS,
+    STATE_VERSIONS,
 };
 use super::types::{Chunk, StagedChunk};
 use crate::memory::config::MemoryConfig;
@@ -94,6 +95,11 @@ struct ChunkVersion {
     operation_id: String,
     revision: u64,
     chunk: Chunk,
+}
+
+struct VisibleOperation {
+    revision: u64,
+    writes: HashSet<(String, String)>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -190,8 +196,13 @@ pub(crate) async fn upsert_chunks_async(config: &MemoryConfig, chunks: &[Chunk])
         return Ok(0);
     }
     for _ in 0..CAS_RETRIES {
-        if commit_if_state_matches_async(config, &[], chunks, &[]).await? {
-            return Ok(chunks.len());
+        let snapshot = capture_head_async(config).await?;
+        let changes =
+            restore_deleted_chunk_lifecycles_async(config, &snapshot, chunks, &[]).await?;
+        match upsert_chunks_at_async(config, &snapshot, chunks, chunks, &changes).await {
+            Ok(_) => return Ok(chunks.len()),
+            Err(error) if is_storage_conflict(&error) => continue,
+            Err(error) => return Err(error),
         }
     }
     anyhow::bail!("chunk version commit did not succeed within the retry budget")
@@ -340,10 +351,12 @@ fn commit_operation(
     let mut last_conflict = None;
     for _ in 0..CAS_RETRIES {
         let snapshot = capture_head(config)?;
-        if is_current_commit_retry(config, &snapshot, &final_chunks, &final_changes)? {
+        let effective_changes =
+            restore_deleted_chunk_lifecycles(config, &snapshot, &final_chunks, &final_changes)?;
+        if is_current_commit_retry(config, &snapshot, &final_chunks, &effective_changes)? {
             return Ok(chunks.len());
         }
-        match upsert_chunks_at(config, &snapshot, chunks, &final_chunks, &final_changes) {
+        match upsert_chunks_at(config, &snapshot, chunks, &final_chunks, &effective_changes) {
             Ok(count) => return Ok(count),
             Err(error) if is_storage_conflict(&error) => last_conflict = Some(error),
             Err(error) => return Err(error),
@@ -352,6 +365,89 @@ fn commit_operation(
     Err(last_conflict.unwrap_or_else(|| {
         anyhow::anyhow!("chunk version commit did not succeed within the retry budget")
     }))
+}
+
+fn restore_deleted_chunk_lifecycles(
+    config: &MemoryConfig,
+    snapshot: &HeadSnapshot,
+    chunks: &[Chunk],
+    changes: &[StateChange],
+) -> Result<Vec<StateChange>> {
+    let documents = config.storage()?.documents().clone();
+    let snapshot = snapshot.clone();
+    let chunks = chunks.to_vec();
+    let mut restored = changes.to_vec();
+    let explicit = changes
+        .iter()
+        .filter(|change| change.collection == CHUNK_LIFECYCLE)
+        .map(|change| change.key.as_str())
+        .collect::<HashSet<_>>();
+    let result = config.storage_blocking()?.run(async move {
+        for chunk in chunks {
+            if explicit.contains(chunk.id.as_str()) {
+                continue;
+            }
+            let lifecycle =
+                read_state_at(&*documents, &snapshot, CHUNK_LIFECYCLE, &chunk.id).await?;
+            if lifecycle
+                .as_ref()
+                .and_then(|value| value.get("status"))
+                .and_then(Value::as_str)
+                == Some("deleted")
+            {
+                restored.push(StateChange {
+                    collection: CHUNK_LIFECYCLE.to_owned(),
+                    key: chunk.id,
+                    value: None,
+                });
+            }
+        }
+        Ok::<_, tinystoragedrivers_types::StorageError>(restored)
+    })?;
+    result.map_err(anyhow::Error::from)
+}
+
+async fn restore_deleted_chunk_lifecycles_async(
+    config: &MemoryConfig,
+    snapshot: &HeadSnapshot,
+    chunks: &[Chunk],
+    changes: &[StateChange],
+) -> Result<Vec<StateChange>> {
+    let documents = config.storage()?.documents().clone();
+    let snapshot = snapshot.clone();
+    let chunks = chunks.to_vec();
+    let mut restored = changes.to_vec();
+    let explicit = changes
+        .iter()
+        .filter(|change| change.collection == CHUNK_LIFECYCLE)
+        .map(|change| change.key.as_str())
+        .collect::<HashSet<_>>();
+    let result = config
+        .storage_blocking()?
+        .run_async(async move {
+            for chunk in chunks {
+                if explicit.contains(chunk.id.as_str()) {
+                    continue;
+                }
+                let lifecycle =
+                    read_state_at(&*documents, &snapshot, CHUNK_LIFECYCLE, &chunk.id).await?;
+                if lifecycle
+                    .as_ref()
+                    .and_then(|value| value.get("status"))
+                    .and_then(Value::as_str)
+                    == Some("deleted")
+                {
+                    restored.push(StateChange {
+                        collection: CHUNK_LIFECYCLE.to_owned(),
+                        key: chunk.id,
+                        value: None,
+                    });
+                }
+            }
+            Ok::<_, tinystoragedrivers_types::StorageError>(restored)
+        })
+        .await?;
+    result.map_err(anyhow::Error::from)
 }
 
 pub(crate) fn write_state_changes(config: &MemoryConfig, changes: &[StateChange]) -> Result<()> {
@@ -696,12 +792,30 @@ pub(crate) fn list_chunk_snapshot(
     config: &MemoryConfig,
     state_collections: &[&str],
 ) -> Result<(Vec<Chunk>, HashMap<String, Vec<(String, Value)>>)> {
+    let (_, chunks, states) = list_chunk_snapshot_with_head(config, state_collections)?;
+    Ok((chunks, states))
+}
+
+/// List chunks and state rows while returning the exact owner head captured
+/// before enumeration. Deletion uses this token to reject phantom inserts.
+pub(crate) fn list_chunk_snapshot_with_head(
+    config: &MemoryConfig,
+    state_collections: &[&str],
+) -> Result<(
+    HeadSnapshot,
+    Vec<Chunk>,
+    HashMap<String, Vec<(String, Value)>>,
+)> {
     let snapshot = capture_head(config)?;
+    let return_snapshot = snapshot.clone();
     let documents = config.storage()?.documents().clone();
-    let state_collections = state_collections
+    let mut state_collections = state_collections
         .iter()
         .map(|collection| (*collection).to_owned())
         .collect::<Vec<_>>();
+    if !state_collections.iter().any(|name| name == CHUNK_LIFECYCLE) {
+        state_collections.push(CHUNK_LIFECYCLE.to_owned());
+    }
     config
         .storage_blocking()?
         .run(async move {
@@ -731,13 +845,13 @@ pub(crate) fn list_chunk_snapshot(
                         // chunk value.
                         continue;
                     }
-                    let Some(manifest) = visible.get(&version.operation_id) else {
+                    let Some(operation) = visible.get(&version.operation_id) else {
                         continue;
                     };
-                    if manifest.revision != version.revision
-                        || !manifest.writes.iter().any(|write| {
-                            write.logical_id == version.logical_id && write.version_id == record.id
-                        })
+                    if operation.revision != version.revision
+                        || !operation
+                            .writes
+                            .contains(&(version.logical_id.clone(), record.id.clone()))
                     {
                         continue;
                     }
@@ -774,9 +888,10 @@ pub(crate) fn list_chunk_snapshot(
                 if let Some((_, chunk)) = latest.remove(&id) {
                     chunks.push(chunk);
                 } else if let Some(value) = legacy.remove(&id) {
-                    chunks.push(serde_json::from_value(value).map_err(
-                        tinystoragedrivers_types::StorageError::from,
-                    )?);
+                    chunks.push(
+                        serde_json::from_value(value)
+                            .map_err(tinystoragedrivers_types::StorageError::from)?,
+                    );
                 }
             }
             let mut states = HashMap::new();
@@ -814,9 +929,138 @@ pub(crate) fn list_chunk_snapshot(
                 }
                 states.insert(collection, values);
             }
+            let deleted_ids: HashSet<String> = states
+                .get(CHUNK_LIFECYCLE)
+                .into_iter()
+                .flatten()
+                .filter_map(|(key, value)| {
+                    (value.get("status").and_then(Value::as_str) == Some("deleted"))
+                        .then(|| key.clone())
+                })
+                .collect();
+            chunks.retain(|chunk| !deleted_ids.contains(&chunk.id));
             Ok::<_, tinystoragedrivers_types::StorageError>((chunks, states))
         })?
+        .map(|(chunks, states)| (return_snapshot, chunks, states))
         .map_err(anyhow::Error::from)
+}
+
+/// Async materialization of a chunk and state snapshot for current-thread
+/// Tokio callers. The returned head is the strict precondition for a later
+/// multi-record delete or cascade.
+pub(crate) async fn list_chunk_snapshot_with_head_async(
+    config: &MemoryConfig,
+    requested_state: &[&str],
+) -> Result<(
+    HeadSnapshot,
+    Vec<Chunk>,
+    HashMap<String, Vec<(String, Value)>>,
+)> {
+    let snapshot = capture_head_async(config).await?;
+    let documents = config.storage()?.documents().clone();
+    let mut state_collections = requested_state
+        .iter()
+        .map(|collection| (*collection).to_owned())
+        .collect::<Vec<_>>();
+    if !state_collections.iter().any(|name| name == CHUNK_LIFECYCLE) {
+        state_collections.push(CHUNK_LIFECYCLE.to_owned());
+    }
+    let read_snapshot = snapshot.clone();
+    let (mut chunks, mut states) = config
+        .storage_blocking()?
+        .run_async(async move {
+            let manifests = load_operation_manifests(&*documents).await?;
+            let visible = visible_operations_at_snapshot(&read_snapshot, &manifests)?;
+            let mut latest = HashMap::<String, (u64, Chunk)>::new();
+            let mut query = Query::all().limit(PAGE_SIZE);
+            loop {
+                let page = documents.query(CHUNK_VERSIONS, &query).await?;
+                for record in page.items {
+                    if record.meta.schema != RECORD_SCHEMA || record.meta.expires_ms.is_some() {
+                        return Err(tinystoragedrivers_types::StorageError::backend(
+                            "chunk version has unexpected schema or expiry metadata",
+                        ));
+                    }
+                    let version: ChunkVersion = serde_json::from_value(record.doc)
+                        .map_err(tinystoragedrivers_types::StorageError::from)?;
+                    if version.chunk.id != version.logical_id
+                        || version_id(&version.logical_id, &version.operation_id) != record.id
+                    {
+                        continue;
+                    }
+                    let Some(operation) = visible.get(&version.operation_id) else {
+                        continue;
+                    };
+                    if operation.revision != version.revision
+                        || !operation
+                            .writes
+                            .contains(&(version.logical_id.clone(), record.id.clone()))
+                    {
+                        continue;
+                    }
+                    if latest
+                        .get(&version.logical_id)
+                        .is_none_or(|(revision, _)| version.revision > *revision)
+                    {
+                        latest.insert(version.logical_id, (version.revision, version.chunk));
+                    }
+                }
+                match page.next {
+                    Some(cursor) => query = query.clone().after(cursor),
+                    None => break,
+                }
+            }
+            let mut legacy = HashMap::new();
+            let mut query = Query::all().limit(PAGE_SIZE);
+            loop {
+                let page = documents.query(CHUNKS, &query).await?;
+                for record in page.items {
+                    legacy.insert(record.id, record.doc);
+                }
+                match page.next {
+                    Some(cursor) => query = query.clone().after(cursor),
+                    None => break,
+                }
+            }
+            let mut ids = HashSet::new();
+            ids.extend(latest.keys().cloned());
+            ids.extend(legacy.keys().cloned());
+            let mut chunks = Vec::with_capacity(ids.len());
+            for id in ids {
+                if let Some((_, chunk)) = latest.remove(&id) {
+                    chunks.push(chunk);
+                } else if let Some(value) = legacy.remove(&id) {
+                    chunks.push(
+                        serde_json::from_value(value)
+                            .map_err(tinystoragedrivers_types::StorageError::from)?,
+                    );
+                }
+            }
+            let mut states = HashMap::new();
+            for collection in state_collections {
+                states.insert(collection.clone(), Vec::new());
+            }
+            Ok::<_, tinystoragedrivers_types::StorageError>((chunks, states))
+        })
+        .await??;
+    for collection in requested_state.iter().copied().chain([CHUNK_LIFECYCLE]) {
+        if states.contains_key(collection) {
+            states.insert(
+                collection.to_owned(),
+                list_state_at_snapshot_async(config, &snapshot, collection).await?,
+            );
+        }
+    }
+    let deleted: HashSet<String> = states
+        .get(CHUNK_LIFECYCLE)
+        .into_iter()
+        .flatten()
+        .filter_map(|(key, value)| {
+            (value.get("status").and_then(Value::as_str) == Some("deleted")).then(|| key.clone())
+        })
+        .collect();
+    chunks.retain(|chunk| !deleted.contains(&chunk.id));
+    Ok((snapshot, chunks, states))
 }
 
 /// Async batch read for async host workflows, preserving current-thread runtimes.
@@ -874,6 +1118,19 @@ async fn read_chunk_at(
     snapshot: &HeadSnapshot,
     logical_id: &str,
 ) -> tinystoragedrivers_types::Result<Option<Chunk>> {
+    if read_state_at(documents, snapshot, CHUNK_LIFECYCLE, logical_id)
+        .await?
+        .and_then(|value| {
+            value
+                .get("status")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+        .as_deref()
+        == Some("deleted")
+    {
+        return Ok(None);
+    }
     let mut query = Query::filter(Filter::eq("logical_id", logical_id))
         .sort(Sort::desc("revision"))
         .limit(PAGE_SIZE);
@@ -1187,6 +1444,43 @@ pub(crate) async fn commit_if_state_matches_at_snapshot_async(
     }
 }
 
+/// Synchronous counterpart for deletion APIs that enumerate through a
+/// blocking host store and must reject phantom rows before committing.
+pub(crate) fn commit_if_state_matches_at_snapshot(
+    config: &MemoryConfig,
+    snapshot: &HeadSnapshot,
+    expected: &[StateChange],
+    changes: &[StateChange],
+) -> Result<bool> {
+    let documents = config.storage()?.documents().clone();
+    let conditions = expected.to_vec();
+    let read_snapshot = snapshot.clone();
+    let matches = config.storage_blocking()?.run(async move {
+        for condition in conditions {
+            if read_state_at(
+                &*documents,
+                &read_snapshot,
+                &condition.collection,
+                &condition.key,
+            )
+            .await?
+                != condition.value
+            {
+                return Ok::<_, tinystoragedrivers_types::StorageError>(false);
+            }
+        }
+        Ok(true)
+    })??;
+    if !matches || capture_head(config)? != *snapshot {
+        return Ok(false);
+    }
+    match upsert_chunks_at(config, snapshot, &[], &[], changes) {
+        Ok(_) => Ok(true),
+        Err(error) if is_storage_conflict(&error) => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
 pub(crate) fn insert_state_changes_if_absent(
     config: &MemoryConfig,
     changes: &[StateChange],
@@ -1414,7 +1708,7 @@ async fn load_operation_manifests(
 fn visible_operations_at_snapshot(
     snapshot: &HeadSnapshot,
     manifests: &HashMap<String, OperationManifest>,
-) -> tinystoragedrivers_types::Result<HashMap<String, OperationManifest>> {
+) -> tinystoragedrivers_types::Result<HashMap<String, VisibleOperation>> {
     let mut visible = HashMap::new();
     let (Some(head_id), Some(_)) = (snapshot.op_id.as_deref(), snapshot.version.as_ref()) else {
         return Ok(visible);
@@ -1472,7 +1766,20 @@ fn visible_operations_at_snapshot(
             }
         }
     }
-    visible.extend(chain);
+    visible.extend(chain.into_iter().map(|(id, manifest)| {
+        let writes = manifest
+            .writes
+            .into_iter()
+            .map(|write| (write.logical_id, write.version_id))
+            .collect();
+        (
+            id,
+            VisibleOperation {
+                revision: manifest.revision,
+                writes,
+            },
+        )
+    }));
     Ok(visible)
 }
 

@@ -128,10 +128,10 @@ pub struct TreeCascadeDeletion {
 /// Captured tree cascade. The owner snapshot prevents phantom summaries or
 /// buffers created after enumeration from surviving a successful deletion.
 pub(crate) struct StagedTreeCascadeDeletion {
-    snapshot: crate::memory::chunks::versioned::HeadSnapshot,
-    expected: Vec<crate::memory::chunks::versioned::StateChange>,
-    changes: Vec<crate::memory::chunks::versioned::StateChange>,
-    result: TreeCascadeDeletion,
+    pub(crate) snapshot: crate::memory::chunks::versioned::HeadSnapshot,
+    pub(crate) expected: Vec<crate::memory::chunks::versioned::StateChange>,
+    pub(crate) changes: Vec<crate::memory::chunks::versioned::StateChange>,
+    pub(crate) result: TreeCascadeDeletion,
 }
 
 /// Delete a tree and every tree-owned record in one strict owner-head commit.
