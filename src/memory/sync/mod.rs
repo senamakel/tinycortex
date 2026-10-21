@@ -26,7 +26,7 @@ pub use composio::{
 pub use dispatcher::{SyncDispatcher, SyncRunResult};
 pub use github::GithubRepoSyncPipeline;
 pub use periodic::{due_workspace_sources, effective_interval_secs, DEFAULT_SYNC_INTERVAL_SECS};
-pub use persist::{KvSkillDocSink, SKILLDOC_NS_PREFIX, SKILL_DOCS_DB};
+pub use persist::{KvSkillDocSink, SKILLDOC_NS_PREFIX};
 pub use rebuild::{
     needs_rebuild, raw_coverage, rebuild_tree_from_raw, rebuild_tree_from_raw_with_audit,
     RawCoverage, RawFileRef, RebuildOutcome,

@@ -1,5 +1,5 @@
 ---
-description: The bottom of the TinyCortex stack — immutable markdown content as source of truth, plus rebuildable SQLite-backed vector, KV, and entity-occurrence indexes.
+description: The bottom of the TinyCortex stack — immutable markdown content as source of truth, plus host-backed vector, KV, and entity-occurrence indexes.
 ---
 
 # Storage Primitives
@@ -20,7 +20,7 @@ This page covers the primitives that live under `src/memory/store/`:
 |---|---|---|
 | Markdown content store | `store/content/` | `.md` files on disk |
 | Local vector DB | `store/vectors/` | SQLite `vectors` table (packed `f32` BLOBs) |
-| KV store + safety guard | `store/kv.rs`, `store/safety.rs` | SQLite `kv_global` / `kv_namespace` |
+| KV store + safety guard | `store/kv.rs`, `store/safety.rs` | Host `KvStore` port; logical identities are scoped and encoded under the TinyCortex prefix |
 | Entity-occurrence index | `store/entity_index/` | SQLite `mem_tree_entity_index` |
 
 The public re-exports live in `src/memory/store/mod.rs`.
