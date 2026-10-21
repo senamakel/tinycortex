@@ -24,10 +24,12 @@ use crate::memory::queue::ops::set_backfill_in_progress;
 #[cfg(test)]
 use crate::memory::queue::store::claim_next;
 use crate::memory::queue::store::purge_retired_jobs;
-use crate::memory::queue::store_settle::{mark_failed_typed, recover_stale_locks};
-use crate::memory::queue::types::{
-    Job, JobFailure, JobKind, JobOutcome, JobStatus, NewJob, SealPayload,
-};
+#[cfg(test)]
+use crate::memory::queue::store_settle::mark_failed_typed;
+use crate::memory::queue::store_settle::recover_stale_locks;
+use crate::memory::queue::types::{Job, JobFailure, JobKind, JobOutcome, JobStatus};
+#[cfg(test)]
+use crate::memory::queue::types::{NewJob, SealPayload};
 
 /// Process-wide LLM concurrency gate. Single-slot by default (mirrors the
 /// upstream single-permit semaphore); LLM-bound jobs hold a permit for the
