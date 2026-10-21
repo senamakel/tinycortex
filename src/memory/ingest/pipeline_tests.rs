@@ -327,8 +327,7 @@ async fn failed_queue_hint_publication_keeps_committed_intent_recoverable() {
     ))
     .unwrap());
     let read_cfg = cfg.clone();
-    let persisted_chunks = on_plain_thread(move || count_chunks(&read_cfg))
-        .unwrap() as usize;
+    let persisted_chunks = on_plain_thread(move || count_chunks(&read_cfg)).unwrap() as usize;
     assert!(persisted_chunks > 0, "the committed source has chunks");
     assert_eq!(
         super::dispatch_pending_extract_jobs_async(&cfg, &NullJobSink)

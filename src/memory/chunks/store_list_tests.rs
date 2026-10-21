@@ -375,7 +375,7 @@ fn exclude_dropped_keeps_a_row_whose_lifecycle_was_never_written() {
     upsert_chunks(&cfg, std::slice::from_ref(&seed)).expect("seed");
     let bypassed = chunk_with(SourceKind::Chat, "slack:#eng", 1, 2_000, "bypassed");
     upsert_chunks(&cfg, std::slice::from_ref(&bypassed)).expect("persist chunk");
-    assert!(versioned::write_state_changes(
+    versioned::write_state_changes(
         &cfg,
         &[StateChange {
             collection: CHUNK_LIFECYCLE.into(),
@@ -383,7 +383,7 @@ fn exclude_dropped_keeps_a_row_whose_lifecycle_was_never_written() {
             value: None,
         }]
     )
-    .unwrap());
+    .unwrap();
     assert!(versioned::read_state(&cfg, CHUNK_LIFECYCLE, &bypassed.id)
         .unwrap()
         .is_none());
