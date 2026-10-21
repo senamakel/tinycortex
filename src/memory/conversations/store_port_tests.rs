@@ -111,3 +111,176 @@ async fn current_thread_async_conversation_operations_do_not_block_on_storage_br
     store.ensure_thread_async(request).await.unwrap();
     assert_eq!(store.list_threads_async().await.unwrap().len(), 1);
 }
+
+#[tokio::test]
+async fn concurrent_appends_preserve_every_message_and_thread_count() {
+    let workspace = tempfile::tempdir().unwrap();
+    let config = crate::memory::chunks::test_support::host_config(workspace.path());
+    let store = ConversationStore::open(&config).unwrap();
+    store
+        .ensure_thread_async(CreateConversationThread {
+            id: "concurrent-appends".into(),
+            title: "Concurrent appends".into(),
+            created_at: "2025-02-03T04:05:06Z".into(),
+            parent_thread_id: None,
+            labels: None,
+            personality_id: None,
+        })
+        .await
+        .unwrap();
+
+    let tasks = (0..100)
+        .map(|index| {
+        let store = store.clone();
+        tokio::spawn(async move {
+            store
+                .append_message_async(
+                    "concurrent-appends",
+                    ConversationMessage {
+                        id: format!("user:{index}"),
+                        content: format!("message {index}"),
+                        message_type: "text".into(),
+                        extra_metadata: serde_json::json!({}),
+                        sender: "user".into(),
+                        created_at: format!("2025-02-03T04:{:02}:00Z", index % 60),
+                    },
+                )
+                .await
+        })
+        })
+        .collect::<Vec<_>>();
+    for task in tasks {
+        task.await.unwrap().unwrap();
+    }
+
+    let messages = store
+        .get_messages_async("concurrent-appends")
+        .await
+        .unwrap();
+    assert_eq!(messages.len(), 100);
+    let thread = store.list_threads_async().await.unwrap().remove(0);
+    assert_eq!(thread.message_count, 100);
+    assert_eq!(thread.last_message_at, messages.last().unwrap().created_at);
+}
+
+#[tokio::test]
+async fn updates_truncation_delete_recreate_and_purge_preserve_logical_transcript_semantics() {
+    let workspace = tempfile::tempdir().unwrap();
+    let config = crate::memory::chunks::test_support::host_config(workspace.path());
+    let store = ConversationStore::open(&config).unwrap();
+    let created = store
+        .ensure_thread_async(CreateConversationThread {
+            id: "lifecycle".into(),
+            title: "Initial".into(),
+            created_at: "2025-02-03T04:05:06Z".into(),
+            parent_thread_id: Some("parent".into()),
+            labels: Some(vec!["work".into(), "general".into()]),
+            personality_id: Some("persona".into()),
+        })
+        .await
+        .unwrap();
+    assert_eq!(created.labels, vec!["general"]);
+    assert_eq!(created.parent_thread_id.as_deref(), Some("parent"));
+    assert_eq!(created.personality_id.as_deref(), Some("persona"));
+
+    let renamed = store
+        .update_thread_title_async("lifecycle", "Renamed", "2025-02-03T04:06:00Z")
+        .await
+        .unwrap();
+    assert_eq!(renamed.title, "Renamed");
+    assert_eq!(renamed.created_at, created.created_at);
+    let relabelled = store
+        .update_thread_labels_async(
+            "lifecycle",
+            vec!["agent-task".into(), "tasks".into()],
+            "2025-02-03T04:07:00Z",
+        )
+        .await
+        .unwrap();
+    assert_eq!(relabelled.labels, vec!["tasks"]);
+    assert_eq!(relabelled.parent_thread_id.as_deref(), Some("parent"));
+
+    for (id, created_at) in [
+        ("m1", "2025-02-03T04:08:00Z"),
+        ("m2", "2025-02-03T04:09:00Z"),
+        ("m3", "2025-02-03T04:10:00Z"),
+    ] {
+        store
+            .append_message_async(
+                "lifecycle",
+                ConversationMessage {
+                    id: id.into(),
+                    content: format!("body {id}"),
+                    message_type: "text".into(),
+                    extra_metadata: serde_json::json!({}),
+                    sender: "user".into(),
+                    created_at: created_at.into(),
+                },
+            )
+            .await
+            .unwrap();
+    }
+    let updated = store
+        .update_message_async(
+            "lifecycle",
+            "m2",
+            ConversationMessagePatch {
+                extra_metadata: Some(serde_json::json!({"reaction": "👍"})),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(updated.extra_metadata, serde_json::json!({"reaction": "👍"}));
+    assert_eq!(
+        store
+            .delete_messages_from_async("lifecycle", "m2")
+            .await
+            .unwrap(),
+        Some(2)
+    );
+    let retained = store.get_messages_async("lifecycle").await.unwrap();
+    assert_eq!(retained.len(), 1);
+    assert_eq!(retained[0].id, "m1");
+    assert_eq!(
+        store.list_threads_async().await.unwrap()[0].last_message_at,
+        "2025-02-03T04:08:00Z"
+    );
+
+    assert!(store
+        .delete_thread_async("lifecycle", "2025-02-03T04:11:00Z")
+        .await
+        .unwrap());
+    assert!(!store
+        .delete_thread_async("lifecycle", "2025-02-03T04:12:00Z")
+        .await
+        .unwrap());
+    assert!(store.get_messages_async("lifecycle").await.unwrap().is_empty());
+    store
+        .ensure_thread_async(CreateConversationThread {
+            id: "lifecycle".into(),
+            title: "Recreated".into(),
+            created_at: "2025-02-03T04:13:00Z".into(),
+            parent_thread_id: None,
+            labels: None,
+            personality_id: None,
+        })
+        .await
+        .unwrap();
+    assert!(store.get_messages_async("lifecycle").await.unwrap().is_empty());
+
+    store
+        .ensure_thread_async(CreateConversationThread {
+            id: "another".into(),
+            title: "Another".into(),
+            created_at: "2025-02-03T04:14:00Z".into(),
+            parent_thread_id: None,
+            labels: None,
+            personality_id: None,
+        })
+        .await
+        .unwrap();
+    let purged = store.purge_threads_async().await.unwrap();
+    assert_eq!(purged.thread_count, 2);
+    assert_eq!(purged.message_count, 0);
+    assert!(store.list_threads_async().await.unwrap().is_empty());
+}

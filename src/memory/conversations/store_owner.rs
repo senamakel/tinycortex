@@ -647,7 +647,7 @@ impl ConversationStore {
         thread_id: &str,
         deleted_at: &str,
     ) -> Result<bool, String> {
-        for _ in 0..8 {
+        for _ in 0..MAX_WRITE_ATTEMPTS {
             let before = self.snapshot(thread_id).await?;
             if before.thread.is_none() {
                 return Ok(false);
