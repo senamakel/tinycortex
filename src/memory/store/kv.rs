@@ -325,7 +325,7 @@ impl KvStore {
                     None => (EntryKind::Global, None),
                 };
                 let expected_key = Self::storage_key(expected_kind, expected_namespace, &entry.key);
-                if record.id != expected_key
+                if row.id != expected_key
                     || entry.kind != expected_kind
                     || entry.namespace.as_deref() != expected_namespace
                 {
@@ -654,8 +654,8 @@ impl KvStore {
                 .list(&format!("{KEY_PREFIX}n:"), cursor, PAGE_SIZE)
                 .await
                 .map_err(|error| format!("list namespaced KV entries: {error}"))?;
-            for record in page.items {
-                let entry: Entry = serde_json::from_value(record.doc)
+            for row in page.items {
+                let entry: Entry = serde_json::from_value(row.doc)
                     .map_err(|error| format!("decode listed KV entry: {error}"))?;
                 let namespace = entry
                     .namespace

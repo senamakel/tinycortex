@@ -9,7 +9,8 @@ use tinystoragedrivers_api::Storage;
 
 use crate::memory::chunks::{self, Chunk, ListChunksQuery};
 use crate::memory::config::MemoryConfig;
-use crate::memory::store::{KvStore, MemoryKvRecord};
+use crate::memory::store::KvStore;
+use crate::memory::types::MemoryKvRecord;
 use crate::memory::tree::store::{self, SummaryNode, Tree, TreeKind};
 
 /// Typed data needed by the standalone viewer, collected through owner APIs.
