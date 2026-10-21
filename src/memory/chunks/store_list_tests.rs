@@ -330,7 +330,7 @@ fn chunk_details_report_stored_facts_without_reading_the_vault() {
     let inline_row = &details[1];
     assert_eq!(inline_row.chunk.id, inline.id);
     assert_eq!(inline_row.content_path, None);
-    assert_eq!(inline_row.lifecycle_status.as_deref(), Some("admitted"));
+    assert_eq!(inline_row.lifecycle_status, None);
     assert!(!inline_row.has_embedding);
 }
 
