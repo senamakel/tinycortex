@@ -34,15 +34,18 @@ example into it, and run the example with an empty output directory:
 ```sh
 repo_root=$(git rev-parse --show-toplevel)
 source_tag=72ce1d176aa3dc3a9ece14b9e61ecef9a8ae6b53
-git_dir=$(mktemp -d)
-archive=$(mktemp -d)
-fixture_out=$(mktemp -d)
+run_id=$(date -u +%Y%m%dT%H%M%SZ)
+run_root="$repo_root/.epic-repositories/legacy-v013-state-runs/$run_id"
+git_dir="$run_root/git"
+archive="$run_root/source"
+fixture_out="$run_root/output"
+mkdir -p "$run_root" "$archive" "$fixture_out" "$archive/target/compiler-scratch"
 git clone --no-checkout https://github.com/senamakel/tinycortex.git "$git_dir"
 git -C "$git_dir" fetch --depth=1 origin "$source_tag"
 git -C "$git_dir" archive "$source_tag" | tar -x -C "$archive"
 cp "$repo_root/tests/fixtures/legacy-v0.1.3-state-public-writer/write_legacy_state_fixture.rs" "$archive/examples/"
 cd "$archive"
-cargo run --locked --manifest-path "$archive/Cargo.toml" --example write_legacy_state_fixture -- "$fixture_out"
+TMPDIR="$archive/target/compiler-scratch" CFLAGS=-pipe cargo run --locked --manifest-path "$archive/Cargo.toml" --example write_legacy_state_fixture -- "$fixture_out"
 ```
 
 The successful recorded run used the same pinned source and example with

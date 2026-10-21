@@ -3,7 +3,7 @@ use super::*;
 #[test]
 fn coverage_is_incremental_and_ignores_source_metadata() {
     let temp = tempfile::tempdir().unwrap();
-    let mut config = MemoryConfig::new(temp.path());
+    let mut config = crate::memory::chunks::test_support::host_config(temp.path());
     let custom_root = temp.path().join("custom-content");
     config.content_root = Some(custom_root.clone());
     let root = custom_root.join("raw/github-com-org-repo/issues");
@@ -29,7 +29,7 @@ fn coverage_is_incremental_and_ignores_source_metadata() {
 #[tokio::test]
 async fn rebuild_ingests_l1_summaries_marks_coverage_and_is_idempotent() {
     let temp = tempfile::tempdir().unwrap();
-    let mut config = MemoryConfig::new(temp.path());
+    let mut config = crate::memory::chunks::test_support::host_config(temp.path());
     config.tree.input_token_budget = 2;
     let root = config
         .workspace
@@ -48,17 +48,31 @@ async fn rebuild_ingests_l1_summaries_marks_coverage_and_is_idempotent() {
     .unwrap();
     assert_eq!(first.files_read, 2);
     assert_eq!(first.batches, 2);
-    assert!(!needs_rebuild(
-        &config,
-        "github:org/repo",
-        "github.com/org/repo"
-    ));
-    assert_eq!(crate::memory::chunks::count_chunks(&config).unwrap(), 0);
-    let tree = TreeFactory::source("github:org/repo")
-        .get_or_create(&config)
-        .unwrap();
+    let coverage_config = config.clone();
+    assert!(!std::thread::spawn(move || {
+        needs_rebuild(&coverage_config, "github:org/repo", "github.com/org/repo")
+    })
+    .join()
+    .unwrap());
+    let count_config = config.clone();
     assert_eq!(
-        list_summaries_at_level(&config, &tree.id, 1).unwrap().len(),
+        std::thread::spawn(move || crate::memory::chunks::count_chunks(&count_config).unwrap())
+            .join()
+            .unwrap(),
+        0
+    );
+    let tree = crate::memory::tree::get_or_create_tree_async(
+        &config,
+        crate::memory::tree::TreeKind::Source,
+        "github:org/repo",
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        list_summaries_at_level_async(&config, &tree.id, 1)
+            .await
+            .unwrap()
+            .len(),
         2
     );
 
@@ -72,7 +86,10 @@ async fn rebuild_ingests_l1_summaries_marks_coverage_and_is_idempotent() {
     .unwrap();
     assert_eq!(second, RebuildOutcome::default());
     assert_eq!(
-        list_summaries_at_level(&config, &tree.id, 1).unwrap().len(),
+        list_summaries_at_level_async(&config, &tree.id, 1)
+            .await
+            .unwrap()
+            .len(),
         2
     );
 }

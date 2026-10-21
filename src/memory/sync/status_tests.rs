@@ -31,7 +31,7 @@ fn chunk(id: &str, source_id: &str, created_ms: i64) -> Chunk {
 #[test]
 fn status_groups_provider_and_tracks_active_wave_resolution() {
     let temp = tempfile::tempdir().unwrap();
-    let config = MemoryConfig::new(temp.path());
+    let config = crate::memory::chunks::test_support::host_config(temp.path());
     let now = 1_777_000_000_000i64;
     upsert_chunks(
         &config,

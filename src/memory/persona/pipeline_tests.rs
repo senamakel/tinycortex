@@ -6,6 +6,7 @@ use async_trait::async_trait;
 use std::io::Write;
 use tempfile::TempDir;
 
+use crate::memory::chunks::test_support::host_config;
 use crate::memory::config::MemoryConfig;
 use crate::memory::persona::config::PersonaConfig;
 use crate::memory::persona::state::FileStateStore;
@@ -134,7 +135,7 @@ fn setup() -> (TempDir, TempDir, MemoryConfig, PersonaConfig) {
     )
     .unwrap();
 
-    let cfg = MemoryConfig::new(ws.path());
+    let cfg = host_config(ws.path());
     let mut persona = PersonaConfig::with_home(src.path(), "me@example.com");
     persona.claude_code_root = Some(src.path().join("claude/projects"));
     persona.codex_root = None;
@@ -433,7 +434,7 @@ async fn fully_lost_session_commits_when_the_run_yields_observations() {
     )
     .unwrap();
 
-    let cfg = MemoryConfig::new(ws.path());
+    let cfg = host_config(ws.path());
     let mut persona = PersonaConfig::with_home(src.path(), "me@example.com");
     persona.claude_code_root = Some(src.path().join("claude/projects"));
     persona.codex_root = None;

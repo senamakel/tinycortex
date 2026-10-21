@@ -4,7 +4,7 @@ use super::*;
 use chrono::Utc;
 use tempfile::TempDir;
 
-use crate::memory::config::MemoryConfig;
+use crate::memory::chunks::test_support::host_config;
 use crate::memory::persona::reduce::{fold_digest, FacetAsks, ReduceState};
 use crate::memory::persona::types::{
     DigestObservation, EvidenceSource, PersonaSourceKind, SessionDigest,
@@ -142,7 +142,7 @@ fn empty_query_or_corpus_yields_nothing() {
 #[tokio::test]
 async fn loads_from_a_real_persona_workspace() {
     let tmp = TempDir::new().unwrap();
-    let config = MemoryConfig::new(tmp.path());
+    let config = host_config(tmp.path());
     let summariser = ConcatSummariser::new();
     let mut state = ReduceState::default();
 
