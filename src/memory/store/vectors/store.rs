@@ -264,7 +264,6 @@ impl VectorStore {
                 usize::try_from(removed).context("vector count did not fit in usize")
             })
             .map_err(anyhow::Error::from)?
-            .map_err(anyhow::Error::from)
     }
 
     /// Returns the number of vectors in one namespace (or all namespaces).
@@ -279,7 +278,6 @@ impl VectorStore {
                 usize::try_from(count).context("vector count did not fit in usize")
             })
             .map_err(anyhow::Error::from)?
-            .map_err(anyhow::Error::from)
     }
 
     /// Lists namespaces in lexical order.

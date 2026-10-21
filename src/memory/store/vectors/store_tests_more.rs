@@ -30,17 +30,16 @@ fn search_by_vector_preserves_metadata() {
 #[test]
 fn search_handles_invalid_metadata_json() {
     let store = fake_store(2);
-    store
-        .insert_with_vector("bad", "ns", "text", &[1.0, 0.0], json!({}))
-        .unwrap();
-    {
-        let conn = store.conn.lock();
-        conn.execute(
-            "UPDATE vectors SET metadata = 'not-json' WHERE id = 'bad' AND namespace = 'ns'",
-            [],
-        )
-        .unwrap();
-    }
+    put_raw_record(
+        &store,
+        "ns",
+        "bad",
+        json!({
+            "namespace": "ns", "id": "bad", "text": "text", "dimensions": 2,
+            "embedding_le": vec_to_bytes(&[1.0, 0.0]), "metadata_json": "not-json",
+            "created_at": 0.0, "updated_at": 0.0
+        }),
+    );
     let results = store.search_by_vector("ns", &[1.0, 0.0], 1).unwrap();
     assert_eq!(results[0].id, "bad");
     assert!(results[0].metadata.is_null());

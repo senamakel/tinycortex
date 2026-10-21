@@ -12,14 +12,17 @@ async fn storage_preparation_requires_host_supplied_ports() {
 }
 
 #[tokio::test]
-async fn storage_preparation_installs_chunk_collection_declarations() {
+async fn storage_preparation_installs_memory_collection_declarations() {
     let scope = tinystoragedrivers_types::Scope::new("test:chunk-preparation").unwrap();
     let storage = tinystoragedrivers_testkit::memory_storage(&scope);
     let config = MemoryConfig::open_with_storage("workspace", storage)
         .await
         .unwrap();
 
-    for spec in crate::memory::chunks::collections() {
+    for spec in crate::memory::chunks::collections()
+        .into_iter()
+        .chain(crate::memory::store::vectors::collections())
+    {
         config
             .storage()
             .unwrap()
