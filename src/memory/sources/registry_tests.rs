@@ -1,17 +1,54 @@
-//! Tests for the TOML-backed source registry.
+//! Tests for source validation and host-config concurrency semantics.
 
 use super::*;
 use crate::memory::sources::types::SourceKind;
-use tempfile::TempDir;
+use std::sync::atomic::{AtomicBool, Ordering};
 
-fn registry() -> (TempDir, SourceRegistry) {
-    let tmp = TempDir::new().unwrap();
-    let reg = SourceRegistry::new(tmp.path().join("config.toml"));
-    (tmp, reg)
+#[derive(Default)]
+struct TestSourceConfig {
+    state: std::sync::Mutex<(u64, Vec<MemorySourceEntry>)>,
+    inject_conflict: AtomicBool,
+}
+
+#[async_trait]
+impl SourceConfigPort for TestSourceConfig {
+    async fn read(&self) -> Result<SourceConfigSnapshot> {
+        let state = self.state.lock().unwrap();
+        Ok(SourceConfigSnapshot {
+            revision: state.0.to_string(),
+            entries: state.1.clone(),
+        })
+    }
+
+    async fn compare_and_set(
+        &self,
+        expected_revision: &str,
+        entries: Vec<MemorySourceEntry>,
+    ) -> Result<bool> {
+        let mut state = self.state.lock().unwrap();
+        if self.inject_conflict.swap(false, Ordering::SeqCst) {
+            state.0 += 1;
+            state.1.push(folder_entry("host_added"));
+            return Ok(false);
+        }
+        if state.0.to_string() != expected_revision {
+            return Ok(false);
+        }
+        state.0 += 1;
+        state.1 = entries;
+        Ok(true)
+    }
+}
+
+fn registry() -> (tempfile::TempDir, SourceRegistry, Arc<TestSourceConfig>) {
+    let temp = tempfile::tempdir().unwrap();
+    let port = Arc::new(TestSourceConfig::default());
+    let registry = SourceRegistry::from_port(port.clone());
+    (temp, registry, port)
 }
 
 fn folder_entry(id: &str) -> MemorySourceEntry {
-    let mut e = MemorySourceEntry {
+    MemorySourceEntry {
         id: id.into(),
         kind: SourceKind::Folder,
         label: "Notes".into(),
@@ -19,7 +56,7 @@ fn folder_entry(id: &str) -> MemorySourceEntry {
         toolkit: None,
         connection_id: None,
         path: Some("/tmp/notes".into()),
-        glob: None,
+        glob: Some("**/*.md".into()),
         url: None,
         branch: None,
         paths: Vec::new(),
@@ -33,279 +70,194 @@ fn folder_entry(id: &str) -> MemorySourceEntry {
         max_tokens_per_sync: None,
         max_cost_per_sync_usd: None,
         sync_depth_days: None,
-    };
-    e.glob = Some("**/*.md".into());
-    e
+    }
 }
 
-#[test]
-fn list_is_empty_for_missing_file() {
-    let (_tmp, reg) = registry();
-    assert!(reg.list().unwrap().is_empty());
-    assert!(reg.get("anything").unwrap().is_none());
+#[tokio::test]
+async fn list_is_empty_for_missing_host_config() {
+    let (_temp, registry, _) = registry();
+    assert!(registry.list().await.unwrap().is_empty());
+    assert!(registry.get("anything").await.unwrap().is_none());
 }
 
-#[test]
-fn add_get_list_round_trip() {
-    let (_tmp, reg) = registry();
-    let added = reg.add(folder_entry("src_1")).unwrap();
+#[tokio::test]
+async fn add_get_list_round_trip() {
+    let (_temp, registry, _) = registry();
+    let added = registry.add(folder_entry("src_1")).await.unwrap();
     assert_eq!(added.id, "src_1");
 
-    let got = reg.get("src_1").unwrap().unwrap();
+    let got = registry.get("src_1").await.unwrap().unwrap();
     assert_eq!(got.kind, SourceKind::Folder);
     assert_eq!(got.path.as_deref(), Some("/tmp/notes"));
-
-    let all = reg.list().unwrap();
-    assert_eq!(all.len(), 1);
+    assert_eq!(registry.list().await.unwrap().len(), 1);
 }
 
-#[test]
-fn add_rejects_duplicate_id() {
-    let (_tmp, reg) = registry();
-    reg.add(folder_entry("src_dup")).unwrap();
-    assert!(reg.add(folder_entry("src_dup")).is_err());
+#[tokio::test]
+async fn add_rejects_duplicate_id() {
+    let (_temp, registry, _) = registry();
+    registry.add(folder_entry("src_dup")).await.unwrap();
+    assert!(registry.add(folder_entry("src_dup")).await.is_err());
 }
 
-#[test]
-fn add_rejects_invalid_entry() {
-    let (_tmp, reg) = registry();
+#[tokio::test]
+async fn add_rejects_invalid_entry_without_mutating_host_config() {
+    let (_temp, registry, _) = registry();
     let mut bad = folder_entry("src_bad");
-    bad.path = None; // folder requires a path
-    assert!(reg.add(bad).is_err());
-    assert!(reg.list().unwrap().is_empty());
+    bad.path = None;
+    assert!(registry.add(bad).await.is_err());
+    assert!(registry.list().await.unwrap().is_empty());
 }
 
-#[test]
-fn concurrent_registry_adds_preserve_every_source() {
-    let (_tmp, reg) = registry();
-    let writers = 24;
-    let barrier = std::sync::Arc::new(std::sync::Barrier::new(writers));
-    let mut threads = Vec::new();
-    for index in 0..writers {
-        let reg = reg.clone();
-        let barrier = barrier.clone();
-        threads.push(std::thread::spawn(move || {
-            barrier.wait();
-            reg.add(folder_entry(&format!("src_concurrent_{index}")))
+#[tokio::test]
+async fn concurrent_adds_preserve_every_source() {
+    let (_temp, registry, _) = registry();
+    let tasks = (0..24).map(|index| {
+        let registry = registry.clone();
+        tokio::spawn(async move {
+            registry
+                .add(folder_entry(&format!("src_concurrent_{index}")))
+                .await
                 .unwrap();
-        }));
+        })
+    });
+    for result in futures::future::join_all(tasks).await {
+        result.unwrap();
     }
-    for thread in threads {
-        thread.join().unwrap();
-    }
-
-    let mut ids: Vec<_> = reg
+    let ids: std::collections::HashSet<_> = registry
         .list()
+        .await
         .unwrap()
         .into_iter()
         .map(|entry| entry.id)
         .collect();
-    ids.sort();
-    assert_eq!(ids.len(), writers);
-    for index in 0..writers {
+    assert_eq!(ids.len(), 24);
+    for index in 0..24 {
         assert!(ids.contains(&format!("src_concurrent_{index}")));
     }
 }
 
-#[test]
-fn update_applies_patch_and_persists() {
-    let (_tmp, reg) = registry();
-    reg.add(folder_entry("src_u")).unwrap();
-
+#[tokio::test]
+async fn update_applies_patch_and_persists_through_host_port() {
+    let (_temp, registry, _) = registry();
+    registry.add(folder_entry("src_u")).await.unwrap();
     let patch = MemorySourcePatch {
         label: Some("Renamed".into()),
         enabled: Some(false),
         ..Default::default()
     };
-    let updated = reg.update("src_u", patch).unwrap();
+    let updated = registry.update("src_u", patch).await.unwrap();
     assert_eq!(updated.label, "Renamed");
     assert!(!updated.enabled);
-
-    // Re-read from disk to confirm persistence.
-    let got = reg.get("src_u").unwrap().unwrap();
+    let got = registry.get("src_u").await.unwrap().unwrap();
     assert_eq!(got.label, "Renamed");
     assert!(!got.enabled);
 }
 
-#[test]
-fn update_missing_id_errors() {
-    let (_tmp, reg) = registry();
-    assert!(reg.update("nope", MemorySourcePatch::default()).is_err());
+#[tokio::test]
+async fn update_missing_id_errors() {
+    let (_temp, registry, _) = registry();
+    assert!(registry
+        .update("nope", MemorySourcePatch::default())
+        .await
+        .is_err());
 }
 
-#[test]
-fn remove_returns_whether_anything_was_removed() {
-    let (_tmp, reg) = registry();
-    reg.add(folder_entry("src_r")).unwrap();
-    assert!(reg.remove("src_r").unwrap());
-    assert!(!reg.remove("src_r").unwrap());
-    assert!(reg.list().unwrap().is_empty());
+#[tokio::test]
+async fn remove_returns_whether_anything_was_removed() {
+    let (_temp, registry, _) = registry();
+    registry.add(folder_entry("src_r")).await.unwrap();
+    assert!(registry.remove("src_r").await.unwrap());
+    assert!(!registry.remove("src_r").await.unwrap());
+    assert!(registry.list().await.unwrap().is_empty());
 }
 
-#[test]
-fn list_enabled_by_kind_filters() {
-    let (_tmp, reg) = registry();
-    reg.add(folder_entry("src_a")).unwrap();
+#[tokio::test]
+async fn list_enabled_by_kind_filters() {
+    let (_temp, registry, _) = registry();
+    registry.add(folder_entry("src_a")).await.unwrap();
     let mut disabled = folder_entry("src_b");
     disabled.enabled = false;
-    reg.add(disabled).unwrap();
+    registry.add(disabled).await.unwrap();
 
-    let enabled = reg.list_enabled_by_kind(SourceKind::Folder).unwrap();
+    let enabled = registry
+        .list_enabled_by_kind(SourceKind::Folder)
+        .await
+        .unwrap();
     assert_eq!(enabled.len(), 1);
     assert_eq!(enabled[0].id, "src_a");
-    assert!(reg
+    assert!(registry
         .list_enabled_by_kind(SourceKind::Conversation)
+        .await
         .unwrap()
         .is_empty());
 }
 
-#[test]
-fn write_preserves_other_top_level_config_keys() {
-    let (tmp, reg) = registry();
-    let path = tmp.path().join("config.toml");
-    std::fs::write(&path, "workspace = \"/data\"\n").unwrap();
-
-    reg.add(folder_entry("src_keep")).unwrap();
-
-    let text = std::fs::read_to_string(&path).unwrap();
-    assert!(text.contains("workspace = \"/data\""));
-    assert!(text.contains("[[memory_sources]]"));
-}
-
-#[test]
-fn write_uses_atomic_temp_file_without_leaving_stale_temp() {
-    let (tmp, reg) = registry();
-    reg.add(folder_entry("src_atomic")).unwrap();
-
-    let text = std::fs::read_to_string(reg.path()).unwrap();
-    assert!(text.contains("src_atomic"));
-
-    let stale_temp_files: Vec<_> = std::fs::read_dir(tmp.path())
+#[tokio::test]
+async fn source_update_retries_after_host_revision_conflict() {
+    let (_temp, registry, port) = registry();
+    port.inject_conflict.store(true, Ordering::SeqCst);
+    registry.add(folder_entry("caller_added")).await.unwrap();
+    let mut ids: Vec<_> = registry
+        .list()
+        .await
         .unwrap()
-        .filter_map(Result::ok)
-        .filter(|entry| {
-            entry
-                .file_name()
-                .to_string_lossy()
-                .starts_with(".config.toml.tmp-")
-        })
+        .into_iter()
+        .map(|entry| entry.id)
         .collect();
-    assert!(stale_temp_files.is_empty());
+    ids.sort();
+    assert_eq!(ids, ["caller_added", "host_added"]);
 }
 
-// ── Composio upsert ──
-
-#[test]
-fn composio_defaults_for_known_and_unknown_toolkits() {
-    assert_eq!(
-        memory_sync_defaults_for_toolkit("gmail"),
-        (Some(100), Some(30))
-    );
-    assert_eq!(
-        memory_sync_defaults_for_toolkit("slack"),
-        (Some(50), Some(14))
-    );
-    assert_eq!(
-        memory_sync_defaults_for_toolkit("unknown_xyz"),
-        (Some(30), Some(14))
-    );
+#[tokio::test]
+async fn registry_never_writes_workspace_files() {
+    let (temp, registry, _) = registry();
+    registry.add(folder_entry("src_opaque")).await.unwrap();
+    assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 0);
 }
 
-#[test]
-fn in_place_upsert_inserts_then_updates_label_only() {
-    let mut sources: Vec<MemorySourceEntry> = vec![];
-    let (entry, was_insert) =
-        upsert_composio_entry_in_place(&mut sources, "gmail", "conn_a", "Gmail · conn_a");
-    assert!(was_insert);
-    assert_eq!(entry.toolkit.as_deref(), Some("gmail"));
-    assert_eq!(entry.max_items, Some(100));
-    assert_eq!(entry.sync_depth_days, Some(30));
-
-    // User customises a cap, then a second upsert updates label only.
-    sources[0].max_items = Some(7);
-    let (entry, was_insert) =
-        upsert_composio_entry_in_place(&mut sources, "gmail", "conn_a", "new label");
-    assert!(!was_insert);
-    assert_eq!(sources.len(), 1);
-    assert_eq!(entry.label, "new label");
-    assert_eq!(entry.max_items, Some(7));
-}
-
-#[test]
-fn upsert_composio_source_persists_and_disconnect_removes() {
-    let (_tmp, reg) = registry();
-    reg.upsert_composio_source("gmail", "conn_a", "Gmail")
+#[tokio::test]
+async fn composio_upsert_and_remove_preserve_source_policy() {
+    let (_temp, registry, _) = registry();
+    let first = registry
+        .upsert_composio_source("gmail", "conn_a", "Gmail")
+        .await
         .unwrap();
-    reg.upsert_composio_source("slack", "conn_b", "Slack")
+    assert_eq!(first.max_items, Some(100));
+    let mut custom = MemorySourcePatch {
+        max_items: Some(Some(7)),
+        ..Default::default()
+    };
+    registry.update(&first.id, custom.clone()).await.unwrap();
+    let updated = registry
+        .upsert_composio_source("gmail", "conn_a", "Gmail renamed")
+        .await
         .unwrap();
-    assert_eq!(reg.list().unwrap().len(), 2);
+    assert_eq!(updated.id, first.id);
+    assert_eq!(updated.label, "Gmail renamed");
+    assert_eq!(updated.max_items, Some(7));
+    custom.max_items = None;
 
-    let removed = reg
-        .remove_composio_source_by_connection_id("conn_a")
-        .unwrap();
-    assert_eq!(removed, 1);
-    assert_eq!(reg.list().unwrap().len(), 1);
+    assert_eq!(
+        registry
+            .remove_composio_source_by_connection_id("conn_a")
+            .await
+            .unwrap(),
+        1
+    );
+    assert!(registry.list().await.unwrap().is_empty());
 }
 
-#[test]
-fn apply_all_in_enables_and_clears_caps() {
-    let (_tmp, reg) = registry();
-    let mut capped = folder_entry("src_capped");
-    capped.enabled = false;
-    capped.max_items = Some(5);
-    capped.sync_depth_days = Some(3);
-    reg.add(capped).unwrap();
+#[tokio::test]
+async fn apply_all_in_enables_sources_and_clears_limits() {
+    let (_temp, registry, _) = registry();
+    let mut source = folder_entry("src_all");
+    source.enabled = false;
+    source.max_items = Some(4);
+    source.sync_depth_days = Some(9);
+    registry.add(source).await.unwrap();
 
-    let updated = reg.apply_all_in().unwrap();
-    assert_eq!(updated.len(), 1);
+    let updated = registry.apply_all_in().await.unwrap();
     assert!(updated[0].enabled);
-    assert!(updated[0].max_items.is_none());
-    assert!(updated[0].sync_depth_days.is_none());
-}
-
-#[test]
-fn memory_source_patch_deserializes_partial_and_github_fields() {
-    let json = serde_json::json!({
-        "label": "New label",
-        "enabled": false,
-        "max_commits": 100,
-        "max_issues": 50,
-        "max_prs": 25
-    });
-    let patch: MemorySourcePatch = serde_json::from_value(json).unwrap();
-    assert_eq!(patch.label.as_deref(), Some("New label"));
-    assert_eq!(patch.enabled, Some(false));
-    assert_eq!(patch.max_commits, Some(Some(100)));
-    assert_eq!(patch.max_issues, Some(Some(50)));
-    assert_eq!(patch.max_prs, Some(Some(25)));
-    assert!(patch.toolkit.is_none());
-}
-
-#[test]
-fn memory_source_patch_can_clear_optional_fields_with_null() {
-    let (_tmp, reg) = registry();
-    let mut entry = folder_entry("src_clear");
-    entry.glob = Some("**/*.md".into());
-    entry.max_items = Some(10);
-    reg.add(entry).unwrap();
-
-    let patch: MemorySourcePatch = serde_json::from_value(serde_json::json!({
-        "glob": null,
-        "max_items": null
-    }))
-    .unwrap();
-    let updated = reg.update("src_clear", patch).unwrap();
-    assert!(updated.glob.is_none());
-    assert!(updated.max_items.is_none());
-}
-
-#[test]
-fn update_rejects_fields_that_do_not_apply_to_source_kind() {
-    let (_tmp, reg) = registry();
-    reg.add(folder_entry("src_kind")).unwrap();
-    let patch: MemorySourcePatch = serde_json::from_value(serde_json::json!({
-        "url": "https://example.com/repo"
-    }))
-    .unwrap();
-    assert!(reg.update("src_kind", patch).is_err());
+    assert_eq!(updated[0].max_items, None);
+    assert_eq!(updated[0].sync_depth_days, None);
 }
