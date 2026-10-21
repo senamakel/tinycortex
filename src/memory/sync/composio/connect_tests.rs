@@ -132,8 +132,14 @@ async fn entity_store_round_trips_and_reuses_ids() {
 
     // Reopen the adapter over the same host scope: values survive and remain stable.
     let reloaded = EntityStore::from_config(&config).unwrap();
-    assert_eq!(reloaded.get("gmail").await.unwrap().as_deref(), Some("my-entity"));
-    assert_eq!(reloaded.get("github").await.unwrap().as_deref(), Some(github_id.as_str()));
+    assert_eq!(
+        reloaded.get("gmail").await.unwrap().as_deref(),
+        Some("my-entity")
+    );
+    assert_eq!(
+        reloaded.get("github").await.unwrap().as_deref(),
+        Some(github_id.as_str())
+    );
     // Stored value wins even if a different override is passed on re-run.
     assert_eq!(
         reloaded

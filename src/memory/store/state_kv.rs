@@ -37,12 +37,19 @@ impl StateKvStore {
     }
 
     fn storage_key(owner: &str, key: &str) -> String {
-        format!("{PREFIX}{}:{}", digest(owner.as_bytes()), digest(key.as_bytes()))
+        format!(
+            "{PREFIX}{}:{}",
+            digest(owner.as_bytes()),
+            digest(key.as_bytes())
+        )
     }
 
     fn decode(doc: Value, owner: &str, key: &str) -> anyhow::Result<Value> {
         let record: Record = serde_json::from_value(doc)?;
-        anyhow::ensure!(record.owner == owner && record.key == key, "opaque state identity mismatch");
+        anyhow::ensure!(
+            record.owner == owner && record.key == key,
+            "opaque state identity mismatch"
+        );
         Ok(record.value)
     }
 
@@ -91,11 +98,7 @@ impl StateKvStore {
             key: key.to_owned(),
             value,
         })?;
-        match self
-            .port
-            .cas(&address, encoded, Precondition::Absent)
-            .await
-        {
+        match self.port.cas(&address, encoded, Precondition::Absent).await {
             Ok(_) => Ok(true),
             Err(error) if error.kind() == ErrorKind::Conflict => Ok(false),
             Err(error) => Err(error.into()),

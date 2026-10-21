@@ -146,9 +146,7 @@ impl KvStateStore {
 #[async_trait]
 impl PersonaStateStore for KvStateStore {
     async fn get(&self, namespace: &str, key: &str) -> Result<Option<serde_json::Value>> {
-        self.kv
-            .get(NAMESPACE, &Self::key(namespace, key))
-            .await
+        self.kv.get(NAMESPACE, &Self::key(namespace, key)).await
     }
 
     async fn set(&self, namespace: &str, key: &str, value: &serde_json::Value) -> Result<()> {

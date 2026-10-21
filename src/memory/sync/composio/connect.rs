@@ -34,9 +34,9 @@
 use serde_json::Value;
 use uuid::Uuid;
 
-use anyhow::{Context, Result};
 use crate::memory::config::MemoryConfig;
 use crate::memory::store::state_kv::StateKvStore;
+use anyhow::{Context, Result};
 
 /// Connection statuses that will never recover on their own — polling should
 /// stop and fail. Mirrors the Composio SDK's `terminalErrorStates`
@@ -201,11 +201,7 @@ impl EntityStore {
     /// Record `entity_id` for `toolkit` in the host KV port.
     pub async fn set(&self, toolkit: &str, entity_id: impl Into<String>) -> Result<()> {
         self.state
-            .set(
-                ENTITY_STORE_OWNER,
-                toolkit,
-                Value::String(entity_id.into()),
-            )
+            .set(ENTITY_STORE_OWNER, toolkit, Value::String(entity_id.into()))
             .await
     }
 
@@ -216,11 +212,7 @@ impl EntityStore {
     /// explicit `override_id` (e.g. `COMPOSIO_ENTITY_ID`) is adopted; otherwise
     /// a fresh id is generated. A conditional insert ensures concurrent
     /// initializers return the same winning id.
-    pub async fn entity_id_for(
-        &self,
-        toolkit: &str,
-        override_id: Option<&str>,
-    ) -> Result<String> {
+    pub async fn entity_id_for(&self, toolkit: &str, override_id: Option<&str>) -> Result<String> {
         if let Some(existing) = self.get(toolkit).await? {
             return Ok(existing);
         }
@@ -231,11 +223,7 @@ impl EntityStore {
             .unwrap_or_else(generate_entity_id);
         if self
             .state
-            .set_if_absent(
-                ENTITY_STORE_OWNER,
-                toolkit,
-                Value::String(chosen.clone()),
-            )
+            .set_if_absent(ENTITY_STORE_OWNER, toolkit, Value::String(chosen.clone()))
             .await?
         {
             return Ok(chosen);

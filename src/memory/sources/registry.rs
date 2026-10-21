@@ -79,7 +79,11 @@ impl SourceRegistry {
 
     /// Get a single source by id, if present.
     pub async fn get(&self, id: &str) -> Result<Option<MemorySourceEntry>> {
-        Ok(self.list().await?.into_iter().find(|source| source.id == id))
+        Ok(self
+            .list()
+            .await?
+            .into_iter()
+            .find(|source| source.id == id))
     }
 
     async fn mutate<T>(
@@ -90,7 +94,7 @@ impl SourceRegistry {
             let snapshot = self.port.read().await?;
             let mut entries = snapshot.entries.clone();
             let result = apply(&mut entries)?;
-            if entries == snapshot.entries {
+            if serde_json::to_value(&entries)? == serde_json::to_value(&snapshot.entries)? {
                 return Ok(result);
             }
             if self

@@ -10,8 +10,8 @@
 //!   and reader output types ([`SourceItem`], [`SourceContent`], [`ContentType`]).
 //! - [`validation`]: required-field rules per kind and the shared
 //!   path-traversal guard for local readers.
-//! - [`registry`]: a TOML-backed [`SourceRegistry`] with the
-//!   load/modify/validate/save CRUD cycle.
+//! - [`registry`]: a [`SourceRegistry`] that validates and mutates source
+//!   entries through the host's revisioned configuration port.
 //! - [`readers`]: the [`SourceReader`] trait and the local folder/conversation
 //!   reader implementations.
 //!
@@ -30,7 +30,10 @@ pub mod types;
 pub mod validation;
 
 pub use readers::{is_locally_readable, reader_for, SourceReader};
-pub use registry::{memory_sync_defaults_for_toolkit, ComposioUpsertTarget, SourceRegistry};
+pub use registry::{
+    memory_sync_defaults_for_toolkit, ComposioUpsertTarget, SourceConfigPort, SourceConfigSnapshot,
+    SourceRegistry,
+};
 pub use types::{
     ContentType, MemorySourceEntry, MemorySourcePatch, SourceContent, SourceItem, SourceKind,
 };
