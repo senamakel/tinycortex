@@ -1,8 +1,8 @@
 //! Core types for memory sources.
 //!
 //! A *memory source* answers the question "what feeds my memory?". Each
-//! configured source is a [`MemorySourceEntry`] persisted in `config.toml`
-//! under `[[memory_sources]]`. The [`SourceKind`] discriminator selects which
+//! configured source is a [`MemorySourceEntry`] supplied by the host's source
+//! configuration port. The [`SourceKind`] discriminator selects which
 //! kind-specific fields are required; required-field checks live in
 //! [`crate::memory::sources::validation`] and are surfaced via
 //! [`MemorySourceEntry::validate`].
@@ -24,7 +24,7 @@ pub(crate) fn default_true() -> bool {
 /// The kind of a configured memory source.
 ///
 /// The wire representation is snake_case (`github_repo`, `rss_feed`, …) and is
-/// persisted in `config.toml`; it must stay stable across versions.
+/// part of the host configuration contract; it must stay stable across versions.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum SourceKind {
@@ -60,7 +60,7 @@ impl SourceKind {
     }
 }
 
-/// A configured memory source entry persisted in `config.toml`.
+/// A configured memory source entry stored by the host.
 ///
 /// All kind-specific fields are flattened onto the struct as `Option`s. The
 /// [`kind`](MemorySourceEntry::kind) discriminator determines which fields are

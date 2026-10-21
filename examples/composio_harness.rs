@@ -47,7 +47,8 @@
 //! - `COMPOSIO_BASE_URL`           override the API base (default v3 backend).
 //! - `COMPOSIO_ENTITY_ID`          Composio `user_id` scoping accounts. When the
 //!   connect flow mints a new connection it uses this if set, else a generated
-//!   `tinycortex-<uuid>` remembered per toolkit in `.composio-harness.json`.
+//!   `tinycortex-<uuid>` remembered per toolkit in the explicitly configured
+//!   host KV bundle for this run. Production hosts can bind a durable bundle.
 //! - `COMPOSIO_TOOLKITS`           comma list restricting which toolkits to sync;
 //!   also the set the connect flow may log in when not already active.
 //! - `COMPOSIO_MAX_ITEMS`          per-toolkit ingest cap (default 25).
@@ -83,7 +84,6 @@ use tinystoragedrivers_types::Scope;
 const DEFAULT_BASE_URL: &str = "https://backend.composio.dev/api/v3";
 const DEFAULT_MAX_ITEMS: u32 = 25;
 /// Local, gitignored file remembering the entity id (`user_id`) per toolkit.
-const ENTITY_STORE_FILE: &str = ".composio-harness.json";
 /// How long to poll a pending connection for `ACTIVE` before giving up.
 const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 120;
 /// Seconds between connection-status polls.
@@ -363,9 +363,8 @@ async fn connect_toolkit(
         if std::time::Instant::now() >= deadline {
             anyhow::bail!(
                 "timed out waiting for {toolkit} to become ACTIVE after {}s. Finish the login in \
-                 the browser, then re-run — the entity id is remembered in {}.",
-                timeout.as_secs(),
-                ENTITY_STORE_FILE
+                 the browser, then re-run with the same host KV scope to reuse its entity id.",
+                timeout.as_secs()
             );
         }
         tokio::time::sleep(std::time::Duration::from_secs(CONNECT_POLL_INTERVAL_SECS)).await;
@@ -602,6 +601,16 @@ async fn run() -> anyhow::Result<()> {
     // so the memory viewer (or any host) can inspect what sync produced.
     let workspace = env_opt("TINYCORTEX_WORKSPACE");
 
+    // This runnable harness supplies an explicit in-process testkit host. A
+    // production host binds a durable storage bundle to the same typed ports.
+    let state_workspace = std::env::temp_dir().join("tinycortex-composio-harness");
+    let scope = Scope::new(&format!("demo:composio-{}", uuid::Uuid::new_v4()))?;
+    let storage = tinystoragedrivers_testkit::memory_storage(&scope);
+    let mut config =
+        MemoryConfig::open_with_storage(state_workspace.to_string_lossy().into_owned(), storage)
+            .await?;
+    let entity_store = EntityStore::from_config(&config)?;
+
     let http = reqwest::Client::new();
 
     // ── Phase 1: connection test ────────────────────────────────────────────
@@ -673,10 +682,6 @@ async fn run() -> anyhow::Result<()> {
     // run stays non-interactive. Each new login reuses/records a per-toolkit
     // entity id so re-runs don't orphan connections.
     if let Some(requested) = toolkit_filter.as_ref() {
-        let store_path = std::env::current_dir()
-            .unwrap_or_default()
-            .join(ENTITY_STORE_FILE);
-        let mut entity_store = EntityStore::load(&store_path);
         let connect_timeout = std::time::Duration::from_secs(
             env_opt("COMPOSIO_CONNECT_TIMEOUT_SECS")
                 .and_then(|value| value.parse::<u64>().ok())
@@ -692,14 +697,17 @@ async fn run() -> anyhow::Result<()> {
                 continue;
             }
             println!("\n── Phase 1.5: connecting {toolkit} ───────────────────────────");
-            let toolkit_entity = match entity_store.entity_id_for(toolkit, entity_id.as_deref()) {
+            let toolkit_entity = match entity_store
+                .entity_id_for(toolkit, entity_id.as_deref())
+                .await
+            {
                 Ok(id) => id,
                 Err(error) => {
                     println!("  could not persist entity id for {toolkit}: {error}");
                     continue;
                 }
             };
-            println!("  entity id: {toolkit_entity} (stored in {ENTITY_STORE_FILE})");
+            println!("  entity id: {toolkit_entity} (stored in this run's host KV scope)");
             let auth_config_override = env_opt(&format!(
                 "COMPOSIO_{}_AUTH_CONFIG_ID",
                 toolkit.to_ascii_uppercase()
@@ -731,11 +739,6 @@ async fn run() -> anyhow::Result<()> {
     // ── Phase 2: memory sync ────────────────────────────────────────────────
     println!("\n── Phase 2: memory sync ({max_items} item cap/toolkit) ───────");
     let api_secret = SecretString::new(api_key);
-    let tmp = std::env::temp_dir().join("tinycortex-composio-harness");
-    let scope = Scope::new(&format!("demo:composio-{}", uuid::Uuid::new_v4()))?;
-    let storage = tinystoragedrivers_testkit::memory_storage(&scope);
-    let mut config =
-        MemoryConfig::open_with_storage(tmp.to_string_lossy().into_owned(), storage).await?;
     config.sync.budget.max_items = Some(max_items);
 
     let captures = Arc::new(Captures::default());
