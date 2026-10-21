@@ -11,6 +11,7 @@ const valid = {
     token_count: 1,
     metadata: { source_kind: "document", source_id: "source-1", owner: "", tags: [], timestamp: 1000 },
   }],
+  graph_chunks: [],
   chunk_total: 1,
   trees: [{ id: "tree-1", kind: "source", scope: "source-1", root_id: null }],
   summaries: [{ id: "summary-1", tree_id: "tree-1", level: 1, parent_id: null, child_ids: ["chunk-1"], content: "summary" }],

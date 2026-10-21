@@ -17,6 +17,7 @@ export type OwnerSnapshot = {
       timestamp: number;
     };
   }>;
+  graph_chunks: OwnerSnapshot["chunks"];
   chunk_total: number;
   trees: Array<{
     id: string;
@@ -95,6 +96,22 @@ export function parseOwnerSnapshot(value: unknown): OwnerSnapshot {
       },
     };
   });
+  const graph_chunks = array(root.graph_chunks, "graph_chunks").map((value) => {
+    const row = object(value);
+    const metadata = object(row.metadata);
+    return {
+      id: string(row.id, "graph chunk id"),
+      content: string(row.content, "graph chunk content"),
+      token_count: finiteNumber(row.token_count, "graph chunk token count"),
+      metadata: {
+        source_kind: string(metadata.source_kind, "graph chunk source kind"),
+        source_id: string(metadata.source_id, "graph chunk source id"),
+        owner: string(metadata.owner, "graph chunk owner"),
+        tags: strings(metadata.tags, "graph chunk tags"),
+        timestamp: finiteNumber(metadata.timestamp, "graph chunk timestamp"),
+      },
+    };
+  });
   const trees = array(root.trees, "trees").map((value) => {
     const row = object(value);
     return {
@@ -118,6 +135,7 @@ export function parseOwnerSnapshot(value: unknown): OwnerSnapshot {
   return {
     skill_documents,
     chunks,
+    graph_chunks,
     chunk_total: finiteNumber(root.chunk_total, "chunk total"),
     trees,
     summaries,

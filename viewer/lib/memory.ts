@@ -305,7 +305,7 @@ export async function memoryGraph(workspace: string): Promise<MemoryGraphData> {
       }
     }
 
-    const found = new Map(snapshot.chunks.map((chunk) => [chunk.id, chunk.content]));
+    const found = new Map(snapshot.graph_chunks.map((chunk) => [chunk.id, chunk.content]));
     for (const id of childChunkIds) {
       const preview = found.get(id);
       nodes.push({

@@ -66,7 +66,7 @@ fn snapshot_reads_owner_kv_and_chunk_records_from_explicit_storage() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn snapshot_includes_summary_chunks_outside_the_newest_page() {
-    use crate::memory::chunks::versioned::{commit_if_state_matches_async, StateChange};
+    use crate::memory::chunks::versioned::commit_if_state_matches_async;
     use crate::memory::tree::store::{insert_tree_async, SummaryNode, Tree, TreeKind, TreeStatus};
 
     let workspace = TempDir::new().unwrap();
@@ -146,20 +146,13 @@ async fn snapshot_includes_summary_chunks_outside_the_newest_page() {
         doc_id: None,
         version_ms: None,
     };
-    let staged = crate::memory::tree::store::summaries::stage_summary_changes(
-        &summary,
-        None,
-        "test/model",
-    )
-    .unwrap();
-    assert!(commit_if_state_matches_async(
-        &config,
-        &staged.expected,
-        &[],
-        &staged.changes,
-    )
-    .await
-    .unwrap());
+    let staged =
+        crate::memory::tree::store::stage_summary_changes(&summary, None, "test/model").unwrap();
+    assert!(
+        commit_if_state_matches_async(&config, &staged.expected, &[], &staged.changes,)
+            .await
+            .unwrap()
+    );
 
     let snapshot = read_snapshot(workspace.path(), storage, 1).await.unwrap();
     assert_eq!(snapshot.chunks, vec![newest]);

@@ -68,9 +68,13 @@ pub async fn read_snapshot(
     }
     let mut summaries = Vec::new();
     for tree in &trees {
-        // A corrupt or hostile row must not turn inspection into an unbounded
-        // query loop. Normal tree levels are small; cap the viewer projection.
-        for level in 1..=tree.max_level.min(64) {
+        // Reject unexpected depth rather than silently showing a partial graph.
+        anyhow::ensure!(
+            tree.max_level <= 64,
+            "tree {} exceeds the inspection summary-depth limit",
+            tree.id
+        );
+        for level in 1..=tree.max_level {
             summaries.extend(store::list_summaries_at_level_async(&config, &tree.id, level).await?);
         }
     }
