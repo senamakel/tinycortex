@@ -38,7 +38,7 @@ Not all memories are equal. Authored messages, replies, DMs, and mentions all si
 
 ## Local-First & Inspectable
 
-Markdown files are the source of truth. SQLite chunk rows, summary trees, vectors, and a git-backed change ledger (opt-in via the `git-diff` Cargo feature) are _derived_ indexes that accelerate reads and can be rebuilt from canonical content. Every item carries source provenance and a security `taint` (internal vs. external-sync).
+Markdown files are the source of truth. Prepared host-store records for chunks, summary trees, vectors, and a git-backed change ledger (opt-in via the `git-diff` Cargo feature) are _derived_ indexes that accelerate reads and can be rebuilt from canonical content. Every item carries source provenance and a security `taint` (internal vs. external-sync).
 
 ## Recency-Weighted Recall
 
@@ -102,7 +102,7 @@ source payload
 
 | Layer                         | What it does                                                                                 |
 | ----------------------------- | -------------------------------------------------------------------------------------------- |
-| **Storage primitives**        | Markdown content store, SQLite chunks, summary trees, vector DB, KV, entity index            |
+| **Storage primitives**        | Markdown content store, host-backed chunks, summary trees, vector store, KV, entity index   |
 | **Ingest**                    | Canonicalize → chunk → score → embed → tree                                                  |
 | **Retrieval**                 | Vector, keyword, graph, tree drill-down, and composable hybrid-score primitives               |
 | **Diff** (`git-diff`)         | Git-backed source snapshots, checkpoints, and read-markers for change awareness              |

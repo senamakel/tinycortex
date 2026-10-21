@@ -30,17 +30,16 @@ fn search_by_vector_preserves_metadata() {
 #[test]
 fn search_handles_invalid_metadata_json() {
     let store = fake_store(2);
-    store
-        .insert_with_vector("bad", "ns", "text", &[1.0, 0.0], json!({}))
-        .unwrap();
-    {
-        let conn = store.conn.lock();
-        conn.execute(
-            "UPDATE vectors SET metadata = 'not-json' WHERE id = 'bad' AND namespace = 'ns'",
-            [],
-        )
-        .unwrap();
-    }
+    put_raw_record(
+        &store,
+        "ns",
+        "bad",
+        json!({
+            "namespace": "ns", "id": "bad", "text": "text", "dimensions": 2,
+            "embedding_le": vec_to_bytes(&[1.0, 0.0]), "metadata_json": "not-json",
+            "created_at": 0.0, "updated_at": 0.0
+        }),
+    );
     let results = store.search_by_vector("ns", &[1.0, 0.0], 1).unwrap();
     assert_eq!(results[0].id, "bad");
     assert!(results[0].metadata.is_null());
@@ -52,8 +51,8 @@ fn search_handles_invalid_metadata_json() {
 async fn delete_existing() {
     let store = fake_store(4);
     store.insert("a", "ns", "text", json!({})).await.unwrap();
-    assert!(store.delete("ns", "a").unwrap());
-    assert_eq!(store.count(Some("ns")).unwrap(), 0);
+    assert!(store.delete_async("ns", "a").await.unwrap());
+    assert_eq!(store.count_async(Some("ns")).await.unwrap(), 0);
 }
 
 #[test]
@@ -65,8 +64,8 @@ fn delete_nonexistent() {
 async fn delete_wrong_namespace() {
     let store = fake_store(4);
     store.insert("a", "ns1", "text", json!({})).await.unwrap();
-    assert!(!store.delete("ns2", "a").unwrap());
-    assert_eq!(store.count(Some("ns1")).unwrap(), 1);
+    assert!(!store.delete_async("ns2", "a").await.unwrap());
+    assert_eq!(store.count_async(Some("ns1")).await.unwrap(), 1);
 }
 
 // ── clear_namespace ─────────────────────────────────────
@@ -80,9 +79,9 @@ async fn clear_namespace_removes_all() {
         .insert("c", "other", "three", json!({}))
         .await
         .unwrap();
-    assert_eq!(store.clear_namespace("ns").unwrap(), 2);
-    assert_eq!(store.count(Some("ns")).unwrap(), 0);
-    assert_eq!(store.count(Some("other")).unwrap(), 1);
+    assert_eq!(store.clear_namespace_async("ns").await.unwrap(), 2);
+    assert_eq!(store.count_async(Some("ns")).await.unwrap(), 0);
+    assert_eq!(store.count_async(Some("other")).await.unwrap(), 1);
 }
 
 #[test]
@@ -92,8 +91,8 @@ fn clear_empty_namespace() {
 
 // ── list_namespaces ─────────────────────────────────────
 
-#[tokio::test]
-async fn list_namespaces_empty() {
+#[test]
+fn list_namespaces_empty() {
     assert!(fake_store(3).list_namespaces().unwrap().is_empty());
 }
 
@@ -103,7 +102,10 @@ async fn list_namespaces_populated() {
     store.insert("a", "beta", "t", json!({})).await.unwrap();
     store.insert("b", "alpha", "t", json!({})).await.unwrap();
     store.insert("c", "beta", "t", json!({})).await.unwrap();
-    assert_eq!(store.list_namespaces().unwrap(), vec!["alpha", "beta"]);
+    assert_eq!(
+        store.list_namespaces_async().await.unwrap(),
+        vec!["alpha", "beta"]
+    );
 }
 
 // ── count ───────────────────────────────────────────────

@@ -166,6 +166,7 @@ impl MemoryConfig {
         let mut collections = crate::memory::chunks::collections();
         #[cfg(feature = "people")]
         collections.extend(crate::memory::people::collections());
+        collections.extend(crate::memory::store::vectors::collections());
         for spec in collections {
             storage
                 .documents()
