@@ -69,19 +69,6 @@ pub fn set_chunk_raw_refs(config: &MemoryConfig, chunk_id: &str, refs: &[RawRef]
     )
 }
 
-/// Stash raw archive pointers on a chunk row inside a caller-owned
-/// transaction. The caller commits/rolls back `tx`.
-///
-/// # Errors
-/// See [`set_chunk_raw_refs`].
-pub fn set_chunk_raw_refs_tx(
-    _tx: &rusqlite::Transaction<'_>,
-    _chunk_id: &str,
-    _refs: &[RawRef],
-) -> Result<()> {
-    anyhow::bail!("raw refs must be committed with host storage, not a SQLite transaction")
-}
-
 /// Return the raw-archive pointers stored for `chunk_id`, or `None` if no raw
 /// reference state was recorded.
 ///
