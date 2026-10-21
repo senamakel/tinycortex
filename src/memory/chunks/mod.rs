@@ -143,7 +143,7 @@ pub use store::{
     list_source_ids_with_prefix, mark_raw_paths_ingested, set_chunk_lifecycle_status,
     update_chunk_content_sha256, update_summary_content_sha256,
     update_summary_content_sha256_async, upsert_chunks, upsert_chunks_async, upsert_chunks_tx,
-    upsert_staged_chunks_tx, CHUNK_STATUS_ADMITTED, CHUNK_STATUS_BUFFERED, CHUNK_STATUS_DROPPED,
+    upsert_staged_chunks, upsert_staged_chunks_tx, CHUNK_STATUS_ADMITTED, CHUNK_STATUS_BUFFERED, CHUNK_STATUS_DROPPED,
     CHUNK_STATUS_PENDING_EXTRACTION, CHUNK_STATUS_SEALED, RAW_FILE_GATE_KIND,
 };
 pub use store_delete::{

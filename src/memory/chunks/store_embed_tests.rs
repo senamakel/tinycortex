@@ -31,6 +31,9 @@ use crate::memory::store::content::read::{
     LEGACY_EMPTY_CHUNK_CONTENT_REASON_PREFIX, LEGACY_EMPTY_CONTENT_POINTER_REASON_PREFIX,
     LEGACY_NO_CONTENT_POINTER_REASON_PREFIX,
 };
+use crate::memory::tree::store::{
+    insert_tree, stage_summary_changes, SummaryNode, Tree, TreeKind, TreeStatus,
+};
 use chrono::{TimeZone, Utc};
 use rusqlite::params;
 use std::sync::Arc;
@@ -62,6 +65,58 @@ fn sample_chunk(source_id: &str, seq: u32, ts_ms: i64) -> Chunk {
         created_at: ts,
         partial_message: false,
     }
+}
+
+fn seed_summary(cfg: &MemoryConfig, id: &str) {
+    let now = Utc.timestamp_millis_opt(1_700_000_000_000).unwrap();
+    let tree_id = format!("tree-{id}");
+    insert_tree(
+        cfg,
+        &Tree {
+            id: tree_id.clone(),
+            kind: TreeKind::Source,
+            scope: format!("source-{id}"),
+            root_id: None,
+            max_level: 0,
+            status: TreeStatus::Active,
+            created_at: now,
+            last_sealed_at: None,
+            ask: None,
+        },
+    )
+    .unwrap();
+    let staged = stage_summary_changes(
+        &SummaryNode {
+            id: id.to_owned(),
+            tree_id,
+            tree_kind: TreeKind::Source,
+            level: 1,
+            parent_id: None,
+            child_ids: vec![],
+            content: "summary body".into(),
+            token_count: 2,
+            entities: vec![],
+            topics: vec![],
+            time_range_start: now,
+            time_range_end: now,
+            score: 1.0,
+            sealed_at: now,
+            deleted: false,
+            embedding: None,
+            doc_id: None,
+            version_ms: None,
+        },
+        None,
+        "model@3",
+    )
+    .unwrap();
+    assert!(versioned::commit_if_state_matches(
+        cfg,
+        &staged.expected,
+        &[],
+        &staged.changes,
+    )
+    .unwrap());
 }
 
 #[test]
@@ -110,6 +165,7 @@ fn setting_chunk_embedding_clears_matching_skip_marker() {
 #[test]
 fn summary_reembed_tombstone_roundtrips_and_clears() {
     let (_tmp, cfg) = test_config();
+    seed_summary(&cfg, "summary-1");
     mark_summary_reembed_skipped(&cfg, "summary-1", "model@3", "oversize").unwrap();
     let stored = versioned::list_state(&cfg, SUMMARY_REEMBED_SKIPS).unwrap();
     assert_eq!(stored.len(), 1);
@@ -137,6 +193,7 @@ fn clear_reembed_skipped_for_signature_removes_all_tombstones_for_sig() {
     // A re-embed tombstone belongs to the model signature and can be cleared
     // independently of the summary projection that produced it.
     let summary_id = "summary-bulk-clear-test";
+    seed_summary(&cfg, summary_id);
     mark_summary_reembed_skipped(&cfg, summary_id, &sig, "summary tombstone").unwrap();
 
     let deleted = clear_reembed_skipped_for_signature(&cfg, &sig).unwrap();

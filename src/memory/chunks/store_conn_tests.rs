@@ -368,7 +368,15 @@ fn existing_wal_db_migrates_to_truncate() {
 fn delete_chunks_by_source_removes_symlink_entry_not_target_file() {
     let (_tmp, cfg) = test_config();
     let linked_chunk = sample_chunk("slack:c-1", 0, 1_700_000_000_000);
-    upsert_chunks(&cfg, std::slice::from_ref(&linked_chunk)).unwrap();
+    upsert_staged_chunks(
+        &cfg,
+        &[StagedChunk {
+            chunk: linked_chunk.clone(),
+            content_path: "chunks/link.md".into(),
+            content_sha256: "link-hash".into(),
+        }],
+    )
+    .unwrap();
 
     let root = content_root(&cfg);
     let target_path = root.join("chunks/target.md");
@@ -377,15 +385,6 @@ fn delete_chunks_by_source_removes_symlink_entry_not_target_file() {
     std::fs::create_dir_all(target_path.parent().unwrap()).unwrap();
     std::fs::write(&target_path, "target").unwrap();
     std::os::unix::fs::symlink("target.md", &link_path).unwrap();
-
-    with_connection(&cfg, |conn| {
-        conn.execute(
-            "UPDATE mem_tree_chunks SET content_path = ?1 WHERE id = ?2",
-            params![link_rel, linked_chunk.id],
-        )?;
-        Ok(())
-    })
-    .unwrap();
 
     let deleted = delete_chunks_by_source(&cfg, SourceKind::Chat, "slack:c-1").unwrap();
 
