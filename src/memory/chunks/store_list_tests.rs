@@ -5,11 +5,11 @@
 use super::types::{chunk_id, Chunk, Metadata, SourceKind, SourceRef};
 use super::{
     count_chunks_matching, list_chunk_details, list_chunks, source_totals, upsert_chunks,
-    with_connection, ListChunksQuery,
+    ListChunksQuery,
 };
 use crate::memory::config::MemoryConfig;
+use crate::memory::store::entity_index::{CanonicalEntity, EntityIndex, EntityKind};
 use chrono::{TimeZone, Utc};
-use rusqlite::params;
 use std::collections::HashSet;
 use tempfile::TempDir;
 
@@ -47,19 +47,25 @@ fn chunk_with(
     }
 }
 
-/// Write one `mem_tree_entity_index` row directly. The scorer owns this table
-/// and is not in the chunk-store test path, so the tests seed it themselves.
-fn index_entity(cfg: &MemoryConfig, node_id: &str, entity_id: &str, entity_kind: &str) {
-    with_connection(cfg, |conn| {
-        conn.execute(
-            "INSERT INTO mem_tree_entity_index (
-                entity_id, node_id, node_kind, entity_kind, surface, score, timestamp_ms
-             ) VALUES (?1, ?2, 'leaf', ?3, 'surface', 0.9, 1700000000000)",
-            params![entity_id, node_id, entity_kind],
-        )?;
-        Ok(())
-    })
-    .unwrap();
+/// Seed entity predicates through the same host-owned index used by listing.
+fn index_entity(cfg: &MemoryConfig, node_id: &str, entity_id: &str, entity_kind: EntityKind) {
+    let entity_index = EntityIndex::for_memory_config(cfg).unwrap();
+    entity_index
+        .index_entity(
+            &CanonicalEntity {
+                canonical_id: entity_id.to_owned(),
+                kind: entity_kind,
+                surface: entity_id.to_owned(),
+                span_start: 0,
+                span_end: entity_id.len() as u32,
+                score: 0.9,
+            },
+            node_id,
+            "leaf",
+            1_700_000_000_000,
+            None,
+        )
+        .unwrap();
 }
 
 fn ids_of(chunks: &[Chunk]) -> Vec<String> {
@@ -103,13 +109,23 @@ fn every_list_predicate_composes_with_and() {
         &other_content,
         &unlisted_id,
     ] {
-        index_entity(&cfg, &chunk.id, "entity:acme", "org");
+        index_entity(&cfg, &chunk.id, "entity:acme", EntityKind::Organization);
     }
     // The wanted entity, of the wrong kind: `entity_ids` accepts this chunk and
     // `entity_kinds` is the only predicate that may reject it.
-    index_entity(&cfg, &other_entity_kind.id, "entity:acme", "person");
+    index_entity(
+        &cfg,
+        &other_entity_kind.id,
+        "entity:acme",
+        EntityKind::Person,
+    );
     // The wanted kind, under the wrong entity: the mirror image.
-    index_entity(&cfg, &other_entity.id, "entity:other", "org");
+    index_entity(
+        &cfg,
+        &other_entity.id,
+        "entity:other",
+        EntityKind::Organization,
+    );
 
     let full = ListChunksQuery {
         ids: ids_of(&[
@@ -123,7 +139,7 @@ fn every_list_predicate_composes_with_and() {
         source_kinds: vec![SourceKind::Chat],
         source_ids: vec!["slack:#eng".to_string()],
         entity_ids: vec!["entity:acme".to_string()],
-        entity_kinds: vec!["org".to_string()],
+        entity_kinds: vec![EntityKind::Organization.as_str().to_string()],
         content_contains: Some("quarterly".to_string()),
         ..Default::default()
     };
@@ -210,13 +226,13 @@ fn entity_predicates_never_multiply_a_chunk() {
     let single = chunk_with(SourceKind::Chat, "slack:#eng", 1, 2_000, "one entity");
     upsert_chunks(&cfg, &[chunk.clone(), single.clone()]).unwrap();
     for entity in ["entity:a", "entity:b", "entity:c"] {
-        index_entity(&cfg, &chunk.id, entity, "org");
+        index_entity(&cfg, &chunk.id, entity, EntityKind::Organization);
     }
-    index_entity(&cfg, &single.id, "entity:a", "org");
+    index_entity(&cfg, &single.id, "entity:a", EntityKind::Organization);
 
     let query = ListChunksQuery {
         entity_ids: vec!["entity:a".into(), "entity:b".into(), "entity:c".into()],
-        entity_kinds: vec!["org".into()],
+        entity_kinds: vec![EntityKind::Organization.as_str().into()],
         ..Default::default()
     };
     let rows = list_chunks(&cfg, &query).unwrap();
