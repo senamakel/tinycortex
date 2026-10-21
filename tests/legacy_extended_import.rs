@@ -171,6 +171,61 @@ async fn extended_v013_public_writer_batch_imports_and_reads_back() -> Result<()
     Ok(())
 }
 
+/// The supplemental fixture uses only APIs that existed in the v0.1.3 source
+/// tag to create pending frontier, hotness, and terminal re-embed records.
+#[tokio::test(flavor = "multi_thread")]
+async fn v013_public_writer_state_families_import_with_history() -> Result<()> {
+    let fixture_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(STATE_FIXTURE);
+    let batch = read_legacy_batch(&fixture_root)?;
+    assert_eq!(batch.chunks.len(), 2);
+    assert_eq!(batch.trees.len(), 2);
+    assert_eq!(batch.summaries.len(), 1);
+    assert_eq!(batch.buffers.len(), 2);
+    assert_eq!(batch.hotness.len(), 1);
+    assert_eq!(batch.chunk_reembed_skips.len(), 1);
+    assert_eq!(batch.summary_reembed_skips.len(), 1);
+
+    let workspace = tempfile::tempdir()?;
+    let destination_content = workspace.path().join("content");
+    copy_tree(&fixture_root.join("content"), &destination_content)?;
+    let scope = tinystoragedrivers_types::Scope::new(&format!(
+        "test:legacy-state-import:{}",
+        uuid::Uuid::new_v4()
+    ))?;
+    let mut config = MemoryConfig::open_with_storage(
+        workspace.path(),
+        tinystoragedrivers_testkit::memory_storage(&scope),
+    )
+    .await?;
+    config.content_root = Some(destination_content);
+
+    let imported = chunks::import_legacy_batch(&config, &batch).await?;
+    assert_eq!(imported.buffers, 2);
+    assert_eq!(imported.hotness, 1);
+    assert_eq!(imported.reembed_skips, 2);
+    for record in &batch.buffers {
+        assert_eq!(
+            tree::store::get_buffer(&config, &record.buffer.tree_id, record.buffer.level)?,
+            record.buffer
+        );
+    }
+    for record in &batch.hotness {
+        assert_eq!(
+            tree::store::hotness::get(&config, &record.counters.entity_id)?,
+            Some(record.counters.clone())
+        );
+    }
+    assert!(!chunks::has_uncovered_reembed_work(
+        &config,
+        "legacy/provider@1536"
+    )?);
+
+    let before_retry = queue::count_total(&config)?;
+    chunks::import_legacy_batch(&config, &batch).await?;
+    assert_eq!(queue::count_total(&config)?, before_retry);
+    Ok(())
+}
+
 fn read_legacy_batch(root: &Path) -> Result<LegacyImportBatch> {
     let db = root.join("chunks.db");
     let conn = Connection::open_with_flags(db, OpenFlags::SQLITE_OPEN_READ_ONLY)?;

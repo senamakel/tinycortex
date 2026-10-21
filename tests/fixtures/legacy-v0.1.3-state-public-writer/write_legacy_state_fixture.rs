@@ -83,7 +83,7 @@ async fn main() -> Result<()> {
             time_range_start: at,
             time_range_end: at,
             score: 0.9,
-            child_labels: vec![summary_chunk_id],
+            child_labels: vec![summary_chunk_id.clone()],
             child_basenames: vec![None],
         },
         &ConcatSummariser,
@@ -104,6 +104,12 @@ async fn main() -> Result<()> {
             last_updated_ms: at.timestamp_millis() + 321,
         },
     )?;
+    tinycortex::memory::chunks::set_chunk_embedding_for_signature(
+        &config,
+        &summary_chunk_id,
+        "legacy/provider@1536",
+        &[0.125, 0.25, 0.5],
+    )?;
     mark_chunk_reembed_skipped(
         &config,
         &pending_chunk_id,
@@ -113,7 +119,7 @@ async fn main() -> Result<()> {
     tinycortex::memory::chunks::mark_summary_reembed_skipped(
         &config,
         &summary.summary_id,
-        "legacy/provider@summary",
+        "legacy/provider@1536",
         "legacy public-writer summary skip",
     )?;
 
