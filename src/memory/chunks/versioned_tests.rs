@@ -351,6 +351,23 @@ async fn listing_chunk_state_resolves_many_lifecycle_keys_in_bounded_queries() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn upserting_many_chunks_checks_deleted_lifecycles_in_bounded_queries() {
+    let (config, state_version_queries) = config_with_state_version_query_counter().await;
+    let chunks = (0..64)
+        .map(|index| chunk(&format!("lifecycle-write-{index:04}"), "write fixture"))
+        .collect::<Vec<_>>();
+
+    assert_eq!(super::super::store::upsert_chunks(&config, &chunks).unwrap(), chunks.len());
+
+    assert!(
+        state_version_queries.load(Ordering::SeqCst) <= 8,
+        "upserting {} chunks issued {} per-key lifecycle queries",
+        chunks.len(),
+        state_version_queries.load(Ordering::SeqCst)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn public_chunk_write_and_read_use_the_host_document_store() {
     let config = config().await;
     let original = chunk("chunk-1", "first");
