@@ -212,6 +212,9 @@ async fn queued_append_publishes_buffer_with_lease_settlement() {
 #[tokio::test(flavor = "current_thread")]
 async fn queued_seal_keeps_plan_invisible_until_lease_settlement() {
     let (_tmp, mut config) = config();
+    // This assertion is about atomic seal settlement; keep it out of the
+    // process-wide default LLM gate shared with parallel worker tests.
+    config.queue.llm_permits = 991;
     config.tree.summary_fanout = 1;
     let tree =
         crate::memory::tree::get_or_create_tree_async(&config, TreeKind::Source, "queue-seal")
