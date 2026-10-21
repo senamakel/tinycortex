@@ -54,7 +54,12 @@ pub async fn read_snapshot(
     )?;
 
     let mut trees = Vec::new();
-    for kind in [TreeKind::Source, TreeKind::Topic, TreeKind::Global, TreeKind::Flavoured] {
+    for kind in [
+        TreeKind::Source,
+        TreeKind::Topic,
+        TreeKind::Global,
+        TreeKind::Flavoured,
+    ] {
         trees.extend(store::list_trees_by_kind_async(&config, kind).await?);
     }
     let mut summaries = Vec::new();
@@ -62,9 +67,7 @@ pub async fn read_snapshot(
         // A corrupt or hostile row must not turn inspection into an unbounded
         // query loop. Normal tree levels are small; cap the viewer projection.
         for level in 1..=tree.max_level.min(64) {
-            summaries.extend(
-                store::list_summaries_at_level_async(&config, &tree.id, level).await?,
-            );
+            summaries.extend(store::list_summaries_at_level_async(&config, &tree.id, level).await?);
         }
     }
 

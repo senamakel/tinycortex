@@ -53,7 +53,10 @@ fn snapshot_reads_owner_kv_and_chunk_records_from_explicit_storage() {
         .unwrap();
 
     assert_eq!(snapshot.skill_documents.len(), 1);
-    assert_eq!(snapshot.skill_documents[0].namespace.as_deref(), Some("skilldoc_notion"));
+    assert_eq!(
+        snapshot.skill_documents[0].namespace.as_deref(),
+        Some("skilldoc_notion")
+    );
     assert_eq!(snapshot.skill_documents[0].key, "document-1");
     assert_eq!(snapshot.chunks, vec![chunk]);
     assert_eq!(snapshot.chunk_total, 1);
