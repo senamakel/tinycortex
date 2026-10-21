@@ -301,16 +301,19 @@ impl VectorStore {
                 record.id,
                 record.namespace
             );
-            validated.push((key, VectorRecord {
-                namespace: record.namespace.clone(),
-                id: record.id.clone(),
-                text: record.text.clone(),
-                dimensions: record.dimensions,
-                embedding_le: record.embedding_le.clone(),
-                metadata_json: record.metadata_json.clone(),
-                created_at: record.created_at,
-                updated_at: record.updated_at,
-            }));
+            validated.push((
+                key,
+                VectorRecord {
+                    namespace: record.namespace.clone(),
+                    id: record.id.clone(),
+                    text: record.text.clone(),
+                    dimensions: record.dimensions,
+                    embedding_le: record.embedding_le.clone(),
+                    metadata_json: record.metadata_json.clone(),
+                    created_at: record.created_at,
+                    updated_at: record.updated_at,
+                },
+            ));
         }
 
         let provenance_id = legacy_source_metadata_id(source);
@@ -369,9 +372,7 @@ impl VectorStore {
             }
             match self.documents.atomic_batch(ops).await {
                 Ok(()) => return Ok(inserted),
-                Err(error)
-                    if error.kind() == tinystoragedrivers_types::ErrorKind::Conflict =>
-                {
+                Err(error) if error.kind() == tinystoragedrivers_types::ErrorKind::Conflict => {
                     // A concurrent identical importer may have won. Re-read
                     // and compare all affected rows before accepting a retry.
                 }

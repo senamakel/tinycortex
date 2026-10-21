@@ -5,7 +5,7 @@ use rusqlite::{Connection, OpenFlags};
 use serde_json::{json, Value};
 use tinycortex::memory::{
     config::MemoryConfig,
-    store::vectors::{LegacyVectorMetadata, LegacyVectorRecord, InertEmbedding, VectorStore},
+    store::vectors::{InertEmbedding, LegacyVectorMetadata, LegacyVectorRecord, VectorStore},
 };
 use tinystoragedrivers_api::DocumentStore;
 use tinystoragedrivers_types::{Filter, Query, Scope};
@@ -21,14 +21,18 @@ async fn v013_public_vector_writer_imports_and_reads_back() -> Result<()> {
     assert_eq!(records.len(), 3);
 
     let workspace = tempfile::tempdir()?;
-    let scope = Scope::new(&format!("test:legacy-vector-import:{}", uuid::Uuid::new_v4()))?;
+    let scope = Scope::new(&format!(
+        "test:legacy-vector-import:{}",
+        uuid::Uuid::new_v4()
+    ))?;
     let config = MemoryConfig::open_with_storage(
         workspace.path(),
         tinystoragedrivers_testkit::memory_storage(&scope),
     )
     .await?;
-    let store = VectorStore::from_config_async(&config, std::sync::Arc::new(InertEmbedding::new(3)))
-        .await?;
+    let store =
+        VectorStore::from_config_async(&config, std::sync::Arc::new(InertEmbedding::new(3)))
+            .await?;
 
     assert_eq!(store.import_legacy_records(&source, &records).await?, 3);
     assert_eq!(store.import_legacy_records(&source, &records).await?, 0);
@@ -66,24 +70,36 @@ async fn v013_public_vector_writer_imports_and_reads_back() -> Result<()> {
     assert_eq!(page.items.len(), records.len());
     for row in page.items {
         let id = row.doc["id"].as_str().context("vector id missing")?;
-        let source_row = records.iter().find(|record| record.id == id).context("source row missing")?;
+        let source_row = records
+            .iter()
+            .find(|record| record.id == id)
+            .context("source row missing")?;
         assert_eq!(row.doc["namespace"], source_row.namespace);
         assert_eq!(row.doc["text"], source_row.text);
         assert_eq!(row.doc["dimensions"], source_row.dimensions);
         assert_eq!(row.doc["embedding_le"], json!(source_row.embedding_le));
         assert_eq!(row.doc["metadata_json"], source_row.metadata_json);
         assert_eq!(
-            row.doc["created_at"].as_f64().context("created_at missing")?.to_bits(),
+            row.doc["created_at"]
+                .as_f64()
+                .context("created_at missing")?
+                .to_bits(),
             source_row.created_at.to_bits()
         );
         assert_eq!(
-            row.doc["updated_at"].as_f64().context("updated_at missing")?.to_bits(),
+            row.doc["updated_at"]
+                .as_f64()
+                .context("updated_at missing")?
+                .to_bits(),
             source_row.updated_at.to_bits()
         );
     }
 
     let metadata_page = docs
-        .query("memory_vector_metadata", &Query::filter(Filter::All).limit(10))
+        .query(
+            "memory_vector_metadata",
+            &Query::filter(Filter::All).limit(10),
+        )
         .await?;
     let source_metadata = metadata_page
         .items
@@ -93,28 +109,31 @@ async fn v013_public_vector_writer_imports_and_reads_back() -> Result<()> {
         .context("legacy provider provenance missing")?;
     assert_eq!(source_metadata["dimensions"], 3);
 
-    let wrong_dims = VectorStore::from_config_async(
-        &config,
-        std::sync::Arc::new(InertEmbedding::new(4)),
-    )
-    .await
-    .expect_err("a reopened store must retain the historical dimension guard");
+    let wrong_dims =
+        VectorStore::from_config_async(&config, std::sync::Arc::new(InertEmbedding::new(4)))
+            .await
+            .err()
+            .context("a reopened store must retain the historical dimension guard")?;
     assert!(wrong_dims.to_string().contains("dimension mismatch"));
     Ok(())
 }
 
-fn read_legacy_vectors(path: &std::path::Path) -> Result<(LegacyVectorMetadata, Vec<LegacyVectorRecord>)> {
+fn read_legacy_vectors(
+    path: &std::path::Path,
+) -> Result<(LegacyVectorMetadata, Vec<LegacyVectorRecord>)> {
     let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     let provider_name = conn.query_row(
         "SELECT value FROM store_meta WHERE key = 'embed_provider'",
         [],
         |row| row.get::<_, String>(0),
     )?;
-    let dimensions = conn.query_row(
-        "SELECT value FROM store_meta WHERE key = 'embed_dims'",
-        [],
-        |row| row.get::<_, String>(0),
-    )?.parse::<usize>()?;
+    let dimensions = conn
+        .query_row(
+            "SELECT value FROM store_meta WHERE key = 'embed_dims'",
+            [],
+            |row| row.get::<_, String>(0),
+        )?
+        .parse::<usize>()?;
     let mut statement = conn.prepare(
         "SELECT namespace, id, text, embedding, metadata, created_at, updated_at \
          FROM vectors ORDER BY namespace, id",

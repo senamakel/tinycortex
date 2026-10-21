@@ -24,7 +24,7 @@ SHA-256:
 | File | SHA-256 |
 | --- | --- |
 | `vectors.db` | `640795e03fefd9000a3dbf2fb5b0a0a4ea4c990ac92d7c73ff16a91176acead2` |
-| `write_vector_fixture.rs` | `GENERATED_AFTER_COPY` |
+| `write_vector_fixture.rs` | `30f9bb908c286d43e757d6e3d1f22cc5a2c2f5cedf96844b86b6b306441fcbf6` |
 
 ## Regeneration
 
