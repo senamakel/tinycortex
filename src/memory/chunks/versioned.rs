@@ -100,6 +100,7 @@ struct ChunkVersion {
 struct VisibleOperation {
     revision: u64,
     writes: HashSet<(String, String)>,
+    state_writes: HashSet<(String, String, String)>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -894,41 +895,9 @@ pub(crate) fn list_chunk_snapshot_with_head(
                     );
                 }
             }
-            let mut states = HashMap::new();
-            for collection in state_collections {
-                let mut query = Query::filter(Filter::eq("collection", collection.clone()))
-                    .sort(Sort::asc("key"))
-                    .limit(PAGE_SIZE);
-                let mut keys = HashSet::new();
-                loop {
-                    let page = documents.query(STATE_VERSIONS, &query).await?;
-                    for row in page.items {
-                        if row.meta.schema != RECORD_SCHEMA || row.meta.expires_ms.is_some() {
-                            return Err(tinystoragedrivers_types::StorageError::backend(
-                                "state version has unexpected schema or expiry metadata",
-                            ));
-                        }
-                        let version: StateVersion = serde_json::from_value(row.doc)
-                            .map_err(tinystoragedrivers_types::StorageError::from)?;
-                        if version.collection == collection {
-                            keys.insert(version.key);
-                        }
-                    }
-                    match page.next {
-                        Some(cursor) => query = query.clone().after(cursor),
-                        None => break,
-                    }
-                }
-                let mut values = Vec::new();
-                for key in keys {
-                    if let Some(value) =
-                        read_state_at(&*documents, &snapshot, &collection, &key).await?
-                    {
-                        values.push((key, value));
-                    }
-                }
-                states.insert(collection, values);
-            }
+            let states =
+                bulk_state_values_at_snapshot(&*documents, &snapshot, &visible, &state_collections)
+                    .await?;
             let deleted_ids: HashSet<String> = states
                 .get(CHUNK_LIFECYCLE)
                 .into_iter()
@@ -1036,21 +1005,16 @@ pub(crate) async fn list_chunk_snapshot_with_head_async(
                     );
                 }
             }
-            let mut states = HashMap::new();
-            for collection in state_collections {
-                states.insert(collection.clone(), Vec::new());
-            }
+            let states = bulk_state_values_at_snapshot(
+                &*documents,
+                &read_snapshot,
+                &visible,
+                &state_collections,
+            )
+            .await?;
             Ok::<_, tinystoragedrivers_types::StorageError>((chunks, states))
         })
         .await??;
-    for collection in requested_state.iter().copied().chain([CHUNK_LIFECYCLE]) {
-        if states.contains_key(collection) {
-            states.insert(
-                collection.to_owned(),
-                list_state_at_snapshot_async(config, &snapshot, collection).await?,
-            );
-        }
-    }
     let deleted: HashSet<String> = states
         .get(CHUNK_LIFECYCLE)
         .into_iter()
@@ -1777,10 +1741,81 @@ fn visible_operations_at_snapshot(
             VisibleOperation {
                 revision: manifest.revision,
                 writes,
+                state_writes: manifest
+                    .state_writes
+                    .into_iter()
+                    .map(|write| (write.collection, write.key, write.version_id))
+                    .collect(),
             },
         )
     }));
     Ok(visible)
+}
+
+/// Resolve several state collections from one already-loaded commit prefix.
+/// State versions are scanned once per requested collection and matched to
+/// their immutable operation manifest in memory, avoiding one query per key.
+async fn bulk_state_values_at_snapshot(
+    documents: &dyn tinystoragedrivers_api::DocumentStore,
+    snapshot: &HeadSnapshot,
+    visible: &HashMap<String, VisibleOperation>,
+    collections: &[String],
+) -> tinystoragedrivers_types::Result<HashMap<String, Vec<(String, Value)>>> {
+    let mut output = HashMap::with_capacity(collections.len());
+    for collection in collections {
+        let mut latest = HashMap::<String, (u64, Option<Value>)>::new();
+        let mut query = Query::filter(Filter::eq("collection", collection.clone()))
+            .sort(Sort::asc("key"))
+            .limit(PAGE_SIZE);
+        loop {
+            let page = documents.query(STATE_VERSIONS, &query).await?;
+            for row in page.items {
+                if row.meta.schema != RECORD_SCHEMA || row.meta.expires_ms.is_some() {
+                    return Err(tinystoragedrivers_types::StorageError::backend(
+                        "state version has unexpected schema or expiry metadata",
+                    ));
+                }
+                let version: StateVersion = serde_json::from_value(row.doc)
+                    .map_err(tinystoragedrivers_types::StorageError::from)?;
+                if version.collection != *collection
+                    || version.revision > snapshot.revision
+                    || state_version_id(collection, &version.key, &version.operation_id) != row.id
+                {
+                    continue;
+                }
+                let Some(operation) = visible.get(&version.operation_id) else {
+                    continue;
+                };
+                if operation.revision != version.revision
+                    || !operation.state_writes.contains(&(
+                        collection.clone(),
+                        version.key.clone(),
+                        row.id,
+                    ))
+                {
+                    continue;
+                }
+                if latest
+                    .get(&version.key)
+                    .is_none_or(|(revision, _)| version.revision > *revision)
+                {
+                    latest.insert(version.key, (version.revision, version.value));
+                }
+            }
+            match page.next {
+                Some(cursor) => query = query.clone().after(cursor),
+                None => break,
+            }
+        }
+        output.insert(
+            collection.clone(),
+            latest
+                .into_iter()
+                .filter_map(|(key, (_, value))| value.map(|value| (key, value)))
+                .collect(),
+        );
+    }
+    Ok(output)
 }
 
 async fn operation_contains_chunk_write(
