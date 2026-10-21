@@ -4,6 +4,7 @@
 //! rewriting. Cursor paths and integration identifiers are application keys,
 //! and their JSON values must round-trip exactly.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
@@ -103,6 +104,45 @@ impl StateKvStore {
             Err(error) if error.kind() == ErrorKind::Conflict => Ok(false),
             Err(error) => Err(error.into()),
         }
+    }
+
+    /// Import an immutable legacy snapshot without replacing progressed owner
+    /// state. Exact retries are no-ops; conflicting destination values fail.
+    pub(crate) async fn import_entries(
+        &self,
+        owner: &str,
+        entries: &[(String, Value)],
+    ) -> anyhow::Result<()> {
+        let mut unique = HashMap::with_capacity(entries.len());
+        for (key, value) in entries {
+            if let Some(previous) = unique.insert(key, value) {
+                anyhow::ensure!(previous == value, "conflicting duplicate legacy state key");
+            }
+        }
+
+        // Preflight every existing value before publishing any missing row.
+        for (key, value) in entries {
+            if let Some(existing) = self.get(owner, key).await? {
+                anyhow::ensure!(
+                    existing == *value,
+                    "legacy state conflicts with existing owner value for key {key:?}"
+                );
+            }
+        }
+
+        for (key, value) in entries {
+            if self.get(owner, key).await?.is_some() {
+                continue;
+            }
+            if !self.set_if_absent(owner, key, value.clone()).await? {
+                let current = self.get(owner, key).await?;
+                anyhow::ensure!(
+                    current.as_ref() == Some(value),
+                    "legacy state changed during import for key {key:?}"
+                );
+            }
+        }
+        Ok(())
     }
 }
 

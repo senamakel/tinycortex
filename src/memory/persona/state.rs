@@ -130,6 +130,15 @@ pub struct KvStateStore {
     kv: StateKvStore,
 }
 
+/// One opaque cursor value read by a host from the legacy persona state file.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LegacyPersonaStateEntry {
+    /// Original state key, without the legacy file's namespace prefix.
+    pub key: String,
+    /// Original JSON value, retained without normalization.
+    pub value: serde_json::Value,
+}
+
 impl KvStateStore {
     /// Attach to the host's prepared KV port.
     pub fn from_config(config: &crate::memory::config::MemoryConfig) -> Result<Self> {
@@ -140,6 +149,18 @@ impl KvStateStore {
 
     fn key(namespace: &str, key: &str) -> String {
         format!("{}:{namespace}{key}", namespace.len())
+    }
+
+    /// Import legacy cursor data without overwriting values already advanced
+    /// by the active pipeline. Replaying the same import is idempotent.
+    pub async fn import_legacy_entries(&self, entries: &[LegacyPersonaStateEntry]) -> Result<()> {
+        let owner_entries = entries
+            .iter()
+            .map(|entry| (Self::key(NAMESPACE, &entry.key), entry.value.clone()))
+            .collect::<Vec<_>>();
+        self.kv
+            .import_entries(NAMESPACE, &owner_entries)
+            .await
     }
 }
 
