@@ -2276,7 +2276,10 @@ fn make_manifest(
     for change in changes {
         digest.update(serde_json::to_vec(change)?);
     }
-    digest.update(serde_json::to_vec(&default_lifecycle_status)?);
+    if let Some(status) = default_lifecycle_status {
+        digest.update(b"default-lifecycle-status\0");
+        digest.update(status.as_bytes());
+    }
     let op_id = format!("memory-write:{:x}", digest.finalize());
     Ok(OperationManifest {
         op_id: op_id.clone(),
