@@ -163,7 +163,10 @@ impl MemoryConfig {
             .storage
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("TinyCortex requires host-supplied storage"))?;
-        for spec in crate::memory::chunks::collections() {
+        let mut collections = crate::memory::chunks::collections();
+        #[cfg(feature = "people")]
+        collections.extend(crate::memory::people::collections());
+        for spec in collections {
             storage
                 .documents()
                 .ensure_collection(&spec)
