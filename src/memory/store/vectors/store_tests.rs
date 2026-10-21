@@ -96,6 +96,22 @@ fn roundtrip_vec_bytes() {
 }
 
 #[test]
+fn vector_bytes_preserve_all_f32_bit_patterns() {
+    let original = [f32::from_bits(0x7fc0_1234), f32::INFINITY, -0.0];
+    let decoded = bytes_to_vec(&vec_to_bytes(&original)).unwrap();
+    assert_eq!(
+        decoded
+            .iter()
+            .map(|value| value.to_bits())
+            .collect::<Vec<_>>(),
+        original
+            .iter()
+            .map(|value| value.to_bits())
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
 fn empty_vec_roundtrip() {
     assert!(bytes_to_vec(&vec_to_bytes(&[])).unwrap().is_empty());
 }
@@ -180,6 +196,27 @@ fn reopening_prepared_store_with_different_backend_errors() {
 }
 
 #[test]
+fn equal_scores_use_a_deterministic_logical_id_tiebreaker() {
+    let store = fake_store(2);
+    store
+        .insert_with_vector("z-id", "ns", "z", &[1.0, 0.0], json!({}))
+        .unwrap();
+    store
+        .insert_with_vector("a-id", "ns", "a", &[1.0, 0.0], json!({}))
+        .unwrap();
+
+    let results = store.search_by_vector("ns", &[1.0, 0.0], 2).unwrap();
+
+    assert_eq!(
+        results
+            .iter()
+            .map(|row| row.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["a-id", "z-id"]
+    );
+}
+
+#[test]
 fn open_rejects_corrupt_dimension_metadata() {
     let config = crate::memory::chunks::test_support::host_config("unused-vector-workspace");
     let store = VectorStore::from_config(&config, Arc::new(FakeEmbedding { dims: 4 })).unwrap();
@@ -250,7 +287,7 @@ fn embedding_signature_format_is_stable() {
 #[tokio::test(flavor = "current_thread")]
 async fn vector_store_uses_the_prepared_host_document_port() {
     let config = crate::memory::chunks::test_support::host_config("unused-vector-workspace");
-    let store = VectorStore::from_config_async(&config, Arc::new(FakeEmbedding { dims: 2}))
+    let store = VectorStore::from_config_async(&config, Arc::new(FakeEmbedding { dims: 2 }))
         .await
         .unwrap();
 
@@ -272,6 +309,20 @@ async fn vector_store_uses_the_prepared_host_document_port() {
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].id, "host-backed");
     assert_eq!(results[0].metadata["source"], "test");
+
+    let stored = config
+        .storage()
+        .unwrap()
+        .documents()
+        .get(
+            super::VECTOR_RECORDS,
+            &super::vector_document_id("notes", "host-backed"),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    let record: super::VectorRecord = serde_json::from_value(stored.doc).unwrap();
+    assert_eq!(record.embedding_le, vec_to_bytes(&[1.0, 0.0]));
 }
 
 #[tokio::test]

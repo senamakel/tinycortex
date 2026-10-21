@@ -332,22 +332,20 @@ async fn clear_namespace_documents(
     namespace: &str,
 ) -> anyhow::Result<usize> {
     let removed = documents
-        .delete_where(VECTOR_RECORDS, &Filter::eq("namespace", namespace.to_owned()))
+        .delete_where(
+            VECTOR_RECORDS,
+            &Filter::eq("namespace", namespace.to_owned()),
+        )
         .await?;
     usize::try_from(removed).context("vector count did not fit in usize")
 }
 
-async fn count_documents(
-    documents: &dyn DocumentStore,
-    filter: &Filter,
-) -> anyhow::Result<usize> {
+async fn count_documents(documents: &dyn DocumentStore, filter: &Filter) -> anyhow::Result<usize> {
     let count = documents.count(VECTOR_RECORDS, filter).await?;
     usize::try_from(count).context("vector count did not fit in usize")
 }
 
-async fn list_namespaces_documents(
-    documents: &dyn DocumentStore,
-) -> anyhow::Result<Vec<String>> {
+async fn list_namespaces_documents(documents: &dyn DocumentStore) -> anyhow::Result<Vec<String>> {
     let rows = query_all(documents, Filter::All).await?;
     let mut namespaces = BTreeSet::new();
     for row in rows {
