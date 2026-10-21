@@ -1,7 +1,7 @@
 use std::io::{self, Write};
 
 use anyhow::{Context, Result};
-use tinystoragedrivers::{Scope, StorageBackend, StorageConfig};
+use tinystoragedrivers::{Scope, StorageConfig};
 
 const MAX_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
 const DEFAULT_CHUNK_LIMIT: usize = 300;
