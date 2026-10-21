@@ -154,6 +154,39 @@ fn matching_chunks_with_extra(
         }
     }
     let (mut chunks, states) = super::versioned::list_chunk_snapshot(config, &collections)?;
+    filter_chunk_snapshot(chunks, states, query)
+}
+
+pub(crate) async fn list_chunks_with_content_state_async(
+    config: &MemoryConfig,
+    query: &ListChunksQuery,
+) -> Result<(
+    Vec<Chunk>,
+    std::collections::HashMap<String, Vec<(String, serde_json::Value)>>,
+)> {
+    let collections = [
+        super::collections::CHUNK_LIFECYCLE,
+        super::collections::ENTITY_INDEX,
+        super::collections::RAW_REFS,
+        super::collections::CHUNK_CONTENT_POINTERS,
+    ];
+    let (_, chunks, states) =
+        super::versioned::list_chunk_snapshot_with_head_async(config, &collections).await?;
+    let (mut chunks, states) = filter_chunk_snapshot(chunks, states, query)?;
+    let offset = query.offset.unwrap_or(0).min(chunks.len());
+    let limit = normalized_limit(query.limit) as usize;
+    chunks = chunks.drain(offset..).take(limit).collect();
+    Ok((chunks, states))
+}
+
+fn filter_chunk_snapshot(
+    mut chunks: Vec<Chunk>,
+    states: std::collections::HashMap<String, Vec<(String, serde_json::Value)>>,
+    query: &ListChunksQuery,
+) -> Result<(
+    Vec<Chunk>,
+    std::collections::HashMap<String, Vec<(String, serde_json::Value)>>,
+)> {
     let lifecycle = states
         .get(super::collections::CHUNK_LIFECYCLE)
         .into_iter()
