@@ -129,7 +129,7 @@ impl SourceRegistry {
                 .find(|source| source.id == id)
                 .ok_or_else(|| anyhow!("source '{id}' not found"))?;
             patch.validate_for_kind(entry.kind.clone())?;
-            patch.apply_to(entry);
+            patch.clone().apply_to(entry);
             entry.validate().map_err(|error| anyhow!(error))?;
             Ok(entry.clone())
         })
