@@ -438,8 +438,8 @@ fn cover_prefers_raw_refs_over_pointer_and_inline_preview() {
     assert_eq!(hit.content, "raw archive body");
 }
 
-#[tokio::test]
-async fn async_cover_reads_pointer_body_and_repairs_its_body_checksum() {
+#[test]
+fn async_cover_reads_pointer_body_and_repairs_its_body_checksum() {
     let (tmp, mut cfg) = test_config();
     let content_root = tmp.path().join("content");
     cfg.content_root = Some(content_root.clone());
@@ -454,15 +454,22 @@ async fn async_cover_reads_pointer_body_and_repairs_its_body_checksum() {
     crate::memory::chunks::update_chunk_content_sha256(&cfg, &chunk.id, "stale-frontmatter-hash")
         .unwrap();
 
-    let response = cover_window_async(
-        &cfg,
-        ts.timestamp_millis() - 1,
-        ts.timestamp_millis() + 1,
-        None,
-        None,
-        1,
-    )
-    .await
+    let cover_cfg = cfg.clone();
+    let response = std::thread::spawn(move || {
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(cover_window_async(
+                &cover_cfg,
+                ts.timestamp_millis() - 1,
+                ts.timestamp_millis() + 1,
+                None,
+                None,
+                1,
+            ))
+            .unwrap()
+    })
+    .join()
     .unwrap();
     assert_eq!(response.hits.len(), 1);
     assert_eq!(
@@ -470,15 +477,9 @@ async fn async_cover_reads_pointer_body_and_repairs_its_body_checksum() {
         "full pointer body with semantic checksum"
     );
 
-    let read_cfg = cfg.clone();
-    let chunk_id = chunk.id.clone();
-    let (_, repaired_sha256) = std::thread::spawn(move || {
-        crate::memory::chunks::get_chunk_content_pointers(&read_cfg, &chunk_id)
-            .unwrap()
-            .unwrap()
-    })
-    .join()
-    .unwrap();
+    let (_, repaired_sha256) = crate::memory::chunks::get_chunk_content_pointers(&cfg, &chunk.id)
+        .unwrap()
+        .unwrap();
     assert_eq!(repaired_sha256, expected_sha256);
 }
 
