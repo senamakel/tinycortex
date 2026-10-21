@@ -224,7 +224,10 @@ fn read_legacy_batch(root: &Path) -> Result<LegacyImportBatch> {
                 max_level: row.get::<_, i64>(4)? as u32,
                 status: TreeStatus::parse(&row.get::<_, String>(5)?).map_err(to_sql_error)?,
                 created_at: created,
-                last_sealed_at: last_sealed.map(datetime).transpose()?,
+                last_sealed_at: last_sealed
+                    .map(datetime)
+                    .transpose()
+                    .map_err(to_sql_error)?,
                 ask: row.get(8)?,
             })
         })?
@@ -272,7 +275,7 @@ fn read_legacy_batch(root: &Path) -> Result<LegacyImportBatch> {
             .query_row(
                 "SELECT content_path, content_sha256 FROM mem_tree_summaries WHERE id = ?1",
                 [&summary.id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
             )
             .optional()?
             .filter(|(path, hash)| !path.is_empty() && !hash.is_empty());
