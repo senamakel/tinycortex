@@ -317,8 +317,8 @@ impl KvStore {
                 .list(&prefix, cursor, PAGE_SIZE)
                 .await
                 .map_err(|error| format!("list KV entries: {error}"))?;
-            for record in page.items {
-                let entry: Entry = serde_json::from_value(record.doc)
+            for row in page.items {
+                let entry: Entry = serde_json::from_value(row.doc)
                     .map_err(|error| format!("decode listed KV entry: {error}"))?;
                 let (expected_kind, expected_namespace) = match namespace {
                     Some(namespace) => (EntryKind::Namespace, Some(namespace)),
@@ -634,6 +634,58 @@ impl KvStore {
                 .map(|entry| record(entry, Some(&namespace)))
                 .collect()
         })
+    }
+
+    /// Return records whose namespace begins with `prefix`, newest first.
+    ///
+    /// This is a bounded-page scan over TinyCortex-owned KV keys and validates
+    /// every row's stored identity before filtering. It supports read-only
+    /// inspection surfaces that need to discover dynamically named namespaces
+    /// without reaching around the owner API to inspect the backend directly.
+    pub async fn records_namespaces_with_prefix_async(
+        &self,
+        prefix: &str,
+    ) -> Result<Vec<MemoryKvRecord>, String> {
+        let mut cursor = None;
+        let mut records = Vec::new();
+        loop {
+            let page = self
+                .port
+                .list(&format!("{KEY_PREFIX}n:"), cursor, PAGE_SIZE)
+                .await
+                .map_err(|error| format!("list namespaced KV entries: {error}"))?;
+            for record in page.items {
+                let entry: Entry = serde_json::from_value(record.doc)
+                    .map_err(|error| format!("decode listed KV entry: {error}"))?;
+                let namespace = entry
+                    .namespace
+                    .as_deref()
+                    .ok_or_else(|| format!("namespace missing for KV key '{}'", entry.key))?;
+                let expected_key =
+                    Self::storage_key(EntryKind::Namespace, Some(namespace), &entry.key);
+                if row.id != expected_key || entry.kind != EntryKind::Namespace {
+                    return Err(format!(
+                        "KV identity mismatch while listing key '{}'",
+                        entry.key
+                    ));
+                }
+                if namespace.starts_with(prefix) {
+                    records.push(record(entry, Some(namespace)));
+                }
+            }
+            cursor = page.next;
+            if cursor.is_none() {
+                break;
+            }
+        }
+        records.sort_by(|left, right| {
+            right
+                .updated_at
+                .partial_cmp(&left.updated_at)
+                .unwrap_or(Ordering::Equal)
+                .then_with(|| left.key.cmp(&right.key))
+        });
+        Ok(records)
     }
 
     /// Return all global records newest-first.
