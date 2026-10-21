@@ -14,6 +14,13 @@ use crate::memory::chunks::{
 };
 use crate::memory::config::MemoryConfig;
 
+#[derive(serde::Deserialize)]
+struct SnapshotChunkContentPointer {
+    chunk_id: String,
+    content_path: String,
+    content_sha256: String,
+}
+
 /// Prefix for retryable legacy rows that were written before staged content
 /// files/raw references existed. `has_uncovered_reembed_work` matches this text
 /// inside `body read failed: ...` skip reasons to keep those chunks eligible for
@@ -191,7 +198,7 @@ pub(crate) fn read_chunk_body_from_snapshot(
     }
 
     if let Some(value) = content_pointer {
-        let pointer: ChunkContentPointer = serde_json::from_value(value.clone())?;
+        let pointer: SnapshotChunkContentPointer = serde_json::from_value(value.clone())?;
         if pointer.chunk_id == chunk_id && !pointer.content_path.is_empty() {
             let abs_path =
                 resolve_within_content_root(&content_root(config), &pointer.content_path)?;
