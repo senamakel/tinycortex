@@ -378,76 +378,8 @@ fn batch_embedding_lookup_splits_id_list_above_per_batch_threshold() {
     assert_eq!(map.get(&c3.id).cloned(), Some(vec![3.0]));
 }
 
-#[test]
-fn global_topic_purge_removes_only_global_and_topic() {
-    let (_tmp, cfg) = test_config();
-    upsert_chunks(&cfg, &[sample_chunk("slack:#eng", 0, 1_700_000_000_000)]).unwrap();
-
-    let summaries = content_root(&cfg).join("wiki").join("summaries");
-    for d in [
-        "global-2026-05-28",
-        "global",
-        "topic-alice",
-        "source-slack-eng",
-    ] {
-        std::fs::create_dir_all(summaries.join(d).join("L0")).unwrap();
-    }
-
-    with_connection(&cfg, |conn| {
-        for (id, kind) in [("source:s1", "source"), ("global:g1", "global"), ("topic:t1", "topic")] {
-            conn.execute(
-                "INSERT INTO mem_tree_trees (id, kind, scope, max_level, status, created_at_ms) \
-                 VALUES (?1, ?2, ?2, 0, 'active', 0)",
-                params![id, kind],
-            )?;
-            conn.execute(
-                "INSERT INTO mem_tree_summaries \
-                 (id, tree_id, tree_kind, level, content, token_count, \
-                  time_range_start_ms, time_range_end_ms, sealed_at_ms) \
-                 VALUES (?1, ?2, ?3, 0, 'x', 1, 0, 0, 0)",
-                params![format!("sum-{id}"), id, kind],
-            )?;
-        }
-        for (jid, kind) in [("j1", "topic_route"), ("j2", "digest_daily"), ("j3", "extract_chunk")] {
-            conn.execute(
-                "INSERT INTO mem_tree_jobs (id, kind, payload_json, available_at_ms, created_at_ms) \
-                 VALUES (?1, ?2, '{}', 0, 0)",
-                params![jid, kind],
-            )?;
-        }
-        conn.pragma_update(None, "user_version", 1i64)?;
-        purge_global_topic_trees(conn, &cfg)?;
-
-        let trees: i64 = conn.query_row("SELECT COUNT(*) FROM mem_tree_trees", [], |r| r.get(0))?;
-        assert_eq!(trees, 1, "only the source tree should remain");
-        let kind: String = conn.query_row("SELECT kind FROM mem_tree_trees", [], |r| r.get(0))?;
-        assert_eq!(kind, "source");
-
-        let summaries_left: i64 =
-            conn.query_row("SELECT COUNT(*) FROM mem_tree_summaries", [], |r| r.get(0))?;
-        assert_eq!(summaries_left, 1);
-
-        let jobs_left: Vec<String> = {
-            let mut stmt = conn.prepare("SELECT kind FROM mem_tree_jobs ORDER BY kind")?;
-            let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
-            rows.collect::<rusqlite::Result<_>>()?
-        };
-        assert_eq!(jobs_left, vec!["extract_chunk".to_string()]);
-
-        let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-        assert_eq!(version, 2);
-        Ok(())
-    })
-    .unwrap();
-
-    assert!(!summaries.join("global-2026-05-28").exists());
-    assert!(!summaries.join("global").exists());
-    assert!(!summaries.join("topic-alice").exists());
-    assert!(
-        summaries.join("source-slack-eng").exists(),
-        "source summary folder must survive"
-    );
-}
+// `purge_global_topic_trees` was a one-time SQLite startup migration. The
+// SQLite migration layer is retired; runtime cleanup is covered by `purge_all`.
 
 #[test]
 fn extraction_coverage_empty_store_is_zero() {
