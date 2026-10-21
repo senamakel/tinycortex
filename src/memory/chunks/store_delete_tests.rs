@@ -4,12 +4,11 @@
 
 use super::types::{chunk_id, Chunk, Metadata, SourceKind, SourceRef};
 use super::{
-    count_chunks, delete_chunk_by_id, get_chunk, is_source_ingested, purge_all, upsert_chunks,
-    with_connection,
+    content_root, count_chunks, delete_chunk_by_id, delete_chunks_by_source, get_chunk,
+    is_source_ingested, purge_all, purge_all_async, upsert_chunks, upsert_staged_chunks,
 };
 use crate::memory::config::MemoryConfig;
 use chrono::{TimeZone, Utc};
-use rusqlite::params;
 use tempfile::TempDir;
 
 fn test_config() -> (TempDir, MemoryConfig) {
@@ -71,17 +70,6 @@ fn chunk_with(source_id: &str, seq: u32, ts_ms: i64, content: &str) -> Chunk {
         created_at: ts,
         partial_message: false,
     }
-}
-
-fn count_rows(cfg: &MemoryConfig, table: &str) -> i64 {
-    with_connection(cfg, |conn| {
-        Ok(
-            conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
-                row.get(0)
-            })?,
-        )
-    })
-    .unwrap()
 }
 
 fn index_entity(cfg: &MemoryConfig, node_id: &str) {
