@@ -62,6 +62,19 @@ pub struct ConversationMessage {
     pub created_at: String,
 }
 
+/// Host-decoded legacy transcript passed to the typed import destination.
+/// Hosts read and quiesce legacy files; TinyCortex never opens them.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct LegacyConversationTranscript {
+    /// Thread metadata as returned by the legacy store.
+    pub thread: ConversationThread,
+    /// Original thread-log update timestamp, retained for list ordering.
+    pub updated_at: String,
+    /// Messages in their original append order.
+    pub messages: Vec<ConversationMessage>,
+}
+
 /// Input payload to create-or-update a thread via
 /// [`ConversationStore::ensure_thread`](super::store::ConversationStore::ensure_thread).
 #[derive(Debug, Clone, Serialize, Deserialize)]

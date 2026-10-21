@@ -54,6 +54,89 @@ async fn conversation_store_uses_prepared_streams_and_rebuildable_document_index
 }
 
 #[tokio::test]
+async fn arbitrary_message_ids_keep_legacy_append_order_and_duplicates() {
+    let workspace = tempfile::tempdir().unwrap();
+    let config = crate::memory::chunks::test_support::host_config(workspace.path());
+    let store = ConversationStore::open(&config).unwrap();
+    store
+        .ensure_thread_async(CreateConversationThread {
+            id: "duplicate-id".into(),
+            title: "Duplicates".into(),
+            created_at: "2025-02-03T04:05:06Z".into(),
+            parent_thread_id: None,
+            labels: None,
+            personality_id: None,
+        })
+        .await
+        .unwrap();
+    let message = ConversationMessage {
+        id: "provider-message-id".into(),
+        content: "first delivery".into(),
+        message_type: "text".into(),
+        extra_metadata: serde_json::Value::Null,
+        sender: "user".into(),
+        created_at: "2025-02-03T04:06:00Z".into(),
+    };
+    store
+        .append_message_async("duplicate-id", message.clone())
+        .await
+        .unwrap();
+    let mut redelivery = message.clone();
+    redelivery.content = "second delivery".into();
+    redelivery.created_at = "2025-02-03T04:07:00Z".into();
+    store
+        .append_message_async("duplicate-id", redelivery.clone())
+        .await
+        .unwrap();
+
+    let messages = store.get_messages_async("duplicate-id").await.unwrap();
+    assert_eq!(messages, vec![message, redelivery]);
+}
+
+#[tokio::test]
+async fn legacy_import_preserves_repeated_message_ids_in_source_order() {
+    let workspace = tempfile::tempdir().unwrap();
+    let config = crate::memory::chunks::test_support::host_config(workspace.path());
+    let store = ConversationStore::open(&config).unwrap();
+    let thread = ConversationThread {
+        id: "legacy-duplicate-id".into(),
+        title: "Legacy duplicates".into(),
+        chat_id: None,
+        is_active: true,
+        message_count: 2,
+        last_message_at: "2025-02-03T04:07:00Z".into(),
+        created_at: "2025-02-03T04:05:06Z".into(),
+        parent_thread_id: None,
+        labels: vec!["general".into()],
+        personality_id: None,
+    };
+    let message = |content: &str, created_at: &str| ConversationMessage {
+        id: "same-legacy-id".into(),
+        content: content.into(),
+        message_type: "text".into(),
+        extra_metadata: serde_json::Value::Null,
+        sender: "assistant".into(),
+        created_at: created_at.into(),
+    };
+    let messages = vec![
+        message("first", "2025-02-03T04:06:00Z"),
+        message("second", "2025-02-03T04:07:00Z"),
+    ];
+    store
+        .import_legacy_transcript_async(LegacyConversationTranscript {
+            thread: thread.clone(),
+            updated_at: thread.last_message_at.clone(),
+            messages: messages.clone(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        store.get_messages_async(&thread.id).await.unwrap(),
+        messages
+    );
+}
+
+#[tokio::test]
 async fn thread_stream_remains_authoritative_when_document_projection_write_fails() {
     use std::sync::Arc;
     use tinystoragedrivers_api::Storage;
@@ -93,6 +176,40 @@ async fn thread_stream_remains_authoritative_when_document_projection_write_fail
     let repaired = store.ensure_thread_async(request).await.unwrap();
     assert_eq!(repaired.id, "recoverable");
     assert_eq!(store.list_threads_async().await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn stale_same_offset_delete_removes_the_document_projection() {
+    let workspace = tempfile::tempdir().unwrap();
+    let config = crate::memory::chunks::test_support::host_config(workspace.path());
+    let store = ConversationStore::open(&config).unwrap();
+    store
+        .ensure_thread_async(CreateConversationThread {
+            id: "same-offset-delete".into(),
+            title: "Projected thread".into(),
+            created_at: "2025-02-03T04:05:06Z".into(),
+            parent_thread_id: None,
+            labels: None,
+            personality_id: None,
+        })
+        .await
+        .unwrap();
+    let mut deleted = store.snapshot("same-offset-delete").await.unwrap();
+    deleted.thread = None;
+
+    store.project("same-offset-delete", &deleted).await.unwrap();
+
+    let projected = config
+        .storage()
+        .unwrap()
+        .documents()
+        .get(
+            THREAD_INDEX,
+            &ConversationStore::document_id("same-offset-delete"),
+        )
+        .await
+        .unwrap();
+    assert!(projected.is_none());
 }
 
 #[tokio::test]
