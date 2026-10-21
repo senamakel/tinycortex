@@ -40,7 +40,7 @@ pub struct LegacyEmbedding {
 }
 
 /// One chunk and its typed adjuncts from an older TinyCortex writer.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct LegacyChunkRecord {
     /// Complete legacy chunk, including its historical creation timestamp.
     pub chunk: Chunk,
@@ -106,7 +106,7 @@ pub struct LegacySourceGate {
 }
 
 /// One import batch read by the host's legacy adapter.
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default)]
 pub struct LegacyImportBatch {
     /// Chunk records and their directly owned adjuncts.
     pub chunks: Vec<LegacyChunkRecord>,
@@ -233,6 +233,15 @@ pub async fn import_legacy_batch(
                     c::CHUNK_LIFECYCLE,
                     &record.chunk.id,
                     Some(serde_json::json!({"status": status})),
+                )?;
+            } else if !current_chunks.contains_key(&record.chunk.id) {
+                add_desired(
+                    &mut desired,
+                    c::CHUNK_LIFECYCLE,
+                    &record.chunk.id,
+                    Some(serde_json::json!({
+                        "status": super::store::CHUNK_STATUS_ADMITTED
+                    })),
                 )?;
             }
             if let Some(embedding) = &record.embedding {
@@ -414,6 +423,13 @@ fn validate_batch(batch: &LegacyImportBatch) -> Result<()> {
         );
         if let Some(score) = &record.score {
             anyhow::ensure!(score.chunk_id == record.chunk.id, "legacy score/chunk ID mismatch");
+        }
+        for occurrence in &record.entities {
+            anyhow::ensure!(
+                occurrence.node_id == record.chunk.id,
+                "chunk {} has an entity occurrence for another node",
+                record.chunk.id
+            );
         }
         if let Some(content) = &record.content {
             anyhow::ensure!(
