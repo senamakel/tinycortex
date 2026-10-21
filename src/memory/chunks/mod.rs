@@ -107,9 +107,9 @@ pub use embeddings_query::{
 };
 pub use legacy_import::{
     import_legacy_batch, LegacyBuffer, LegacyChunkRecord, LegacyChunkReembedSkip,
-    LegacyContentPointer, LegacyEmbedding, LegacyEntityEdge, LegacyEntityOccurrence,
-    LegacyHotness, LegacyImportBatch, LegacyImportCounts, LegacySourceGate,
-    LegacySummaryContent, LegacySummaryEmbedding, LegacySummaryReembedSkip,
+    LegacyContentPointer, LegacyEmbedding, LegacyEntityEdge, LegacyEntityOccurrence, LegacyHotness,
+    LegacyImportBatch, LegacyImportCounts, LegacySourceGate, LegacySummaryContent,
+    LegacySummaryEmbedding, LegacySummaryReembedSkip,
 };
 pub use raw_refs::{
     get_chunk_content_path, get_chunk_content_pointers, get_chunk_raw_refs,

@@ -94,7 +94,7 @@ fn fixture_batch() -> LegacyImportBatch {
     };
     LegacyImportBatch {
         chunks: vec![LegacyChunkRecord {
-            chunk,
+            chunk: chunk.clone(),
             content: Some(LegacyContentPointer {
                 path: "chat/legacy-source/chunk.md".into(),
                 sha256: "a".repeat(64),
@@ -154,6 +154,40 @@ fn fixture_batch() -> LegacyImportBatch {
             ingested_at_ms: 1_750_000_000_000,
         }],
         jobs: vec![job],
+        buffers: vec![LegacyBuffer {
+            buffer: crate::memory::tree::store::Buffer {
+                tree_id: tree.id.clone(),
+                level: 0,
+                item_ids: vec![chunk.id.clone()],
+                token_sum: 2,
+                oldest_at: Some(chunk.created_at),
+            },
+        }],
+        hotness: vec![LegacyHotness {
+            counters: HotnessCounters {
+                entity_id: "person:ada".into(),
+                mention_count_30d: 12,
+                distinct_sources: 3,
+                last_seen_ms: Some(1_749_999_000_000),
+                query_hits_30d: 7,
+                graph_centrality: Some(0.75),
+                ingests_since_check: 4,
+                last_hotness: Some(13.5),
+                last_updated_ms: 1_750_000_000_500,
+            },
+        }],
+        chunk_reembed_skips: vec![LegacyChunkReembedSkip {
+            chunk_id: chunk.id.clone(),
+            model_signature: "fixture/model@3".into(),
+            reason: "legacy chunk provider refusal".into(),
+            skipped_at_ms: 1_749_999_123_456,
+        }],
+        summary_reembed_skips: vec![LegacySummaryReembedSkip {
+            summary_id: "legacy-summary".into(),
+            model_signature: "fixture/summary-model@2".into(),
+            reason: "legacy summary exceeds provider budget".into(),
+            skipped_at_ms: 1_749_998_123_456,
+        }],
     }
 }
 
@@ -172,6 +206,9 @@ async fn typed_import_commits_chunk_adjuncts_tree_entities_and_jobs_together() {
     assert_eq!(counts.entities, 1);
     assert_eq!(counts.trees, 2);
     assert_eq!(counts.jobs, 1);
+    assert_eq!(counts.buffers, 1);
+    assert_eq!(counts.hotness, 1);
+    assert_eq!(counts.reembed_skips, 2);
     assert_eq!(
         super::super::versioned::get_chunk_async(&config, &chunk_id)
             .await
@@ -277,6 +314,71 @@ async fn typed_import_commits_chunk_adjuncts_tree_entities_and_jobs_together() {
     assert_eq!(
         before_retry, after_retry,
         "an idempotent retry must not create another owner commit"
+    );
+}
+
+#[tokio::test]
+async fn typed_import_preserves_buffer_hotness_and_skip_history_idempotently() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let config = crate::memory::chunks::test_support::host_config(tmp.path());
+    let mut batch = fixture_batch();
+    batch.chunks[0].score.as_mut().unwrap().chunk_id = batch.chunks[0].chunk.id.clone();
+    let counts = import_legacy_batch(&config, &batch).await.unwrap();
+    let imported_snapshot =
+        crate::memory::chunks::versioned::capture_state_snapshot_async(&config)
+            .await
+            .unwrap();
+    assert_eq!(counts.buffers, 1);
+    assert_eq!(counts.hotness, 1);
+    assert_eq!(counts.reembed_skips, 2);
+    assert_eq!(
+        crate::memory::tree::store::get_buffer(&config, "legacy-tree", 0).unwrap(),
+        batch.buffers[0].buffer
+    );
+    assert_eq!(
+        crate::memory::tree::store::hotness::get(&config, "person:ada").unwrap(),
+        Some(batch.hotness[0].counters.clone())
+    );
+    let chunk_skip_key = serde_json::to_string(&(
+        batch.chunk_reembed_skips[0].chunk_id.as_str(),
+        batch.chunk_reembed_skips[0].model_signature.as_str(),
+    ))
+    .unwrap();
+    let summary_skip_key = serde_json::to_string(&(
+        batch.summary_reembed_skips[0].summary_id.as_str(),
+        batch.summary_reembed_skips[0].model_signature.as_str(),
+    ))
+    .unwrap();
+    let chunk_skip = crate::memory::chunks::versioned::read_state_async(
+        &config,
+        crate::memory::chunks::collections::CHUNK_REEMBED_SKIPS,
+        &chunk_skip_key,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(chunk_skip["reason"], batch.chunk_reembed_skips[0].reason);
+    assert_eq!(chunk_skip["skipped_at_ms"], batch.chunk_reembed_skips[0].skipped_at_ms);
+    let summary_skip = crate::memory::chunks::versioned::read_state_async(
+        &config,
+        crate::memory::chunks::collections::SUMMARY_REEMBED_SKIPS,
+        &summary_skip_key,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(summary_skip["reason"], batch.summary_reembed_skips[0].reason);
+    assert_eq!(
+        summary_skip["skipped_at_ms"],
+        batch.summary_reembed_skips[0].skipped_at_ms
+    );
+
+    import_legacy_batch(&config, &batch).await.unwrap();
+    assert_eq!(
+        crate::memory::chunks::versioned::capture_state_snapshot_async(&config)
+            .await
+            .unwrap(),
+        imported_snapshot
     );
 }
 

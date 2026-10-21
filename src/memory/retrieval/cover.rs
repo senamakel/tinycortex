@@ -243,14 +243,16 @@ fn collect_cover(
     let mut hits: Vec<RetrievalHit> = Vec::new();
     for (source, src_chunks) in by_source {
         cover_one_source(
-            config,
+            CoverSourceContext {
+                config,
+                since_ms,
+                until_ms,
+                exact_source: restrict_summaries,
+                content_state: &content_state,
+                out: &mut hits,
+            },
             &source,
-            since_ms,
-            until_ms,
             src_chunks,
-            restrict_summaries,
-            &content_state,
-            &mut hits,
         )?;
     }
     Ok(hits)
@@ -303,32 +305,46 @@ async fn collect_cover_async(
     let mut hits = Vec::new();
     for (source, src_chunks) in by_source {
         cover_one_source_async(
-            config,
+            CoverSourceContext {
+                config,
+                since_ms,
+                until_ms,
+                exact_source: restrict_summaries,
+                content_state: &content_state,
+                out: &mut hits,
+            },
             &source,
-            since_ms,
-            until_ms,
             src_chunks,
-            restrict_summaries,
-            &content_state,
-            &mut hits,
         )
         .await?;
     }
     Ok(hits)
 }
 
+struct CoverSourceContext<'a> {
+    config: &'a MemoryConfig,
+    since_ms: i64,
+    until_ms: i64,
+    exact_source: bool,
+    content_state: &'a HashMap<String, HashMap<String, serde_json::Value>>,
+    out: &'a mut Vec<RetrievalHit>,
+}
+
 /// Minimum cover for one source: frontier summaries (when the source has a
 /// sealed tree) plus every in-window chunk they don't already cover, raw.
 fn cover_one_source(
-    config: &MemoryConfig,
+    context: CoverSourceContext<'_>,
     source: &str,
-    since_ms: i64,
-    until_ms: i64,
     chunks: Vec<Chunk>,
-    exact_source: bool,
-    content_state: &HashMap<String, HashMap<String, serde_json::Value>>,
-    out: &mut Vec<RetrievalHit>,
 ) -> Result<()> {
+    let CoverSourceContext {
+        config,
+        since_ms,
+        until_ms,
+        exact_source,
+        content_state,
+        mut out,
+    } = context;
     let tree = get_tree_by_scope(config, TreeKind::Source, source)?;
     let (tree_id, eligible) = match &tree {
         Some(t) => (
@@ -373,15 +389,18 @@ fn cover_one_source(
 }
 
 async fn cover_one_source_async(
-    config: &MemoryConfig,
+    context: CoverSourceContext<'_>,
     source: &str,
-    since_ms: i64,
-    until_ms: i64,
     chunks: Vec<Chunk>,
-    exact_source: bool,
-    content_state: &HashMap<String, HashMap<String, serde_json::Value>>,
-    out: &mut Vec<RetrievalHit>,
 ) -> Result<()> {
+    let CoverSourceContext {
+        config,
+        since_ms,
+        until_ms,
+        exact_source,
+        content_state,
+        mut out,
+    } = context;
     let tree = get_tree_by_scope_async(config, TreeKind::Source, source).await?;
     let (tree_id, eligible) = match &tree {
         Some(tree) => (

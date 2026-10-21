@@ -977,9 +977,7 @@ pub(crate) fn list_chunk_snapshot_with_head(
                 .get(CHUNK_LIFECYCLE)
                 .into_iter()
                 .flatten()
-                .filter(|(_, value)| {
-                    value.get("status").and_then(Value::as_str) == Some("deleted")
-                })
+                .filter(|(_, value)| value.get("status").and_then(Value::as_str) == Some("deleted"))
                 .map(|(key, _)| key.clone())
                 .collect();
             chunks.retain(|chunk| !deleted_ids.contains(&chunk.id));

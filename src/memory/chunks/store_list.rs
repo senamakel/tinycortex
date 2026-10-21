@@ -99,20 +99,14 @@ fn matching_chunks(
     config: &MemoryConfig,
     query: &ListChunksQuery,
     include_details: bool,
-) -> Result<(
-    Vec<Chunk>,
-    super::versioned::StateRows,
-)> {
+) -> Result<(Vec<Chunk>, super::versioned::StateRows)> {
     matching_chunks_with_extra(config, query, include_details, &[])
 }
 
 pub(crate) fn list_chunks_with_content_state(
     config: &MemoryConfig,
     query: &ListChunksQuery,
-) -> Result<(
-    Vec<Chunk>,
-    super::versioned::StateRows,
-)> {
+) -> Result<(Vec<Chunk>, super::versioned::StateRows)> {
     let (mut chunks, states) = matching_chunks_with_extra(
         config,
         query,
@@ -133,10 +127,7 @@ fn matching_chunks_with_extra(
     query: &ListChunksQuery,
     include_details: bool,
     extra_collections: &[&str],
-) -> Result<(
-    Vec<Chunk>,
-    super::versioned::StateRows,
-)> {
+) -> Result<(Vec<Chunk>, super::versioned::StateRows)> {
     let mut collections = Vec::new();
     if query.exclude_dropped || include_details {
         collections.push(super::collections::CHUNK_LIFECYCLE);
@@ -160,10 +151,7 @@ fn matching_chunks_with_extra(
 pub(crate) async fn list_chunks_with_content_state_async(
     config: &MemoryConfig,
     query: &ListChunksQuery,
-) -> Result<(
-    Vec<Chunk>,
-    super::versioned::StateRows,
-)> {
+) -> Result<(Vec<Chunk>, super::versioned::StateRows)> {
     let collections = [
         super::collections::CHUNK_LIFECYCLE,
         super::collections::ENTITY_INDEX,
@@ -183,10 +171,7 @@ fn filter_chunk_snapshot(
     mut chunks: Vec<Chunk>,
     states: super::versioned::StateRows,
     query: &ListChunksQuery,
-) -> Result<(
-    Vec<Chunk>,
-    super::versioned::StateRows,
-)> {
+) -> Result<(Vec<Chunk>, super::versioned::StateRows)> {
     let lifecycle = states
         .get(super::collections::CHUNK_LIFECYCLE)
         .into_iter()

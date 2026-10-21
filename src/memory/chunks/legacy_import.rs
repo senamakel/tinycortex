@@ -579,8 +579,7 @@ pub async fn import_legacy_batch(
             jobs: staged_jobs.publish.len(),
             buffers: batch.buffers.len(),
             hotness: batch.hotness.len(),
-            reembed_skips: batch.chunk_reembed_skips.len()
-                + batch.summary_reembed_skips.len(),
+            reembed_skips: batch.chunk_reembed_skips.len() + batch.summary_reembed_skips.len(),
         };
 
         let committed = if chunks_to_write.is_empty() && changes.is_empty() {
@@ -721,7 +720,10 @@ fn validate_batch(batch: &LegacyImportBatch) -> Result<()> {
             }),
             "legacy buffer has a duplicate, empty, or unknown pending item"
         );
-        anyhow::ensure!(buffer.token_sum >= 0, "legacy buffer has negative token sum");
+        anyhow::ensure!(
+            buffer.token_sum >= 0,
+            "legacy buffer has negative token sum"
+        );
     }
     let mut hotness_ids = HashSet::new();
     for record in &batch.hotness {
@@ -750,7 +752,8 @@ fn validate_batch(batch: &LegacyImportBatch) -> Result<()> {
         anyhow::ensure!(
             summary_ids.contains(skip.summary_id.as_str())
                 && !skip.model_signature.trim().is_empty()
-                && summary_skip_keys.insert((skip.summary_id.as_str(), skip.model_signature.as_str())),
+                && summary_skip_keys
+                    .insert((skip.summary_id.as_str(), skip.model_signature.as_str())),
             "invalid or duplicate legacy summary re-embed skip"
         );
         super::embeddings::validate_reembed_skip_key("summary_id", &skip.summary_id)?;
