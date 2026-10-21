@@ -1,18 +1,11 @@
 #![allow(unused_imports)]
 //! Unit tests for the chunk store (`super`): upsert / list / delete.
 
-use super::connection::{
-    clear_connection_cache_for, get_or_init_connection, invalidate_connection,
-    schema_apply_count_for_path_for_tests, with_connection, CB_THRESHOLD,
-};
 use super::embeddings::{active_embedding_dims, embedding_to_blob};
-use super::migrations::purge_global_topic_trees;
-use super::recovery::{is_transient_cold_start, try_cleanup_stale_files};
-use super::store::upsert_staged_chunks_tx;
 use super::types::{chunk_id, Chunk, Metadata, SourceKind, SourceRef, StagedChunk};
 use super::{
-    claim_source_ingest_tx, clear_chunk_reembed_skipped, clear_reembed_skipped_for_signature,
-    content_root, count_chunks, count_raw_paths_ingested_with_prefix, db_path_for,
+    clear_chunk_reembed_skipped, clear_reembed_skipped_for_signature, content_root, count_chunks,
+    count_raw_paths_ingested_with_prefix,
     delete_chunk_by_id, delete_chunks_by_owner, delete_chunks_by_source, extraction_coverage,
     filter_raw_paths_not_ingested, get_chunk, get_chunk_content_path, get_chunk_content_pointers,
     get_chunk_embedding, get_chunk_embedding_for_signature,
@@ -21,11 +14,10 @@ use super::{
     list_chunks, list_summaries_with_content_path, mark_chunk_reembed_skipped,
     mark_raw_paths_ingested, set_chunk_embedding, set_chunk_embedding_for_signature,
     set_chunk_raw_refs, tree_active_signature, upsert_chunks, upsert_staged_chunks,
-    ListChunksQuery, RawRef, DB_DIR, GLOBAL_TOPIC_PURGE_MIGRATION_VERSION,
+    ListChunksQuery, RawRef,
 };
 use crate::memory::config::MemoryConfig;
 use chrono::{TimeZone, Utc};
-use rusqlite::params;
 use std::sync::Arc;
 use tempfile::TempDir;
 
