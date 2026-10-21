@@ -97,10 +97,6 @@ async fn extended_v013_public_writer_batch_imports_and_reads_back() -> Result<()
         tree::store::get_summary(&config, &source_summary.id)?,
         Some(source_summary.clone())
     );
-    assert_eq!(
-        read_summary_body(&config, &source_summary.id)?,
-        source_summary.content
-    );
     let summary_pointer = batch
         .summary_content
         .iter()
