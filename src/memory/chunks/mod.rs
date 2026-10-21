@@ -109,9 +109,9 @@ pub use connection::{shared_connection, with_connection};
 pub use embeddings::{
     clear_chunk_reembed_skipped, clear_reembed_skipped_for_signature,
     clear_summary_reembed_skipped, embedding_to_blob, mark_chunk_reembed_skipped,
-    mark_summary_reembed_skipped, set_chunk_embedding, set_chunk_embedding_for_signature,
-    set_chunk_embedding_for_signature_tx, set_summary_embedding_for_signature_tx,
-    tree_active_signature, REEMBED_SKIP_KEY_MAX_LEN,
+    mark_summary_reembed_skipped, plan_chunk_embedding_for_queue, set_chunk_embedding,
+    set_chunk_embedding_for_signature, set_chunk_embedding_for_signature_tx,
+    set_summary_embedding_for_signature_tx, tree_active_signature, REEMBED_SKIP_KEY_MAX_LEN,
 };
 pub use embeddings_query::{
     get_chunk_embedding, get_chunk_embedding_async, get_chunk_embedding_for_signature,
@@ -151,6 +151,10 @@ pub use store_list::{
     count_chunks_matching, list_chunk_details, list_chunks, source_totals, ChunkDetailRow,
     ListChunksQuery, SourceTotal,
 };
+
+#[cfg(test)]
+#[path = "embedding_plan_tests.rs"]
+mod embedding_plan_tests;
 pub use store_sources::{get_chunk_lifecycle_status_tx, set_chunk_lifecycle_status_tx};
 
 // ── Shared internal constants / helpers ─────────────────────────────────────

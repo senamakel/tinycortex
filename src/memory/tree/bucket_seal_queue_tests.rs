@@ -3,8 +3,9 @@ use crate::memory::chunks::{
     chunk_id, upsert_chunks_async, Chunk, Metadata, SourceKind, SourceRef,
 };
 use crate::memory::queue::{
-    AppendDecision, AppendTarget, DelegateOutput, ExtractDecision, JobStateCollection, NewJob,
-    NodeRef, QueueDelegates, ReembedProgress, SealDocumentPayload, SealPayload, StaleBuffer,
+    AppendBufferPayload, AppendDecision, AppendTarget, DelegateOutput, ExtractDecision,
+    JobStateCollection, NewJob, NodeRef, QueueDelegates, ReembedProgress, SealDocumentPayload,
+    SealPayload, StaleBuffer,
 };
 use crate::memory::store::entity_index::{CanonicalEntity, EntityIndex, EntityKind};
 use crate::memory::tree::store::{self, TreeKind};
@@ -55,11 +56,11 @@ impl QueueDelegates for SealDelegate {
 
     async fn append_node(
         &self,
-        _: &crate::memory::config::MemoryConfig,
-        _: &NodeRef,
-        _: &AppendTarget,
+        config: &crate::memory::config::MemoryConfig,
+        node: &NodeRef,
+        target: &AppendTarget,
     ) -> Result<Option<DelegateOutput<AppendDecision>>> {
-        bail!("not an append job")
+        plan_append_node_for_queue(config, node, target).await
     }
 
     async fn seal_level(
@@ -135,6 +136,70 @@ fn config() -> (TempDir, crate::memory::config::MemoryConfig) {
     let tmp = TempDir::new().unwrap();
     let config = crate::memory::chunks::test_support::host_config(tmp.path());
     (tmp, config)
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn queued_append_publishes_buffer_with_lease_settlement() {
+    let (_tmp, config) = config();
+    let tree =
+        crate::memory::tree::get_or_create_tree_async(&config, TreeKind::Topic, "queue-append")
+            .await
+            .unwrap();
+    let chunk = chunk(3, 1_700_000_000_000);
+    upsert_chunks_async(&config, std::slice::from_ref(&chunk))
+        .await
+        .unwrap();
+    let payload = AppendBufferPayload {
+        node: NodeRef::Leaf {
+            chunk_id: chunk.id.clone(),
+        },
+        target: AppendTarget::Topic {
+            tree_id: tree.id.clone(),
+        },
+    };
+    let delegate = SealDelegate {
+        summariser: ConcatSummariser,
+        observer: NoopSealObserver,
+        #[cfg(feature = "tokio")]
+        invalidate_job_lease: None,
+    };
+
+    let planned = delegate
+        .append_node(&config, &payload.node, &payload.target)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!planned.mutations.is_empty());
+    assert!(store::get_buffer_async(&config, &tree.id, 0)
+        .await
+        .unwrap()
+        .is_empty());
+
+    let job_id = crate::memory::queue::store::enqueue_async(
+        &config,
+        &NewJob::append_buffer(&payload).unwrap(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(crate::memory::queue::run_once(&config, &delegate)
+        .await
+        .unwrap());
+    assert_eq!(
+        store::get_buffer_async(&config, &tree.id, 0)
+            .await
+            .unwrap()
+            .item_ids,
+        vec![chunk.id]
+    );
+    assert_eq!(
+        crate::memory::queue::store::get_job_async(&config, &job_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        crate::memory::queue::JobStatus::Done
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]

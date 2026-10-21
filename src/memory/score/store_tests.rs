@@ -67,6 +67,39 @@ fn upsert_score_idempotent() {
     assert_eq!(count_scores(&cfg).unwrap(), 1);
 }
 
+#[tokio::test]
+async fn queue_score_planner_returns_owner_mutations_without_persisting_them() {
+    let (_tmp, cfg) = test_config();
+    let row = sample_row("planned-chunk", false);
+    let result = crate::memory::score::ScoreResult {
+        chunk_id: row.chunk_id.clone(),
+        total: row.total,
+        signals: row.signals,
+        kept: true,
+        drop_reason: None,
+        extracted: Default::default(),
+        canonical_entities: vec![sample_entity("alice")],
+    };
+
+    let mutations = plan_score_persistence_for_queue(&cfg, &result, 123, Some("source"))
+        .await
+        .unwrap();
+
+    assert!(mutations.iter().any(|mutation| {
+        mutation.collection == crate::memory::queue::JobStateCollection::ChunkScores
+            && mutation.key == "planned-chunk"
+    }));
+    assert!(mutations.iter().any(|mutation| {
+        mutation.collection == crate::memory::queue::JobStateCollection::EntityIndex
+            && mutation.value.is_some()
+    }));
+    assert!(get_score_async(&cfg, "planned-chunk").await.unwrap().is_none());
+    assert!(list_entity_ids_for_node_async(&cfg, "planned-chunk")
+        .await
+        .unwrap()
+        .is_empty());
+}
+
 #[test]
 fn dropped_flag_persists() {
     let (_tmp, cfg) = test_config();

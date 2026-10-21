@@ -125,6 +125,72 @@ pub fn set_chunk_embedding_for_signature(
     Ok(())
 }
 
+/// Plan one queue-owned embedding write without publishing it.
+///
+/// The chunk row is carried as a guarded no-op mutation so a concurrent chunk
+/// deletion fences the vector write during the same lease settlement. The
+/// existing vector is replaced and any matching re-embed skip is cleared.
+pub async fn plan_chunk_embedding_for_queue(
+    config: &MemoryConfig,
+    chunk_id: &str,
+    model_signature: &str,
+    embedding: &[f32],
+) -> Result<crate::memory::queue::DelegateOutput<()>> {
+    let chunk_id = validate_reembed_skip_key("chunk_id", chunk_id)?;
+    let model_signature = validate_reembed_skip_key("model_signature", model_signature)?;
+    let dim = i64::try_from(embedding.len()).context("embedding dimension does not fit i64")?;
+    let key = chunk_embedding_key(chunk_id, model_signature);
+    let keys = [
+        super::versioned::StateKey {
+            collection: super::collections::CHUNKS.to_owned(),
+            key: chunk_id.to_owned(),
+        },
+        super::versioned::StateKey {
+            collection: CHUNK_EMBEDDINGS.to_owned(),
+            key: key.clone(),
+        },
+        super::versioned::StateKey {
+            collection: CHUNK_REEMBED_SKIPS.to_owned(),
+            key: key.clone(),
+        },
+    ];
+    let values = super::versioned::read_state_keys_async(config, &keys).await?;
+    let Some(chunk) = values[0].clone() else {
+        anyhow::bail!("cannot plan an embedding for missing chunk {chunk_id}");
+    };
+    let record = ChunkEmbeddingRecord {
+        chunk_id: chunk_id.to_owned(),
+        model_signature: model_signature.to_owned(),
+        vector: embedding_to_blob(embedding),
+        dim,
+        created_at_ms: Utc::now().timestamp_millis(),
+    };
+    use crate::memory::queue::{JobMutation, JobStateCollection as Collection};
+    Ok(crate::memory::queue::DelegateOutput {
+        result: (),
+        mutations: vec![
+            JobMutation {
+                collection: Collection::Chunks,
+                key: chunk_id.to_owned(),
+                expected: Some(chunk.clone()),
+                value: Some(chunk),
+            },
+            JobMutation {
+                collection: Collection::ChunkEmbeddings,
+                key: key.clone(),
+                expected: values[1].clone(),
+                value: Some(serde_json::to_value(record)?),
+            },
+            JobMutation {
+                collection: Collection::ChunkReembedSkips,
+                key,
+                expected: values[2].clone(),
+                value: None,
+            },
+        ],
+    })
+}
+
 /// Legacy SQLite transaction seam retained for source compatibility during
 /// the tree-owned migration. Chunk embeddings cannot be written through it.
 ///

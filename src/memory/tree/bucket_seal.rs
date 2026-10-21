@@ -71,6 +71,252 @@ pub async fn plan_seal_one_level_for_queue(
     })
 }
 
+/// Plan one queue-owned append without publishing any tree state.
+///
+/// The returned buffer and tree mutations can be combined with the append
+/// job's lease receipt in the queue's owner-head CAS. This keeps a stale
+/// worker from appending after its lease has expired.
+pub(crate) async fn plan_append_to_buffer_for_queue(
+    config: &MemoryConfig,
+    tree_id: &str,
+    level: u32,
+    item_id: &str,
+    token_delta: i64,
+    item_ts: DateTime<Utc>,
+) -> Result<crate::memory::queue::DelegateOutput<crate::memory::queue::AppendDecision>> {
+    let staged =
+        store::stage_buffer_item_async(config, tree_id, level, item_id, token_delta, item_ts)
+            .await?;
+    let mutations = merge_staged_seal_changes(staged.expected, staged.changes)?;
+    Ok(crate::memory::queue::DelegateOutput {
+        result: crate::memory::queue::AppendDecision {
+            tree_id: tree_id.to_owned(),
+            should_seal: should_seal(config, &staged.buffer),
+        },
+        mutations,
+    })
+}
+
+/// Plan a queue append from its typed node and destination references.
+///
+/// Cortex resolves the node's stored token/time metadata, rejects missing or
+/// dropped leaves and deleted summaries, and resolves or stages a source tree
+/// itself. The returned mutations include all existence predicates and remain
+/// invisible until queue lease settlement commits them.
+pub async fn plan_append_node_for_queue(
+    config: &MemoryConfig,
+    node: &crate::memory::queue::NodeRef,
+    target: &crate::memory::queue::AppendTarget,
+) -> Result<Option<crate::memory::queue::DelegateOutput<crate::memory::queue::AppendDecision>>> {
+    use crate::memory::chunks::collections as c;
+    use crate::memory::chunks::versioned::{read_state_keys_async, StateKey};
+    use crate::memory::queue::{JobMutation, JobStateCollection as C};
+    use crate::memory::tree::store::TreeStatus;
+
+    let (item_id, token_delta, timestamp, node_mutations) = match node {
+        crate::memory::queue::NodeRef::Leaf { chunk_id } => {
+            let keys = [
+                StateKey {
+                    collection: c::CHUNKS.to_owned(),
+                    key: chunk_id.clone(),
+                },
+                StateKey {
+                    collection: c::CHUNK_LIFECYCLE.to_owned(),
+                    key: chunk_id.clone(),
+                },
+            ];
+            let values = read_state_keys_async(config, &keys).await?;
+            let Some(chunk_value) = values[0].clone() else {
+                return Ok(None);
+            };
+            if values[1]
+                .as_ref()
+                .and_then(|v| v.get("status"))
+                .and_then(serde_json::Value::as_str)
+                == Some(crate::memory::chunks::CHUNK_STATUS_DROPPED)
+            {
+                return Ok(None);
+            }
+            let chunk: crate::memory::chunks::Chunk = serde_json::from_value(chunk_value.clone())?;
+            (
+                chunk_id.clone(),
+                i64::from(chunk.token_count),
+                chunk.created_at,
+                vec![
+                    JobMutation {
+                        collection: C::Chunks,
+                        key: chunk_id.clone(),
+                        expected: Some(chunk_value.clone()),
+                        value: Some(chunk_value),
+                    },
+                    JobMutation {
+                        collection: C::ChunkLifecycle,
+                        key: chunk_id.clone(),
+                        expected: values[1].clone(),
+                        value: values[1].clone(),
+                    },
+                ],
+            )
+        }
+        crate::memory::queue::NodeRef::Summary { summary_id } => {
+            let Some(value) = crate::memory::chunks::versioned::read_state_async(
+                config,
+                c::SUMMARIES,
+                &format!("summary:{summary_id}"),
+            )
+            .await?
+            else {
+                return Ok(None);
+            };
+            let summary: SummaryNode = serde_json::from_value(value.clone())?;
+            if summary.deleted {
+                return Ok(None);
+            }
+            (
+                summary_id.clone(),
+                summary.token_count as i64,
+                summary.time_range_start,
+                vec![JobMutation {
+                    collection: C::Summaries,
+                    key: format!("summary:{summary_id}"),
+                    expected: Some(value.clone()),
+                    value: Some(value),
+                }],
+            )
+        }
+    };
+
+    let (tree_id, tree_mutations, new_tree) = match target {
+        crate::memory::queue::AppendTarget::Topic { tree_id } => {
+            let Some(value) = crate::memory::chunks::versioned::read_state_async(
+                config,
+                c::TREES,
+                &format!("tree:{tree_id}"),
+            )
+            .await?
+            else {
+                return Ok(None);
+            };
+            let tree: Tree = serde_json::from_value(value.clone())?;
+            anyhow::ensure!(
+                tree.status == TreeStatus::Active,
+                "tree '{tree_id}' is archived"
+            );
+            (
+                tree_id.clone(),
+                vec![JobMutation {
+                    collection: C::Trees,
+                    key: format!("tree:{tree_id}"),
+                    expected: Some(value.clone()),
+                    value: Some(value),
+                }],
+                None,
+            )
+        }
+        crate::memory::queue::AppendTarget::Source { source_id } => {
+            let rows = crate::memory::chunks::versioned::list_state_async(config, c::TREES).await?;
+            let scope_key = format!("scope:source:{source_id}");
+            if let Some(tree_id) = rows
+                .iter()
+                .find(|(key, _)| key == &scope_key)
+                .and_then(|(_, value)| value.as_str())
+            {
+                let value = rows
+                    .iter()
+                    .find(|(key, _)| key == &format!("tree:{tree_id}"))
+                    .map(|(_, value)| value.clone())
+                    .context("source tree scope points to a missing tree")?;
+                let tree: Tree = serde_json::from_value(value.clone())?;
+                anyhow::ensure!(
+                    tree.status == TreeStatus::Active,
+                    "tree '{tree_id}' is archived"
+                );
+                (
+                    tree_id.to_owned(),
+                    vec![
+                        JobMutation {
+                            collection: C::Trees,
+                            key: scope_key.clone(),
+                            expected: Some(serde_json::Value::String(tree_id.to_owned())),
+                            value: Some(serde_json::Value::String(tree_id.to_owned())),
+                        },
+                        JobMutation {
+                            collection: C::Trees,
+                            key: format!("tree:{tree_id}"),
+                            expected: Some(value.clone()),
+                            value: Some(value),
+                        },
+                    ],
+                    None,
+                )
+            } else {
+                let tree = Tree {
+                    id: crate::memory::tree::new_tree_id(crate::memory::tree::TreeKind::Source),
+                    kind: crate::memory::tree::TreeKind::Source,
+                    scope: source_id.clone(),
+                    root_id: None,
+                    max_level: 0,
+                    status: TreeStatus::Active,
+                    created_at: Utc::now(),
+                    last_sealed_at: None,
+                    ask: None,
+                };
+                let tree_key = format!("tree:{}", tree.id);
+                let scope_value = serde_json::Value::String(tree.id.clone());
+                (
+                    tree.id.clone(),
+                    vec![
+                        JobMutation {
+                            collection: C::Trees,
+                            key: scope_key,
+                            expected: None,
+                            value: Some(scope_value),
+                        },
+                        JobMutation {
+                            collection: C::Trees,
+                            key: tree_key,
+                            expected: None,
+                            value: Some(serde_json::to_value(tree.clone())?),
+                        },
+                    ],
+                    Some(tree),
+                )
+            }
+        }
+    };
+
+    let mut mutations = node_mutations;
+    mutations.extend(tree_mutations);
+    let (buffer, buffer_mutations) = if let Some(tree) = new_tree {
+        let mut buffer = Buffer::empty(&tree.id, 0);
+        buffer.item_ids.push(item_id);
+        buffer.token_sum = token_delta;
+        buffer.oldest_at = Some(timestamp);
+        let mutation = crate::memory::queue::JobMutation {
+            collection: crate::memory::queue::JobStateCollection::TreeBuffers,
+            key: format!("buffer:{}:0", tree.id),
+            expected: None,
+            value: Some(serde_json::to_value(&buffer)?),
+        };
+        (buffer, vec![mutation])
+    } else {
+        let staged =
+            store::stage_buffer_item_async(config, &tree_id, 0, &item_id, token_delta, timestamp)
+                .await?;
+        let buffer = staged.buffer;
+        let mutations = merge_staged_seal_changes(staged.expected, staged.changes)?;
+        (buffer, mutations)
+    };
+    mutations.extend(buffer_mutations);
+    Ok(Some(crate::memory::queue::DelegateOutput {
+        result: crate::memory::queue::AppendDecision {
+            tree_id,
+            should_seal: should_seal(config, &buffer.buffer),
+        },
+        mutations,
+    }))
+}
+
 fn merge_staged_seal_changes(
     expected: Vec<crate::memory::chunks::versioned::StateChange>,
     changes: Vec<crate::memory::chunks::versioned::StateChange>,

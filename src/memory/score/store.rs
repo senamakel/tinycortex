@@ -10,9 +10,10 @@ use std::collections::{HashMap, HashSet};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
-use crate::memory::chunks::collections::SCORES;
+use crate::memory::chunks::collections::{ENTITY_INDEX, SCORES};
 use crate::memory::chunks::versioned::{self, StateChange};
 use crate::memory::config::MemoryConfig;
+use crate::memory::queue::{JobMutation, JobStateCollection};
 use crate::memory::score::extract::EntityKind;
 use crate::memory::score::resolver::CanonicalEntity;
 use crate::memory::score::signals::ScoreSignals;
@@ -175,6 +176,54 @@ pub(crate) async fn stage_score_and_entities_async(
     staged.expected.extend(entity_changes.expected);
     staged.changes.extend(entity_changes.changes);
     Ok(staged)
+}
+
+/// Stage a score result and its replacement entity occurrences for one queue
+/// settlement. The returned mutations are not persisted; the queue worker
+/// commits them with the job receipt and any follow-up intents under one owner
+/// head. A dropped result still returns tombstones for prior occurrences.
+pub async fn plan_score_persistence_for_queue(
+    config: &MemoryConfig,
+    result: &super::ScoreResult,
+    timestamp_ms: i64,
+    tree_id: Option<&str>,
+) -> Result<Vec<JobMutation>> {
+    let row = super::score_row(result);
+    let staged = stage_score_and_entities_async(
+        config,
+        &row,
+        &result.canonical_entities,
+        result.kept,
+        timestamp_ms,
+        tree_id,
+    )
+    .await?;
+    anyhow::ensure!(
+        staged.expected.len() == staged.changes.len(),
+        "score planner produced mismatched preconditions and changes"
+    );
+    staged
+        .expected
+        .into_iter()
+        .zip(staged.changes)
+        .map(|(expected, change)| {
+            anyhow::ensure!(
+                expected.collection == change.collection && expected.key == change.key,
+                "score planner produced mismatched mutation identity"
+            );
+            let collection = match change.collection.as_str() {
+                SCORES => JobStateCollection::ChunkScores,
+                ENTITY_INDEX => JobStateCollection::EntityIndex,
+                other => anyhow::bail!("unsupported score mutation collection {other}"),
+            };
+            Ok(JobMutation {
+                collection,
+                key: change.key,
+                expected: expected.value,
+                value: change.value,
+            })
+        })
+        .collect()
 }
 
 /// Stage summary entities for an owner commit. Summary surfaces are stored as
