@@ -147,13 +147,15 @@ async fn persist_score_enqueue(
     let publish_jobs = sink.accepts_extract_jobs();
     let intent_ids = persist_ingest_operation(
         config,
-        source_id,
-        source_kind,
-        &chunks,
-        &staged,
-        &scores,
-        opts,
-        publish_jobs,
+        IngestPersistence {
+            source_id,
+            source_kind,
+            chunks: &chunks,
+            staged: &staged,
+            scores: &scores,
+            opts,
+            publish_jobs,
+        },
     )
     .await?;
     let Some(intent_ids) = intent_ids else {
@@ -191,16 +193,29 @@ async fn persist_score_enqueue(
     })
 }
 
+struct IngestPersistence<'a> {
+    source_id: &'a str,
+    source_kind: SourceKind,
+    chunks: &'a [crate::memory::chunks::Chunk],
+    staged: &'a [crate::memory::chunks::StagedChunk],
+    scores: &'a [crate::memory::score::ScoreResult],
+    opts: &'a IngestOptions,
+    publish_jobs: bool,
+}
+
 async fn persist_ingest_operation(
     config: &MemoryConfig,
-    source_id: &str,
-    source_kind: SourceKind,
-    chunks: &[crate::memory::chunks::Chunk],
-    staged: &[crate::memory::chunks::StagedChunk],
-    scores: &[crate::memory::score::ScoreResult],
-    opts: &IngestOptions,
-    publish_jobs: bool,
+    operation: IngestPersistence<'_>,
 ) -> Result<Option<Vec<String>>> {
+    let IngestPersistence {
+        source_id,
+        source_kind,
+        chunks,
+        staged,
+        scores,
+        opts,
+        publish_jobs,
+    } = operation;
     let gate_key = match opts.gate_version_ms {
         Some(version) => format!("{source_id}@{version}"),
         None => source_id.to_string(),

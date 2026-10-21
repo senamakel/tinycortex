@@ -101,7 +101,7 @@ fn matching_chunks(
     include_details: bool,
 ) -> Result<(
     Vec<Chunk>,
-    std::collections::HashMap<String, Vec<(String, serde_json::Value)>>,
+    super::versioned::StateRows,
 )> {
     matching_chunks_with_extra(config, query, include_details, &[])
 }
@@ -111,7 +111,7 @@ pub(crate) fn list_chunks_with_content_state(
     query: &ListChunksQuery,
 ) -> Result<(
     Vec<Chunk>,
-    std::collections::HashMap<String, Vec<(String, serde_json::Value)>>,
+    super::versioned::StateRows,
 )> {
     let (mut chunks, states) = matching_chunks_with_extra(
         config,
@@ -135,7 +135,7 @@ fn matching_chunks_with_extra(
     extra_collections: &[&str],
 ) -> Result<(
     Vec<Chunk>,
-    std::collections::HashMap<String, Vec<(String, serde_json::Value)>>,
+    super::versioned::StateRows,
 )> {
     let mut collections = Vec::new();
     if query.exclude_dropped || include_details {
@@ -162,7 +162,7 @@ pub(crate) async fn list_chunks_with_content_state_async(
     query: &ListChunksQuery,
 ) -> Result<(
     Vec<Chunk>,
-    std::collections::HashMap<String, Vec<(String, serde_json::Value)>>,
+    super::versioned::StateRows,
 )> {
     let collections = [
         super::collections::CHUNK_LIFECYCLE,
@@ -181,11 +181,11 @@ pub(crate) async fn list_chunks_with_content_state_async(
 
 fn filter_chunk_snapshot(
     mut chunks: Vec<Chunk>,
-    states: std::collections::HashMap<String, Vec<(String, serde_json::Value)>>,
+    states: super::versioned::StateRows,
     query: &ListChunksQuery,
 ) -> Result<(
     Vec<Chunk>,
-    std::collections::HashMap<String, Vec<(String, serde_json::Value)>>,
+    super::versioned::StateRows,
 )> {
     let lifecycle = states
         .get(super::collections::CHUNK_LIFECYCLE)
