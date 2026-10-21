@@ -14,8 +14,8 @@ use sha2::{Digest, Sha256};
 use tinystoragedrivers_api::{DocumentStore, DocumentStoreExt};
 use tinystoragedrivers_types::{Filter, Precondition, Query, Versioned, WriteOp};
 
-use crate::memory::{config::MemoryConfig, storage::Blocking};
 use super::embedding::EmbeddingBackend;
+use crate::memory::{config::MemoryConfig, storage::Blocking};
 
 /// Collection containing one record per `(namespace, id)` vector.
 pub const VECTOR_RECORDS: &str = "memory_vectors";
@@ -29,8 +29,7 @@ const QUERY_PAGE_SIZE: usize = 512;
 pub fn collections() -> Vec<tinystoragedrivers_types::CollectionSpec> {
     use tinystoragedrivers_types::{CollectionSpec, IndexSpec};
     vec![
-        CollectionSpec::new(VECTOR_RECORDS)
-            .index(IndexSpec::new("by_namespace", ["namespace"])),
+        CollectionSpec::new(VECTOR_RECORDS).index(IndexSpec::new("by_namespace", ["namespace"])),
         CollectionSpec::new(VECTOR_METADATA),
     ]
 }
@@ -205,7 +204,8 @@ impl VectorStore {
         limit: usize,
     ) -> anyhow::Result<Vec<SearchResult>> {
         let query_vec = self.backend.embed_one(query).await?;
-        self.search_by_vector_async(namespace, &query_vec, limit).await
+        self.search_by_vector_async(namespace, &query_vec, limit)
+            .await
     }
 
     /// Searches using a pre-computed query vector.
@@ -301,7 +301,10 @@ async fn check_or_store_metadata(
     documents: &dyn DocumentStore,
     expected: VectorMetadata,
 ) -> tinystoragedrivers_types::Result<()> {
-    match documents.get_as::<VectorMetadata>(VECTOR_METADATA, VECTOR_META_ID).await? {
+    match documents
+        .get_as::<VectorMetadata>(VECTOR_METADATA, VECTOR_META_ID)
+        .await?
+    {
         Some(stored) => validate_metadata(&stored.doc, &expected),
         None => match documents
             .put_as(
@@ -342,10 +345,12 @@ fn validate_metadata(
     if stored.backend_signature != expected.backend_signature
         || stored.backend_name != expected.backend_name
     {
-        return Err(tinystoragedrivers_types::StorageError::invalid_input(format!(
-            "vector store backend mismatch: database uses {} but the current backend is {}",
-            stored.backend_signature, expected.backend_signature
-        )));
+        return Err(tinystoragedrivers_types::StorageError::invalid_input(
+            format!(
+                "vector store backend mismatch: database uses {} but the current backend is {}",
+                stored.backend_signature, expected.backend_signature
+            ),
+        ));
     }
     Ok(())
 }
@@ -419,7 +424,11 @@ async fn delete_record(
         "vector document identity mismatch"
     );
     documents
-        .delete(VECTOR_RECORDS, &document_id, Precondition::Version(stored.version))
+        .delete(
+            VECTOR_RECORDS,
+            &document_id,
+            Precondition::Version(stored.version),
+        )
         .await
         .map_err(anyhow::Error::from)
 }
@@ -455,11 +464,7 @@ async fn search_documents(
     query_vec: &[f32],
     limit: usize,
 ) -> anyhow::Result<Vec<SearchResult>> {
-    let rows = query_all(
-        documents,
-        Filter::eq("namespace", namespace.to_owned()),
-    )
-    .await?;
+    let rows = query_all(documents, Filter::eq("namespace", namespace.to_owned())).await?;
     struct ScoredRow {
         score: f64,
         record: VectorRecord,

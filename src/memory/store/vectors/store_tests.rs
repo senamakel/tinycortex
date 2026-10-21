@@ -74,12 +74,7 @@ fn put_raw_record(store: &VectorStore, namespace: &str, id: &str, doc: serde_jso
         .blocking
         .run(async move {
             documents
-                .put(
-                    super::VECTOR_RECORDS,
-                    &document_id,
-                    doc,
-                    Precondition::None,
-                )
+                .put(super::VECTOR_RECORDS, &document_id, doc, Precondition::None)
                 .await
         })
         .unwrap()
@@ -245,7 +240,13 @@ fn vector_store_uses_the_prepared_host_document_port() {
     let store = VectorStore::from_config(&config, Arc::new(FakeEmbedding { dims: 2 })).unwrap();
 
     store
-        .insert_with_vector("host-backed", "notes", "text", &[1.0, 0.0], json!({"source": "test"}))
+        .insert_with_vector(
+            "host-backed",
+            "notes",
+            "text",
+            &[1.0, 0.0],
+            json!({"source": "test"}),
+        )
         .unwrap();
 
     let results = store.search_by_vector("notes", &[1.0, 0.0], 1).unwrap();
