@@ -33,8 +33,9 @@ use crate::memory::tree::store::{
 use crate::memory::tree::{SummaryNode, TreeKind};
 
 use super::types::{
-    hydrated_chunk_hit_from_snapshot, hydrated_chunk_hit_from_snapshot_async, hydrated_summary_hit,
-    hydrated_summary_hit_async, QueryResponse, RetrievalHit,
+    hydrated_chunk_hit, hydrated_chunk_hit_from_snapshot,
+    hydrated_chunk_hit_from_snapshot_async, hydrated_summary_hit, hydrated_summary_hit_async,
+    QueryResponse, RetrievalHit,
 };
 
 /// Page size used while scanning the complete in-window chunk set. Pagination
@@ -353,21 +354,7 @@ fn cover_one_source(
         if plan.covered_chunk_ids.contains(&chunk.id) || suppressed_chunk_ids.contains(&chunk.id) {
             continue;
         }
-        let raw_refs = content_state
-            .get(crate::memory::chunks::collections::RAW_REFS)
-            .and_then(|rows| rows.get(&chunk.id));
-        let content_pointer = content_state
-            .get(crate::memory::chunks::collections::CHUNK_CONTENT_POINTERS)
-            .and_then(|rows| rows.get(&chunk.id));
-        out.push(hydrated_chunk_hit_from_snapshot(
-            config,
-            chunk,
-            &tree_id,
-            source,
-            0.0,
-            raw_refs,
-            content_pointer,
-        ));
+        out.push(hydrated_chunk_hit(config, chunk, &tree_id, source, 0.0));
     }
     Ok(())
 }

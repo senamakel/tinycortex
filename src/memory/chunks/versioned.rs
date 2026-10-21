@@ -1473,6 +1473,26 @@ pub(crate) fn write_state(config: &MemoryConfig, change: StateChange) -> Result<
     write_state_changes(config, &[change])
 }
 
+async fn state_change_matches_at(
+    documents: &dyn tinystoragedrivers_api::DocumentStore,
+    snapshot: &HeadSnapshot,
+    condition: &StateChange,
+) -> tinystoragedrivers_types::Result<bool> {
+    let mut actual = read_state_at(
+        documents,
+        snapshot,
+        &condition.collection,
+        &condition.key,
+    )
+    .await?;
+    if actual.is_none() && condition.collection == CHUNK_LIFECYCLE {
+        actual = implicit_chunk_lifecycle_status(documents, snapshot, &condition.key)
+            .await?
+            .map(|status| serde_json::json!({"status": status}));
+    }
+    Ok(actual == condition.value)
+}
+
 /// Commit domain mutations only while every declared state value still
 /// matches. The values are re-read on each head-CAS retry, fencing stale
 /// workers after another lease epoch has become visible.
@@ -1490,15 +1510,7 @@ pub(crate) fn commit_if_state_matches(
         let read_snapshot = snapshot.clone();
         let matches = config.storage_blocking()?.run(async move {
             for condition in conditions {
-                if read_state_at(
-                    &*documents,
-                    &read_snapshot,
-                    &condition.collection,
-                    &condition.key,
-                )
-                .await?
-                    != condition.value
-                {
+                if !state_change_matches_at(&*documents, &read_snapshot, &condition).await? {
                     return Ok::<_, tinystoragedrivers_types::StorageError>(false);
                 }
             }
@@ -1536,15 +1548,7 @@ pub(crate) async fn commit_if_state_matches_async(
             .storage_blocking()?
             .run_async(async move {
                 for condition in conditions {
-                    if read_state_at(
-                        &*documents,
-                        &read_snapshot,
-                        &condition.collection,
-                        &condition.key,
-                    )
-                    .await?
-                        != condition.value
-                    {
+                    if !state_change_matches_at(&*documents, &read_snapshot, &condition).await? {
                         return Ok::<_, tinystoragedrivers_types::StorageError>(false);
                     }
                 }
@@ -1583,15 +1587,7 @@ pub(crate) async fn commit_if_state_matches_at_snapshot_async(
         .storage_blocking()?
         .run_async(async move {
             for condition in conditions {
-                if read_state_at(
-                    &*documents,
-                    &read_snapshot,
-                    &condition.collection,
-                    &condition.key,
-                )
-                .await?
-                    != condition.value
-                {
+                if !state_change_matches_at(&*documents, &read_snapshot, &condition).await? {
                     return Ok::<_, tinystoragedrivers_types::StorageError>(false);
                 }
             }
@@ -1621,15 +1617,7 @@ pub(crate) fn commit_if_state_matches_at_snapshot(
     let read_snapshot = snapshot.clone();
     let matches = config.storage_blocking()?.run(async move {
         for condition in conditions {
-            if read_state_at(
-                &*documents,
-                &read_snapshot,
-                &condition.collection,
-                &condition.key,
-            )
-            .await?
-                != condition.value
-            {
+            if !state_change_matches_at(&*documents, &read_snapshot, &condition).await? {
                 return Ok::<_, tinystoragedrivers_types::StorageError>(false);
             }
         }
