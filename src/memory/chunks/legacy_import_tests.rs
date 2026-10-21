@@ -301,8 +301,9 @@ async fn typed_import_rejects_path_escape_before_writes() {
 async fn typed_import_rejects_malformed_existing_content_pointer_without_mutation() {
     let tmp = tempfile::TempDir::new().unwrap();
     let config = crate::memory::chunks::test_support::host_config(tmp.path());
-    let batch = fixture_batch();
+    let mut batch = fixture_batch();
     let chunk_id = batch.chunks[0].chunk.id.clone();
+    batch.chunks[0].score.as_mut().unwrap().chunk_id = chunk_id.clone();
     let pointer = StateChange {
         collection: super::super::collections::CHUNK_CONTENT_POINTERS.to_owned(),
         key: chunk_id.clone(),
