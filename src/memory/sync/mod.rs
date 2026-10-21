@@ -13,7 +13,9 @@ pub mod traits;
 pub mod workspace;
 
 pub use audit::{
-    append_audit_entry, estimate_cost_usd, read_audit_log, RealCostAccumulator, SyncAuditEntry,
+    append_audit_entry, append_audit_entry_async, estimate_cost_usd,
+    import_legacy_audit_entries_async, read_audit_log, read_audit_log_async, RealCostAccumulator,
+    SyncAuditEntry,
 };
 pub use composio::{
     create_connection_link, generate_entity_id, get_connection_status, list_auth_configs,

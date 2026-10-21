@@ -36,9 +36,10 @@ use std::sync::Arc;
 
 use tinycortex::memory::config::{MemoryConfig, SecretString};
 use tinycortex::memory::persona::config::PersonaConfig;
-use tinycortex::memory::persona::state::FileStateStore;
+use tinycortex::memory::persona::state::KvStateStore;
 use tinycortex::memory::persona::{Pipeline, RunMode};
 use tinycortex::memory::providers::{OpenRouterConfig, OpenRouterProvider};
+use tinystoragedrivers_types::Scope;
 
 fn env_path(key: &str) -> Option<PathBuf> {
     std::env::var(key).ok().map(PathBuf::from)
@@ -116,9 +117,17 @@ async fn main() -> anyhow::Result<()> {
     let workspace =
         env_path("TINYCORTEX_WORKSPACE").unwrap_or_else(|| PathBuf::from("./persona-workspace"));
     std::fs::create_dir_all(&workspace)?;
-    let config = MemoryConfig::new(&workspace);
+    let scope = Scope::new(&format!(
+        "tinycortex-persona-harness-{}",
+        uuid::Uuid::new_v4()
+    ))?;
+    let config = MemoryConfig::open_with_storage(
+        &workspace,
+        tinystoragedrivers_testkit::memory_storage(&scope),
+    )
+    .await?;
     let persona = build_persona_config();
-    let store = FileStateStore::open_in_workspace(&workspace)?;
+    let store = KvStateStore::from_config(&config)?;
 
     println!("persona harness: mode={mode}");
     println!("  workspace: {}", workspace.display());

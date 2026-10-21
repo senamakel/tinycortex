@@ -21,6 +21,7 @@ async fn storage_preparation_installs_memory_collection_declarations() {
 
     for spec in crate::memory::chunks::collections()
         .into_iter()
+        .chain(crate::memory::conversations::collections())
         .chain(crate::memory::store::vectors::collections())
     {
         config

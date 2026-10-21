@@ -16,7 +16,7 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use tinycortex::memory::config::{MemoryConfig, SecretString};
 use tinycortex::memory::persona::config::PersonaConfig;
-use tinycortex::memory::persona::state::FileStateStore;
+use tinycortex::memory::persona::state::KvStateStore;
 use tinycortex::memory::persona::{Pipeline, RunMode};
 use tinycortex::memory::providers::{OpenRouterConfig, OpenRouterProvider};
 use tinystoragedrivers_types::Scope;
@@ -160,7 +160,7 @@ async fn backfill_produces_structured_pack_within_budget() {
     let config = host_config(ws.path()).await;
     let persona = persona_config(sources.path());
     let prov = provider(&server, &persona);
-    let store = FileStateStore::open_in_workspace(ws.path()).unwrap();
+    let store = KvStateStore::from_config(&config).unwrap();
 
     let pipeline = Pipeline {
         config: &config,
@@ -203,7 +203,7 @@ async fn incremental_resume_after_partial_backfill() {
     // Partial: only one session may digest, forcing a checkpoint.
     persona.run_budget.max_sessions = 1;
     let prov = provider(&server, &persona);
-    let store = FileStateStore::open_in_workspace(ws.path()).unwrap();
+    let store = KvStateStore::from_config(&config).unwrap();
 
     let first = {
         let pipeline = Pipeline {
@@ -250,7 +250,7 @@ async fn offline_compile_only_needs_no_provider() {
     let config = host_config(ws.path()).await;
     let persona = persona_config(sources.path());
     let prov = provider(&server, &persona);
-    let store = FileStateStore::open_in_workspace(ws.path()).unwrap();
+    let store = KvStateStore::from_config(&config).unwrap();
 
     {
         let pipeline = Pipeline {

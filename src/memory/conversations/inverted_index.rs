@@ -40,8 +40,8 @@
 //!   Roaring Bitmaps + FST + LSM segments are the long-term destination
 //!   (Gemini Deep Research write-up); we defer that until corpus sizes
 //!   justify the complexity.
-//! - **Whole index lives in RAM**, rebuilt from JSONL on first access in
-//!   the process. The JSONL files remain the source of truth.
+//! - **Whole index lives in RAM**, rebuilt from authoritative host streams
+//!   when a query needs it. Conversation streams remain the source of truth.
 //! - **Scoring matches the previous linear scan**:
 //!   `score = matched_terms / total_terms` with a `created_at` tiebreaker.
 //! - **Pathological query short-circuit**: if Phase 1 produces a
@@ -69,7 +69,7 @@ const MIN_TERM_BYTES: usize = 3;
 const LARGE_CANDIDATE_LIMIT: usize = 10_000;
 
 /// One indexed message. Carries enough state to (a) reconstruct a
-/// `CrossThreadHit` without re-reading JSONL on the hot path and (b)
+/// `CrossThreadHit` without re-reading every stream on the hot path and (b)
 /// verify Phase 1 candidates by exact substring match on the normalized
 /// form.
 ///
@@ -124,7 +124,7 @@ impl InvertedIndex {
     /// owned strings can be moved into the index without an internal
     /// clone of each field. If the (thread, message_id) pair is already
     /// in the index this is a no-op (messages are append-only in the
-    /// store, so duplicate IDs indicate a corrupt JSONL — silently
+    /// store, so duplicate IDs indicate corrupt stream history — silently
     /// ignore rather than panic).
     pub fn insert(&mut self, thread_id: &str, msg: ConversationMessage) {
         let ConversationMessage {
@@ -170,6 +170,7 @@ impl InvertedIndex {
 
     /// Drop every document belonging to a thread. Used by
     /// `delete_thread` and during full purge.
+    #[cfg(test)]
     pub fn remove_thread(&mut self, thread_id: &str) {
         let to_remove: Vec<u32> = self
             .by_message
@@ -195,6 +196,7 @@ impl InvertedIndex {
         self.role_pool.clear();
     }
 
+    #[cfg(test)]
     fn remove_doc(&mut self, doc_id: u32) {
         let idx = doc_id as usize;
         let Some(entry) = self.docs.get_mut(idx).and_then(|slot| slot.take()) else {

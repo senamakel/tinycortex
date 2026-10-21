@@ -35,7 +35,7 @@ ingest requests.
 | `memory_diff` | Change ledger | snapshots, item diffs, checkpoints, read markers |
 | `memory_entities` | Entity catalog | canonical entity ids, aliases, handles |
 | `memory_graph` | Relationship graph | weighted co-occurrence edges |
-| `memory_conversations` | Thread/message store | JSONL thread/message records |
+| `memory_conversations` | Thread/message store | Host-provided stream history and rebuildable thread projection |
 | `memory_archivist` | Episodic archive | per-turn capture, cleaned tree archival |
 | `memory_goals` | Durable goals | markdown-backed ordered goals list |
 | `memory_tools` | Tool-scoped rules | priority rules by tool namespace |
@@ -562,7 +562,7 @@ pub struct Turn {
 
 Boundary rule: conversation history, episodic archive, and tree-ingested
 conversation summaries are related but distinct. TinyCortex should not conflate
-thread JSONL with tree leaves or with recall citations.
+thread streams with tree leaves or with recall citations.
 
 TinyCortex stores per-thread conversation messages at
 `threads/<hex(thread_id)>.jsonl` so arbitrary provider thread ids never become
