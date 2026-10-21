@@ -7,7 +7,7 @@
 //! domain record (`crate::memory::types::GraphRelationRecord`).
 //!
 //! [`query`] exposes a storage-agnostic read trait for derived graph queries;
-//! [`edge_store`] owns persistent edge updates and traversal diagnostics.
+//! `edge_store` owns persistent edge updates and traversal diagnostics.
 
 mod bfs;
 pub(crate) mod edge_store;
