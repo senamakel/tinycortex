@@ -1450,8 +1450,7 @@ async fn state_change_matches_at(
     snapshot: &HeadSnapshot,
     condition: &StateChange,
 ) -> tinystoragedrivers_types::Result<bool> {
-    let actual =
-        read_state_at(documents, snapshot, &condition.collection, &condition.key).await?;
+    let actual = read_state_at(documents, snapshot, &condition.collection, &condition.key).await?;
     if actual.is_none() && condition.collection == CHUNK_LIFECYCLE && condition.value.is_some() {
         let implicit = implicit_chunk_lifecycle_status(documents, snapshot, &condition.key)
             .await?
