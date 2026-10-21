@@ -10,8 +10,8 @@ use tinystoragedrivers_api::Storage;
 use crate::memory::chunks::{self, Chunk, ListChunksQuery};
 use crate::memory::config::MemoryConfig;
 use crate::memory::store::KvStore;
-use crate::memory::types::MemoryKvRecord;
 use crate::memory::tree::store::{self, SummaryNode, Tree, TreeKind};
+use crate::memory::types::MemoryKvRecord;
 
 /// Typed data needed by the standalone viewer, collected through owner APIs.
 #[derive(Debug, Clone, Serialize)]
@@ -45,14 +45,15 @@ pub async fn read_snapshot(
         .await
         .map_err(anyhow::Error::msg)?;
 
-    let chunk_total = chunks::count_chunks(&config)?;
-    let chunks = chunks::list_chunks(
+    let chunk_total = chunks::count_chunks_async(&config).await?;
+    let chunks = chunks::list_chunks_async(
         &config,
         &ListChunksQuery {
             limit: Some(limit.clamp(1, 10_000)),
             ..Default::default()
         },
-    )?;
+    )
+    .await?;
 
     let mut trees = Vec::new();
     for kind in [

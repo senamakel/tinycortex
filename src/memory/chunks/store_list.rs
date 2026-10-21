@@ -95,6 +95,34 @@ pub fn list_chunks(config: &MemoryConfig, query: &ListChunksQuery) -> Result<Vec
     Ok(chunks.drain(offset..).take(limit).collect())
 }
 
+/// Async listing counterpart for callers running on a current-thread Tokio
+/// runtime. It reads the owner snapshot directly instead of entering the
+/// synchronous storage bridge.
+pub async fn list_chunks_async(
+    config: &MemoryConfig,
+    query: &ListChunksQuery,
+) -> Result<Vec<Chunk>> {
+    let mut collections = Vec::new();
+    if query.exclude_dropped {
+        collections.push(super::collections::CHUNK_LIFECYCLE);
+    }
+    if !query.entity_ids.is_empty() || !query.entity_kinds.is_empty() {
+        collections.push(super::collections::ENTITY_INDEX);
+    }
+    let (_, chunks, states) =
+        super::versioned::list_chunk_snapshot_with_head_async(config, &collections).await?;
+    let (mut chunks, _) = filter_chunk_snapshot(chunks, states, query)?;
+    let offset = query.offset.unwrap_or(0).min(chunks.len());
+    let limit = normalized_limit(query.limit) as usize;
+    Ok(chunks.drain(offset..).take(limit).collect())
+}
+
+/// Async count counterpart for current-thread Tokio callers.
+pub async fn count_chunks_async(config: &MemoryConfig) -> Result<u64> {
+    let (_, chunks, _) = super::versioned::list_chunk_snapshot_with_head_async(config, &[]).await?;
+    Ok(chunks.len() as u64)
+}
+
 fn matching_chunks(
     config: &MemoryConfig,
     query: &ListChunksQuery,

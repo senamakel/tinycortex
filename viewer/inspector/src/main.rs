@@ -1,7 +1,7 @@
 use std::io::{self, Write};
 
 use anyhow::{Context, Result};
-use tinystoragedrivers::{Scope, StorageConfig, StorageBackend};
+use tinystoragedrivers::{Scope, StorageBackend, StorageConfig};
 
 const MAX_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
 const CHUNK_LIMIT: usize = 300;
@@ -28,13 +28,9 @@ async fn run() -> Result<()> {
     let storage = backend
         .for_scope(&scope)
         .context("open configured storage scope")?;
-    let snapshot = tinycortex::memory::inspection::read_snapshot(
-        workspace,
-        storage,
-        CHUNK_LIMIT,
-    )
-    .await
-    .context("read owner inspection snapshot")?;
+    let snapshot = tinycortex::memory::inspection::read_snapshot(workspace, storage, CHUNK_LIMIT)
+        .await
+        .context("read owner inspection snapshot")?;
 
     let bytes = serde_json::to_vec(&snapshot).context("encode inspection snapshot")?;
     anyhow::ensure!(
@@ -42,8 +38,12 @@ async fn run() -> Result<()> {
         "inspection snapshot exceeds the output limit"
     );
     let mut stdout = io::stdout().lock();
-    stdout.write_all(&bytes).context("write inspection snapshot")?;
-    stdout.write_all(b"\n").context("finish inspection snapshot")?;
+    stdout
+        .write_all(&bytes)
+        .context("write inspection snapshot")?;
+    stdout
+        .write_all(b"\n")
+        .context("finish inspection snapshot")?;
     Ok(())
 }
 

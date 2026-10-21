@@ -140,8 +140,8 @@ pub use store_delete::{
     delete_orphaned_source_tree, delete_orphaned_source_tree_async, purge_all, purge_all_async,
 };
 pub use store_list::{
-    count_chunks_matching, list_chunk_details, list_chunks, source_totals, ChunkDetailRow,
-    ListChunksQuery, SourceTotal,
+    count_chunks_async, count_chunks_matching, list_chunk_details, list_chunks, list_chunks_async,
+    source_totals, ChunkDetailRow, ListChunksQuery, SourceTotal,
 };
 pub(crate) use store_list::{list_chunks_with_content_state, list_chunks_with_content_state_async};
 
