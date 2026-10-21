@@ -18,78 +18,6 @@ use crate::memory::config::MemoryConfig;
 use crate::memory::score::embed::decode_optional_blob;
 use crate::memory::store::content::StagedSummary;
 
-/// Insert a sealed summary. Immutable; the caller mints a fresh id per seal.
-/// Idempotent on the primary key (`INSERT OR IGNORE`).
-///
-/// The legacy `embedding` column is written NULL — when `node.embedding` is
-/// `Some`, the vector is persisted to the per-model sidecar at
-/// `model_signature`, in this same transaction so it commits atomically.
-pub fn insert_summary_tx(
-    tx: &Transaction<'_>,
-    node: &SummaryNode,
-    model_signature: &str,
-) -> Result<()> {
-    insert_staged_summary_tx(tx, node, None, model_signature)
-}
-
-/// Insert a summary and optional staged Markdown pointer in one transaction.
-pub fn insert_staged_summary_tx(
-    tx: &Transaction<'_>,
-    node: &SummaryNode,
-    staged: Option<&StagedSummary>,
-    model_signature: &str,
-) -> Result<()> {
-    let embedding_blob: Option<Vec<u8>> = None;
-    let (content, content_path, content_sha256) = staged.map_or_else(
-        || (node.content.clone(), None, None),
-        |staged| {
-            (
-                node.content.chars().take(500).collect(),
-                Some(staged.content_path.clone()),
-                Some(staged.content_sha256.clone()),
-            )
-        },
-    );
-    tx.execute(
-        "INSERT OR IGNORE INTO mem_tree_summaries (
-            id, tree_id, tree_kind, level, parent_id,
-            child_ids_json, content, token_count,
-            entities_json, topics_json,
-            time_range_start_ms, time_range_end_ms,
-            score, sealed_at_ms, deleted, embedding,
-            doc_id, version_ms, content_path, content_sha256
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
-        params![
-            node.id,
-            node.tree_id,
-            node.tree_kind.as_str(),
-            node.level,
-            node.parent_id,
-            serde_json::to_string(&node.child_ids)?,
-            content,
-            node.token_count,
-            serde_json::to_string(&node.entities)?,
-            serde_json::to_string(&node.topics)?,
-            node.time_range_start.timestamp_millis(),
-            node.time_range_end.timestamp_millis(),
-            node.score,
-            node.sealed_at.timestamp_millis(),
-            node.deleted as i64,
-            embedding_blob,
-            node.doc_id,
-            node.version_ms,
-            content_path,
-            content_sha256,
-        ],
-    )
-    .with_context(|| format!("Failed to insert summary id={}", node.id))?;
-
-    if let Some(v) = node.embedding.as_deref() {
-        upsert_summary_embedding_conn(tx, &node.id, model_signature, v)?;
-    }
-    Ok(())
-}
-
 /// Fetch one summary by id. Soft-deleted rows are returned with `deleted = true`.
 pub fn get_summary(config: &MemoryConfig, id: &str) -> Result<Option<SummaryNode>> {
     crate::memory::chunks::versioned::read_state(
@@ -429,26 +357,6 @@ async fn all_summaries_async(config: &MemoryConfig) -> Result<Vec<SummaryNode>> 
 
 // ── Embedding sidecar ───────────────────────────────────────────────────────
 
-fn upsert_summary_embedding_conn(
-    conn: &rusqlite::Connection,
-    summary_id: &str,
-    model_signature: &str,
-    embedding: &[f32],
-) -> Result<()> {
-    let blob = pack_embedding_blob(embedding);
-    let dim = i64::try_from(embedding.len()).context("embedding dimension does not fit i64")?;
-    let created_at = Utc::now().timestamp_millis() as f64 / 1000.0;
-    conn.execute(
-        "INSERT INTO mem_tree_summary_embeddings
-             (summary_id, model_signature, vector, dim, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5)
-             ON CONFLICT(summary_id, model_signature) DO UPDATE SET
-                vector = excluded.vector, dim = excluded.dim, created_at = excluded.created_at",
-        params![summary_id, model_signature, blob, dim, created_at],
-    )?;
-    Ok(())
-}
-
 /// Store a summary embedding for a specific provider/model/dimension signature.
 pub fn set_summary_embedding_for_signature(
     config: &MemoryConfig,
@@ -661,82 +569,6 @@ pub async fn get_summary_embeddings_batch_async(
 }
 
 // ── Row decoding ────────────────────────────────────────────────────────────
-
-const SELECT_SUMMARY_BASE: &str = "SELECT id, tree_id, tree_kind, level, parent_id, \
-    child_ids_json, content, token_count, entities_json, topics_json, \
-    time_range_start_ms, time_range_end_ms, score, sealed_at_ms, deleted, embedding, \
-    doc_id, version_ms FROM mem_tree_summaries";
-
-const SELECT_SUMMARY_COLS: &str =
-    "SELECT id, tree_id, tree_kind, level, parent_id, child_ids_json, content, token_count, \
-     entities_json, topics_json, time_range_start_ms, time_range_end_ms, score, sealed_at_ms, \
-     deleted, embedding, doc_id, version_ms FROM mem_tree_summaries WHERE id = ?1";
-
-fn row_to_summary(row: &rusqlite::Row<'_>) -> rusqlite::Result<SummaryNode> {
-    let id: String = row.get(0)?;
-    let tree_id: String = row.get(1)?;
-    let tree_kind_s: String = row.get(2)?;
-    let level: i64 = row.get(3)?;
-    let parent_id: Option<String> = row.get(4)?;
-    let child_ids_json: String = row.get(5)?;
-    let content: String = row.get(6)?;
-    let token_count: i64 = row.get(7)?;
-    let entities_json: String = row.get(8)?;
-    let topics_json: String = row.get(9)?;
-    let trs_ms: i64 = row.get(10)?;
-    let tre_ms: i64 = row.get(11)?;
-    let score: f64 = row.get(12)?;
-    let sealed_ms: i64 = row.get(13)?;
-    let deleted: i64 = row.get(14)?;
-    let embedding_blob: Option<Vec<u8>> = row.get(15)?;
-    let doc_id: Option<String> = row.get(16)?;
-    let version_ms: Option<i64> = row.get(17)?;
-
-    let tree_kind = TreeKind::parse(&tree_kind_s).map_err(|e| {
-        rusqlite::Error::FromSqlConversionFailure(2, rusqlite::types::Type::Text, e.into())
-    })?;
-    let child_ids: Vec<String> = serde_json::from_str(&child_ids_json).map_err(|e| {
-        rusqlite::Error::FromSqlConversionFailure(5, rusqlite::types::Type::Text, Box::new(e))
-    })?;
-    let entities: Vec<String> = serde_json::from_str(&entities_json).map_err(|e| {
-        rusqlite::Error::FromSqlConversionFailure(8, rusqlite::types::Type::Text, Box::new(e))
-    })?;
-    let topics: Vec<String> = serde_json::from_str(&topics_json).map_err(|e| {
-        rusqlite::Error::FromSqlConversionFailure(9, rusqlite::types::Type::Text, Box::new(e))
-    })?;
-    let embedding =
-        decode_optional_blob(embedding_blob, &format!("summary_id={id}")).map_err(|e| {
-            rusqlite::Error::FromSqlConversionFailure(
-                15,
-                rusqlite::types::Type::Blob,
-                Box::new(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    e.to_string(),
-                )),
-            )
-        })?;
-
-    Ok(SummaryNode {
-        id,
-        tree_id,
-        tree_kind,
-        level: level.max(0) as u32,
-        parent_id,
-        child_ids,
-        content,
-        token_count: token_count.max(0) as u32,
-        entities,
-        topics,
-        time_range_start: ms_to_utc(trs_ms)?,
-        time_range_end: ms_to_utc(tre_ms)?,
-        score: score as f32,
-        sealed_at: ms_to_utc(sealed_ms)?,
-        deleted: deleted != 0,
-        embedding,
-        doc_id,
-        version_ms,
-    })
-}
 
 #[cfg(test)]
 #[path = "summaries_tests.rs"]
