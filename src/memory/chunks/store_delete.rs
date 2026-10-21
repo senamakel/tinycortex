@@ -576,6 +576,7 @@ pub async fn purge_all_async(config: &MemoryConfig) -> Result<usize> {
         BUFFERS,
         CHUNK_CONTENT_POINTERS,
         CHUNK_EMBEDDINGS,
+        CHUNK_LIFECYCLE,
         CHUNK_REEMBED_SKIPS,
         ENTITY_EDGES,
         ENTITY_HOTNESS,
@@ -596,6 +597,10 @@ pub async fn purge_all_async(config: &MemoryConfig) -> Result<usize> {
         let mut changes = Vec::new();
         let mut content_paths = Vec::new();
         let mut logical_rows = chunks.len();
+        let chunk_ids = chunks
+            .iter()
+            .map(|chunk| chunk.id.as_str())
+            .collect::<std::collections::HashSet<_>>();
         for chunk in &chunks {
             stage_delete(
                 &mut expected,
@@ -611,6 +616,12 @@ pub async fn purge_all_async(config: &MemoryConfig) -> Result<usize> {
         }
         for collection in OWNED_COLLECTIONS {
             for (key, value) in state_rows(&states, collection) {
+                // Live chunks already receive a lifecycle tombstone above,
+                // using their effective (possibly implicit) status as the
+                // CAS expectation. Clear only orphan lifecycle rows here.
+                if *collection == CHUNK_LIFECYCLE && chunk_ids.contains(key.as_str()) {
+                    continue;
+                }
                 if *collection == CHUNK_CONTENT_POINTERS || *collection == SUMMARY_CONTENT_POINTERS
                 {
                     if let Some(path) = value
