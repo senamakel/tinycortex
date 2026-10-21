@@ -1,0 +1,22 @@
+[[memory_sources]]
+enabled = true
+glob = "**/*.md"
+id = "legacy-folder"
+kind = "folder"
+label = "Legacy notes"
+max_cost_per_sync_usd = 0.42
+max_tokens_per_sync = 987
+path = "/legacy/notes"
+sync_depth_days = 45
+
+[[memory_sources]]
+connection_id = "legacy-connection"
+enabled = false
+id = "legacy-slack"
+kind = "composio"
+label = "Legacy Slack"
+max_cost_per_sync_usd = 0.09
+max_items = 17
+max_tokens_per_sync = 321
+sync_depth_days = 12
+toolkit = "slack"
