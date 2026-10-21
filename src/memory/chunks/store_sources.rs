@@ -8,9 +8,9 @@ use chrono::Utc;
 use super::collections::{CHUNK_LIFECYCLE, INGESTED_SOURCES};
 use super::types::SourceKind;
 use super::versioned::{
-    insert_state_changes_if_absent, list_chunk_snapshot, list_state,
-    read_chunk_lifecycle_status as read_implicit_lifecycle_status, read_state, write_state,
-    StateChange,
+    commit_if_state_matches_async, insert_state_changes_if_absent, list_chunk_snapshot, list_state,
+    list_state_async, read_chunk_lifecycle_status as read_implicit_lifecycle_status, read_state,
+    read_states_async, write_state, StateChange,
 };
 use crate::memory::config::MemoryConfig;
 
@@ -177,6 +177,60 @@ pub fn mark_raw_paths_ingested(config: &MemoryConfig, rel_paths: &[String]) -> R
     Ok(insert_state_changes_if_absent(config, &changes)? as u64)
 }
 
+/// Async counterpart to [`mark_raw_paths_ingested`] for Tokio callers.
+pub async fn mark_raw_paths_ingested_async(
+    config: &MemoryConfig,
+    rel_paths: &[String],
+) -> Result<u64> {
+    if rel_paths.is_empty() {
+        return Ok(0);
+    }
+    let now_ms = Utc::now().timestamp_millis();
+    let mut unique = std::collections::HashSet::new();
+    let changes: Vec<_> = rel_paths
+        .iter()
+        .filter(|path| unique.insert(path.as_str()))
+        .map(|path| StateChange {
+            collection: INGESTED_SOURCES.into(),
+            key: source_gate_key(
+                SourceKind::Document,
+                &format!("{RAW_FILE_GATE_KIND}:{path}"),
+            ),
+            value: Some(serde_json::json!({
+                "source_kind": RAW_FILE_GATE_KIND,
+                "source_id": path,
+                "ingested_at_ms": now_ms,
+            })),
+        })
+        .collect();
+
+    for _ in 0..8 {
+        let keys: Vec<_> = changes.iter().map(|change| change.key.clone()).collect();
+        let current = read_states_async(config, INGESTED_SOURCES, &keys).await?;
+        let expected: Vec<_> = changes
+            .iter()
+            .filter(|change| !current.contains_key(&change.key))
+            .map(|change| StateChange {
+                collection: INGESTED_SOURCES.into(),
+                key: change.key.clone(),
+                value: None,
+            })
+            .collect();
+        let to_insert: Vec<_> = changes
+            .iter()
+            .filter(|change| !current.contains_key(&change.key))
+            .cloned()
+            .collect();
+        if to_insert.is_empty() {
+            return Ok(0);
+        }
+        if commit_if_state_matches_async(config, &expected, &[], &to_insert).await? {
+            return Ok(to_insert.len() as u64);
+        }
+    }
+    anyhow::bail!("raw-file coverage changed repeatedly while marking paths ingested")
+}
+
 /// Filter `rel_paths` down to the ones NOT yet recorded as ingested raw files.
 /// Order of the surviving paths is preserved.
 ///
@@ -213,6 +267,33 @@ pub fn filter_raw_paths_not_ingested(
     Ok(out)
 }
 
+/// Async counterpart to [`filter_raw_paths_not_ingested`]. Reads every gate
+/// against one captured owner head and preserves input order.
+pub async fn filter_raw_paths_not_ingested_async(
+    config: &MemoryConfig,
+    rel_paths: &[String],
+) -> Result<Vec<String>> {
+    if rel_paths.is_empty() {
+        return Ok(Vec::new());
+    }
+    let keys: Vec<_> = rel_paths
+        .iter()
+        .map(|path| {
+            source_gate_key(
+                SourceKind::Document,
+                &format!("{RAW_FILE_GATE_KIND}:{path}"),
+            )
+        })
+        .collect();
+    let current = read_states_async(config, INGESTED_SOURCES, &keys).await?;
+    Ok(rel_paths
+        .iter()
+        .zip(keys)
+        .filter(|(_, key)| !current.contains_key(key))
+        .map(|(path, _)| path.clone())
+        .collect())
+}
+
 /// Count raw-file gate rows whose path starts with `rel_prefix`. Rust-side
 /// prefix filter (not SQL `LIKE`) so `_` / `%` in slugs are treated literally.
 ///
@@ -226,6 +307,23 @@ pub fn count_raw_paths_ingested_with_prefix(
     rel_prefix: &str,
 ) -> Result<u64> {
     Ok(list_state(config, INGESTED_SOURCES)?
+        .iter()
+        .filter(|(_, value)| value["source_kind"] == RAW_FILE_GATE_KIND)
+        .filter(|(_, value)| {
+            value["source_id"]
+                .as_str()
+                .is_some_and(|path| path.starts_with(rel_prefix))
+        })
+        .count() as u64)
+}
+
+/// Async counterpart to [`count_raw_paths_ingested_with_prefix`].
+pub async fn count_raw_paths_ingested_with_prefix_async(
+    config: &MemoryConfig,
+    rel_prefix: &str,
+) -> Result<u64> {
+    Ok(list_state_async(config, INGESTED_SOURCES)
+        .await?
         .iter()
         .filter(|(_, value)| value["source_kind"] == RAW_FILE_GATE_KIND)
         .filter(|(_, value)| {

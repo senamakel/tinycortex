@@ -69,7 +69,7 @@ async fn rebuild_ingests_l1_summaries_marks_coverage_and_is_idempotent() {
     .await
     .unwrap();
     assert_eq!(
-        list_summaries_at_level_async(&config, &tree.id, 1)
+        crate::memory::tree::store::list_summaries_at_level_async(&config, &tree.id, 1)
             .await
             .unwrap()
             .len(),
@@ -86,7 +86,7 @@ async fn rebuild_ingests_l1_summaries_marks_coverage_and_is_idempotent() {
     .unwrap();
     assert_eq!(second, RebuildOutcome::default());
     assert_eq!(
-        list_summaries_at_level_async(&config, &tree.id, 1)
+        crate::memory::tree::store::list_summaries_at_level_async(&config, &tree.id, 1)
             .await
             .unwrap()
             .len(),

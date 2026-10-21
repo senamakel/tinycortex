@@ -15,11 +15,10 @@ use chrono::{DateTime, Utc};
 use sha2::{Digest, Sha256};
 
 use super::types::{DigestObservation, EvidenceTier, PersonaEvidence, PersonaFacet, SessionDigest};
-use crate::memory::chunks::{chunk_id, upsert_chunks, Chunk, Metadata, SourceKind};
+use crate::memory::chunks::{chunk_id, upsert_chunks_async, Chunk, Metadata, SourceKind};
 use crate::memory::config::MemoryConfig;
 use crate::memory::tree::bucket_seal::LeafRef;
-use crate::memory::tree::flavoured::compile_flavoured_root;
-use crate::memory::tree::{Summariser, TreeFactory};
+use crate::memory::tree::{compile_flavoured_root_async, Summariser, TreeFactory};
 
 /// Per-facet natural-language asks, defaulting to [`PersonaFacet::default_ask`]
 /// and overridable via config.
@@ -160,7 +159,7 @@ async fn fold_leaf(
 ) -> Result<()> {
     let scope = facet.tree_scope();
     let chunk = persona_chunk(&scope, leaf_text, timestamp);
-    upsert_chunks(config, std::slice::from_ref(&chunk))?;
+    upsert_chunks_async(config, std::slice::from_ref(&chunk)).await?;
 
     let leaf = LeafRef {
         chunk_id: chunk.id.clone(),
@@ -230,10 +229,10 @@ pub async fn seal_and_collect(
     let mut bodies = BTreeMap::new();
     for facet in PersonaFacet::ALL {
         let factory = TreeFactory::flavoured(facet.tree_scope(), asks.ask(facet));
-        let tree = factory.get_or_create(config)?;
+        let tree = factory.get_or_create_async(config).await?;
         // Only trees that received leaves have a non-empty buffer or root.
         factory.seal_now(config, summariser).await?;
-        let markdown = compile_flavoured_root(config, &tree.id)?;
+        let markdown = compile_flavoured_root_async(config, &tree.id).await?;
         let body = strip_frontmatter(&markdown);
         if !body.trim().is_empty() {
             bodies.insert(facet, body);

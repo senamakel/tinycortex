@@ -122,14 +122,15 @@ pub use signature::{
 };
 pub use store::{
     claim_source_ingest, count_chunks, count_chunks_by_lifecycle_status,
-    count_raw_paths_ingested_with_prefix, delete_source_ingest, extraction_coverage,
-    extraction_coverage_async, filter_raw_paths_not_ingested, get_chunk, get_chunk_async,
+    count_raw_paths_ingested_with_prefix, count_raw_paths_ingested_with_prefix_async,
+    delete_source_ingest, extraction_coverage, extraction_coverage_async,
+    filter_raw_paths_not_ingested, filter_raw_paths_not_ingested_async, get_chunk, get_chunk_async,
     get_chunk_lifecycle_status, get_chunks_batch, get_chunks_batch_async, is_source_ingested,
-    list_source_ids_with_prefix, mark_raw_paths_ingested, set_chunk_lifecycle_status,
-    update_chunk_content_sha256, update_chunk_content_sha256_async, update_summary_content_sha256,
-    update_summary_content_sha256_async, upsert_chunks, upsert_chunks_async, upsert_staged_chunks,
-    CHUNK_STATUS_ADMITTED, CHUNK_STATUS_BUFFERED, CHUNK_STATUS_DROPPED,
-    CHUNK_STATUS_PENDING_EXTRACTION, CHUNK_STATUS_SEALED, RAW_FILE_GATE_KIND,
+    list_source_ids_with_prefix, mark_raw_paths_ingested, mark_raw_paths_ingested_async,
+    set_chunk_lifecycle_status, update_chunk_content_sha256, update_chunk_content_sha256_async,
+    update_summary_content_sha256, update_summary_content_sha256_async, upsert_chunks,
+    upsert_chunks_async, upsert_staged_chunks, CHUNK_STATUS_ADMITTED, CHUNK_STATUS_BUFFERED,
+    CHUNK_STATUS_DROPPED, CHUNK_STATUS_PENDING_EXTRACTION, CHUNK_STATUS_SEALED, RAW_FILE_GATE_KIND,
 };
 pub(crate) use store_delete::remove_unreferenced_content_files_async;
 pub use store_delete::{
