@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tinystoragedrivers_api::Storage;
-use tinystoragedrivers_types::{ErrorKind, Precondition, WriteOptions};
+use tinystoragedrivers_types::{Capability, ErrorKind, Precondition, WriteOptions};
 
 use super::collections::THREAD_INDEX;
 use super::inverted_index::InvertedIndex;
@@ -59,6 +59,20 @@ enum Event {
     },
 }
 
+enum AppendFailure {
+    Conflict,
+    Other(String),
+}
+
+impl AppendFailure {
+    fn message(self) -> String {
+        match self {
+            Self::Conflict => "conversation stream changed too often".into(),
+            Self::Other(message) => message,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct ThreadSnapshot {
     thread: Option<ConversationThread>,
@@ -94,17 +108,31 @@ impl ConversationStore {
     async fn read_stream(&self, thread_id: &str) -> Result<(Vec<Event>, u64), String> {
         let streams = self.storage.streams();
         let name = Self::stream_name(thread_id);
+        // Streams are append-only, so fixing the end before paging gives this
+        // read one coherent prefix even while another writer appends.
+        let length = streams
+            .len(&name)
+            .await
+            .map_err(|error| error.to_string())?;
         let mut cursor = 0_u64;
         let mut events = Vec::new();
-        loop {
+        while cursor < length {
             let page = streams
                 .read_window(&name, cursor, STREAM_PAGE)
                 .await
                 .map_err(|error| error.to_string())?;
             if page.is_empty() {
-                break;
+                return Err(format!(
+                    "conversation stream {thread_id} ended before captured offset {length}"
+                ));
             }
             for entry in page {
+                if entry.offset != cursor {
+                    return Err(format!(
+                        "conversation stream {thread_id} returned offset {}, expected {cursor}",
+                        entry.offset
+                    ));
+                }
                 events.push(
                     serde_json::from_value(entry.value)
                         .map_err(|error| format!("decode conversation stream: {error}"))?,
@@ -112,10 +140,6 @@ impl ConversationStore {
                 cursor = entry.offset.saturating_add(1);
             }
         }
-        let length = streams
-            .len(&name)
-            .await
-            .map_err(|error| error.to_string())?;
         Ok((events, length))
     }
 
@@ -196,15 +220,37 @@ impl ConversationStore {
         Ok(Self::fold(thread_id, &events, length))
     }
 
-    async fn append_event(&self, thread_id: &str, event: Event) -> Result<u64, String> {
-        self.storage
-            .streams()
-            .append(
+    async fn append_event_at(
+        &self,
+        thread_id: &str,
+        expected_offset: u64,
+        event: Event,
+    ) -> Result<u64, AppendFailure> {
+        let streams = self.storage.streams();
+        if !streams
+            .capabilities()
+            .contains(Capability::ConditionalStreamAppend)
+        {
+            return Err(AppendFailure::Other(
+                "conversation writes require ConditionalStreamAppend storage capability".into(),
+            ));
+        }
+        let value = serde_json::to_value(event)
+            .map_err(|error| AppendFailure::Other(error.to_string()))?;
+        streams
+            .append_batch_if_offset(
                 &Self::stream_name(thread_id),
-                serde_json::to_value(event).map_err(|error| error.to_string())?,
+                expected_offset,
+                vec![value],
             )
             .await
-            .map_err(|error| error.to_string())
+            .map_err(|error| {
+                if error.kind() == ErrorKind::Conflict {
+                    AppendFailure::Conflict
+                } else {
+                    AppendFailure::Other(error.to_string())
+                }
+            })
     }
 
     async fn project(&self, thread_id: &str, snapshot: &ThreadSnapshot) -> Result<(), String> {
@@ -222,10 +268,14 @@ impl ConversationStore {
             }
             let Some(thread) = &snapshot.thread else {
                 if let Some(current) = current {
-                    documents
+                    match documents
                         .delete(THREAD_INDEX, &id, Precondition::Version(current.version))
                         .await
-                        .map_err(|error| error.to_string())?;
+                    {
+                        Ok(_) => return Ok(()),
+                        Err(error) if error.kind() == ErrorKind::Conflict => continue,
+                        Err(error) => return Err(error.to_string()),
+                    }
                 }
                 return Ok(());
             };
@@ -270,51 +320,60 @@ impl ConversationStore {
         &self,
         request: CreateConversationThread,
     ) -> Result<ConversationThread, String> {
-        let before = self.snapshot(&request.id).await?;
-        let mut thread = before.thread.clone().unwrap_or_else(|| ConversationThread {
-            id: request.id.clone(),
-            title: request.title.clone(),
-            chat_id: None,
-            is_active: true,
-            message_count: before.messages.len(),
-            last_message_at: before
-                .messages
-                .last()
-                .map(|message| message.created_at.clone())
-                .unwrap_or_else(|| request.created_at.clone()),
-            created_at: request.created_at.clone(),
-            parent_thread_id: request.parent_thread_id.clone(),
-            labels: request
-                .labels
-                .clone()
-                .map(super::store::normalize_labels)
-                .unwrap_or_else(|| super::store::infer_labels(&request.id)),
-            personality_id: request.personality_id.clone(),
-        });
-        thread.title = request.title;
-        if let Some(parent) = request.parent_thread_id {
-            thread.parent_thread_id = Some(parent);
+        for _ in 0..8 {
+            let before = self.snapshot(&request.id).await?;
+            let mut thread = before.thread.clone().unwrap_or_else(|| ConversationThread {
+                id: request.id.clone(),
+                title: request.title.clone(),
+                chat_id: None,
+                is_active: true,
+                message_count: before.messages.len(),
+                last_message_at: before
+                    .messages
+                    .last()
+                    .map(|message| message.created_at.clone())
+                    .unwrap_or_else(|| request.created_at.clone()),
+                created_at: request.created_at.clone(),
+                parent_thread_id: request.parent_thread_id.clone(),
+                labels: request
+                    .labels
+                    .clone()
+                    .map(super::store::normalize_labels)
+                    .unwrap_or_else(|| super::store::infer_labels(&request.id)),
+                personality_id: request.personality_id.clone(),
+            });
+            thread.title = request.title.clone();
+            if let Some(parent) = &request.parent_thread_id {
+                thread.parent_thread_id = Some(parent.clone());
+            }
+            if let Some(labels) = &request.labels {
+                thread.labels = super::store::normalize_labels(labels.clone());
+            }
+            if let Some(personality) = &request.personality_id {
+                thread.personality_id = Some(personality.clone());
+            }
+            thread.is_active = true;
+            match self
+                .append_event_at(
+                    &request.id,
+                    before.offset,
+                    Event::ThreadUpsert {
+                        thread: thread.clone(),
+                        updated_at: request.created_at.clone(),
+                    },
+                )
+                .await
+            {
+                Err(AppendFailure::Conflict) => continue,
+                Err(error) => return Err(error.message()),
+                Ok(_) => {
+                    let snapshot = self.snapshot(&request.id).await?;
+                    self.project(&request.id, &snapshot).await?;
+                    return Ok(snapshot.thread.unwrap_or(thread));
+                }
+            }
         }
-        if let Some(labels) = request.labels {
-            thread.labels = super::store::normalize_labels(labels);
-        }
-        if let Some(personality) = request.personality_id {
-            thread.personality_id = Some(personality);
-        }
-        thread.is_active = true;
-        let offset = self
-            .append_event(
-                &request.id,
-                Event::ThreadUpsert {
-                    thread: thread.clone(),
-                    updated_at: request.created_at,
-                },
-            )
-            .await?;
-        let snapshot = self.snapshot(&request.id).await?;
-        debug_assert_eq!(snapshot.offset, offset + 1);
-        self.project(&request.id, &snapshot).await?;
-        Ok(snapshot.thread.unwrap_or(thread))
+        Err("conversation stream changed too often".into())
     }
 
     /// List live threads in descending update time, matching the legacy
@@ -363,30 +422,41 @@ impl ConversationStore {
         thread_id: &str,
         message: ConversationMessage,
     ) -> Result<ConversationMessage, String> {
-        let before = self.snapshot(thread_id).await?;
-        if before.thread.is_none() {
-            return Err(format!("thread {thread_id} not found"));
-        }
-        if is_deterministic_message_id(&message.id) {
-            if let Some(existing) = before.messages.iter().find(|item| item.id == message.id) {
-                return Ok(existing.clone());
+        for _ in 0..8 {
+            let before = self.snapshot(thread_id).await?;
+            if before.thread.is_none() {
+                return Err(format!("thread {thread_id} not found"));
+            }
+            if is_deterministic_message_id(&message.id) {
+                if let Some(existing) = before.messages.iter().find(|item| item.id == message.id) {
+                    return Ok(existing.clone());
+                }
+            }
+            match self
+                .append_event_at(
+                    thread_id,
+                    before.offset,
+                    Event::MessageAppend {
+                        message: message.clone(),
+                    },
+                )
+                .await
+            {
+                Err(AppendFailure::Conflict) => continue,
+                Err(error) => return Err(error.message()),
+                Ok(_) => {
+                    let snapshot = self.snapshot(thread_id).await?;
+                    self.project(thread_id, &snapshot).await?;
+                    return Ok(snapshot
+                        .messages
+                        .iter()
+                        .find(|item| item.id == message.id)
+                        .cloned()
+                        .unwrap_or(message));
+                }
             }
         }
-        self.append_event(
-            thread_id,
-            Event::MessageAppend {
-                message: message.clone(),
-            },
-        )
-        .await?;
-        let snapshot = self.snapshot(thread_id).await?;
-        self.project(thread_id, &snapshot).await?;
-        Ok(snapshot
-            .messages
-            .iter()
-            .find(|item| item.id == message.id)
-            .cloned()
-            .unwrap_or(message))
+        Err("conversation stream changed too often".into())
     }
 
     /// Substring search over live conversation messages.
@@ -423,14 +493,36 @@ impl ConversationStore {
         title: &str,
         updated_at: &str,
     ) -> Result<ConversationThread, String> {
-        let mut thread = self
-            .snapshot(thread_id)
-            .await?
-            .thread
-            .ok_or_else(|| format!("thread {thread_id} not found"))?;
-        thread.title = title.to_string();
-        self.upsert_current_thread(thread_id, thread, updated_at)
-            .await
+        for _ in 0..8 {
+            let before = self.snapshot(thread_id).await?;
+            let mut thread = before
+                .thread
+                .clone()
+                .ok_or_else(|| format!("thread {thread_id} not found"))?;
+            thread.title = title.to_string();
+            match self
+                .append_event_at(
+                    thread_id,
+                    before.offset,
+                    Event::ThreadUpsert {
+                        thread,
+                        updated_at: updated_at.to_string(),
+                    },
+                )
+                .await
+            {
+                Err(AppendFailure::Conflict) => continue,
+                Err(error) => return Err(error.message()),
+                Ok(_) => {
+                    let latest = self.snapshot(thread_id).await?;
+                    self.project(thread_id, &latest).await?;
+                    return latest
+                        .thread
+                        .ok_or_else(|| format!("thread {thread_id} missing after update"));
+                }
+            }
+        }
+        Err("conversation stream changed too often".into())
     }
 
     /// Replace a thread's label set.
@@ -440,35 +532,37 @@ impl ConversationStore {
         labels: Vec<String>,
         updated_at: &str,
     ) -> Result<ConversationThread, String> {
-        let mut thread = self
-            .snapshot(thread_id)
-            .await?
-            .thread
-            .ok_or_else(|| format!("thread {thread_id} not found"))?;
-        thread.labels = super::store::normalize_labels(labels);
-        self.upsert_current_thread(thread_id, thread, updated_at)
-            .await
-    }
-
-    async fn upsert_current_thread(
-        &self,
-        thread_id: &str,
-        thread: ConversationThread,
-        updated_at: &str,
-    ) -> Result<ConversationThread, String> {
-        self.append_event(
-            thread_id,
-            Event::ThreadUpsert {
-                thread,
-                updated_at: updated_at.to_string(),
-            },
-        )
-        .await?;
-        let snapshot = self.snapshot(thread_id).await?;
-        self.project(thread_id, &snapshot).await?;
-        snapshot
-            .thread
-            .ok_or_else(|| format!("thread {thread_id} missing after update"))
+        let labels = super::store::normalize_labels(labels);
+        for _ in 0..8 {
+            let before = self.snapshot(thread_id).await?;
+            let mut thread = before
+                .thread
+                .clone()
+                .ok_or_else(|| format!("thread {thread_id} not found"))?;
+            thread.labels = labels.clone();
+            match self
+                .append_event_at(
+                    thread_id,
+                    before.offset,
+                    Event::ThreadUpsert {
+                        thread,
+                        updated_at: updated_at.to_string(),
+                    },
+                )
+                .await
+            {
+                Err(AppendFailure::Conflict) => continue,
+                Err(error) => return Err(error.message()),
+                Ok(_) => {
+                    let latest = self.snapshot(thread_id).await?;
+                    self.project(thread_id, &latest).await?;
+                    return latest
+                        .thread
+                        .ok_or_else(|| format!("thread {thread_id} missing after update"));
+                }
+            }
+        }
+        Err("conversation stream changed too often".into())
     }
 
     /// Patch one message's metadata.
@@ -478,26 +572,37 @@ impl ConversationStore {
         message_id: &str,
         patch: ConversationMessagePatch,
     ) -> Result<ConversationMessage, String> {
-        let snapshot = self.snapshot(thread_id).await?;
-        let mut message = snapshot
-            .messages
-            .iter()
-            .find(|item| item.id == message_id)
-            .cloned()
-            .ok_or_else(|| format!("message {message_id} not found in thread {thread_id}"))?;
-        if let Some(extra_metadata) = patch.extra_metadata {
-            message.extra_metadata = extra_metadata;
+        for _ in 0..8 {
+            let snapshot = self.snapshot(thread_id).await?;
+            let mut message = snapshot
+                .messages
+                .iter()
+                .find(|item| item.id == message_id)
+                .cloned()
+                .ok_or_else(|| format!("message {message_id} not found in thread {thread_id}"))?;
+            if let Some(extra_metadata) = &patch.extra_metadata {
+                message.extra_metadata = extra_metadata.clone();
+            }
+            match self
+                .append_event_at(
+                    thread_id,
+                    snapshot.offset,
+                    Event::MessageReplace {
+                        message: message.clone(),
+                    },
+                )
+                .await
+            {
+                Err(AppendFailure::Conflict) => continue,
+                Err(error) => return Err(error.message()),
+                Ok(_) => {
+                    let latest = self.snapshot(thread_id).await?;
+                    self.project(thread_id, &latest).await?;
+                    return Ok(message);
+                }
+            }
         }
-        self.append_event(
-            thread_id,
-            Event::MessageReplace {
-                message: message.clone(),
-            },
-        )
-        .await?;
-        let latest = self.snapshot(thread_id).await?;
-        self.project(thread_id, &latest).await?;
-        Ok(message)
+        Err("conversation stream changed too often".into())
     }
 
     /// Remove `message_id` and every later message from the logical transcript.
@@ -506,25 +611,36 @@ impl ConversationStore {
         thread_id: &str,
         message_id: &str,
     ) -> Result<Option<usize>, String> {
-        let snapshot = self.snapshot(thread_id).await?;
-        let Some(index) = snapshot
-            .messages
-            .iter()
-            .position(|item| item.id == message_id)
-        else {
-            return Ok(None);
-        };
-        let removed = snapshot.messages.len() - index;
-        self.append_event(
-            thread_id,
-            Event::MessagesTruncate {
-                from_message_id: message_id.to_string(),
-            },
-        )
-        .await?;
-        let latest = self.snapshot(thread_id).await?;
-        self.project(thread_id, &latest).await?;
-        Ok(Some(removed))
+        for _ in 0..8 {
+            let snapshot = self.snapshot(thread_id).await?;
+            let Some(index) = snapshot
+                .messages
+                .iter()
+                .position(|item| item.id == message_id)
+            else {
+                return Ok(None);
+            };
+            let removed = snapshot.messages.len() - index;
+            match self
+                .append_event_at(
+                    thread_id,
+                    snapshot.offset,
+                    Event::MessagesTruncate {
+                        from_message_id: message_id.to_string(),
+                    },
+                )
+                .await
+            {
+                Err(AppendFailure::Conflict) => continue,
+                Err(error) => return Err(error.message()),
+                Ok(_) => {
+                    let latest = self.snapshot(thread_id).await?;
+                    self.project(thread_id, &latest).await?;
+                    return Ok(Some(removed));
+                }
+            }
+        }
+        Err("conversation stream changed too often".into())
     }
 
     /// Tombstone a thread without deleting its stream history.
@@ -533,19 +649,31 @@ impl ConversationStore {
         thread_id: &str,
         deleted_at: &str,
     ) -> Result<bool, String> {
-        if self.snapshot(thread_id).await?.thread.is_none() {
-            return Ok(false);
+        for _ in 0..8 {
+            let before = self.snapshot(thread_id).await?;
+            if before.thread.is_none() {
+                return Ok(false);
+            }
+            match self
+                .append_event_at(
+                    thread_id,
+                    before.offset,
+                    Event::ThreadDelete {
+                        deleted_at: deleted_at.to_string(),
+                    },
+                )
+                .await
+            {
+                Err(AppendFailure::Conflict) => continue,
+                Err(error) => return Err(error.message()),
+                Ok(_) => {
+                    let latest = self.snapshot(thread_id).await?;
+                    self.project(thread_id, &latest).await?;
+                    return Ok(true);
+                }
+            }
         }
-        self.append_event(
-            thread_id,
-            Event::ThreadDelete {
-                deleted_at: deleted_at.to_string(),
-            },
-        )
-        .await?;
-        let latest = self.snapshot(thread_id).await?;
-        self.project(thread_id, &latest).await?;
-        Ok(true)
+        Err("conversation stream changed too often".into())
     }
 
     /// Tombstone every live thread. Stream history remains the recovery source.
