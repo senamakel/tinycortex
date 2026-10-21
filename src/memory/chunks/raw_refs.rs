@@ -180,8 +180,8 @@ pub fn get_chunk_content_path(config: &MemoryConfig, chunk_id: &str) -> Result<O
     Ok(get_chunk_content_pointers(config, chunk_id)?.map(|(path, _)| path))
 }
 
-/// Return both `content_path` and `content_sha256` stored in SQLite for
-/// `summary_id`. `None` means either column is SQL NULL; see
+/// Return both `content_path` and `content_sha256` stored for
+/// `summary_id`. `None` means no complete pointer is stored; see
 /// [`get_chunk_content_pointers`] for chunk-pointer semantics.
 ///
 /// # Errors

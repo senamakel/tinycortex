@@ -1,8 +1,7 @@
 //! Chunk persistence and query operations.
 //!
-//! Chunk record writes and direct record reads use the host-supplied document
-//! store. Collection listing and several related transaction paths are being
-//! moved with the tree, score, queue, and entity-index group.
+//! Chunk records and their adjunct queries use the host-supplied document
+//! store.
 
 use anyhow::Result;
 use std::collections::{HashMap, HashSet};

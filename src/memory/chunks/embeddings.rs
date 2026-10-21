@@ -3,8 +3,8 @@
 //! Chunk embeddings and re-embed skips are versioned host-document records
 //! keyed by `(chunk_id, model_signature)` so multiple vector spaces can
 //! coexist. This module does not compute embeddings — callers pass vectors in.
-//! Summary embedding adjuncts remain with the tree's SQLite store until that
-//! coupled tree migration lands. Signature-aware chunk reads live in the
+//! Summary embeddings use their own owner-state collection. Signature-aware
+//! chunk reads live in the
 //! [`super::embeddings_query`] sibling.
 
 use super::collections::{CHUNK_EMBEDDINGS, CHUNK_REEMBED_SKIPS, SUMMARY_REEMBED_SKIPS};
@@ -416,7 +416,7 @@ pub(crate) fn summary_reembed_skip_key(summary_id: &str, model_signature: &str) 
 }
 
 /// Bounds attacker-controlled ids/signatures passed to reembed-skipped admin
-/// helpers. Rejects NUL bytes so SQLite bindings cannot be truncated.
+/// helpers. Rejects NUL bytes so record keys cannot be ambiguous.
 pub const REEMBED_SKIP_KEY_MAX_LEN: usize = 2048;
 
 /// Validate and trim a `chunk_id` / `model_signature` value before it reaches
