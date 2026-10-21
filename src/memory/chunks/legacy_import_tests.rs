@@ -140,16 +140,17 @@ async fn typed_import_commits_chunk_adjuncts_tree_entities_and_jobs_together() {
     assert_eq!(counts.entities, 1);
     assert_eq!(counts.trees, 2);
     assert_eq!(counts.jobs, 1);
-    assert_eq!(super::super::versioned::get_chunk_async(&config, &chunk_id).await.unwrap(), Some(batch.chunks[0].chunk.clone()));
     assert_eq!(
-        super::super::versioned::read_state_async(
-            &config,
-            c::RAW_REFS,
-            &chunk_id
-        )
-        .await
-        .unwrap()
-        .unwrap()[0]["path"],
+        super::super::versioned::get_chunk_async(&config, &chunk_id)
+            .await
+            .unwrap(),
+        Some(batch.chunks[0].chunk.clone())
+    );
+    assert_eq!(
+        super::super::versioned::read_state_async(&config, c::RAW_REFS, &chunk_id)
+            .await
+            .unwrap()
+            .unwrap()[0]["path"],
         "raw/legacy-source.md"
     );
     assert!(
@@ -158,30 +159,44 @@ async fn typed_import_commits_chunk_adjuncts_tree_entities_and_jobs_together() {
             .unwrap()
             .is_some()
     );
-    assert!(
-        super::super::versioned::read_state_async(&config, c::CHUNK_EMBEDDINGS, &format!("[\"{chunk_id}\",\"fixture/model@1\"]"))
-            .await
-            .unwrap()
-            .is_some()
-    );
-    assert!(
-        super::super::versioned::read_state_async(&config, c::ENTITY_INDEX, &format!("occ:{}:{}", hex("person:ada"), hex(&chunk_id)))
-            .await
-            .unwrap()
-            .is_some()
-    );
+    assert!(super::super::versioned::read_state_async(
+        &config,
+        c::CHUNK_EMBEDDINGS,
+        &format!("[\"{chunk_id}\",\"fixture/model@1\"]")
+    )
+    .await
+    .unwrap()
+    .is_some());
+    assert!(super::super::versioned::read_state_async(
+        &config,
+        c::ENTITY_INDEX,
+        &format!("occ:{}:{}", hex("person:ada"), hex(&chunk_id))
+    )
+    .await
+    .unwrap()
+    .is_some());
     assert!(
         super::super::versioned::read_state_async(&config, c::TREES, "tree:legacy-tree")
             .await
             .unwrap()
             .is_some()
     );
-    assert!(
-        super::super::versioned::read_state_async(&config, c::SUMMARIES, "summary:legacy-summary")
-            .await
-            .unwrap()
-            .is_some()
-    );
+    assert!(super::super::versioned::read_state_async(
+        &config,
+        c::SUMMARIES,
+        "summary:legacy-summary"
+    )
+    .await
+    .unwrap()
+    .is_some());
+    assert!(super::super::versioned::read_state_async(
+        &config,
+        c::INGESTED_SOURCES,
+        "chat\0legacy-source"
+    )
+    .await
+    .unwrap()
+    .is_some());
     assert!(
         crate::memory::queue::store::get_job_async(&config, "legacy-extract-job")
             .await
@@ -189,20 +204,22 @@ async fn typed_import_commits_chunk_adjuncts_tree_entities_and_jobs_together() {
             .is_some()
     );
 
+    let before_retry = super::super::versioned::capture_state_snapshot_async(&config)
+        .await
+        .unwrap();
     let repeated = import_legacy_batch(&config, &batch).await.unwrap();
+    let after_retry = super::super::versioned::capture_state_snapshot_async(&config)
+        .await
+        .unwrap();
     assert_eq!(repeated.chunks, 1);
     assert_eq!(
-        super::super::versioned::list_state_async(&config, c::CHUNK_VERSIONS)
-            .await
-            .unwrap()
-            .len(),
-        0,
-        "the idempotent retry must not create unrelated chunk-state records"
+        before_retry, after_retry,
+        "an idempotent retry must not create another owner commit"
     );
 }
 
 #[tokio::test]
-async fn typed_import_rejects_path_escape_and_mismatched_score_before_writes() {
+async fn typed_import_rejects_path_escape_before_writes() {
     let tmp = tempfile::TempDir::new().unwrap();
     let config = crate::memory::chunks::test_support::host_config(tmp.path());
     let mut batch = fixture_batch();
@@ -210,9 +227,10 @@ async fn typed_import_rejects_path_escape_and_mismatched_score_before_writes() {
 
     assert!(import_legacy_batch(&config, &batch).await.is_err());
     assert!(
-        super::super::versioned::list_chunks_async(&config)
+        super::super::versioned::list_chunk_snapshot_with_head_async(&config, &[])
             .await
             .unwrap()
+            .1
             .is_empty()
     );
 }

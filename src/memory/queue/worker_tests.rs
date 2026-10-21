@@ -8,8 +8,8 @@ use crate::memory::queue::store::{
 };
 use crate::memory::queue::test_support::RecordingDelegates;
 use crate::memory::queue::types::{FlushStalePayload, JobStatus, NewJob, ReembedBackfillPayload};
-use tinystoragedrivers_types::{ErrorKind, StorageError};
 use tempfile::TempDir;
+use tinystoragedrivers_types::{ErrorKind, StorageError};
 
 fn test_config() -> (TempDir, MemoryConfig) {
     let tmp = TempDir::new().unwrap();
@@ -380,7 +380,10 @@ fn storage_failures_are_classified_by_typed_kind_through_context() {
     let backend = anyhow::Error::new(StorageError::backend("generic storage failure"));
     let unrelated = anyhow::anyhow!("database disk image is malformed");
 
-    assert_eq!(storage_error_kind(&unavailable), Some(ErrorKind::Unavailable));
+    assert_eq!(
+        storage_error_kind(&unavailable),
+        Some(ErrorKind::Unavailable)
+    );
     assert_eq!(storage_error_kind(&conflict), Some(ErrorKind::Conflict));
     assert_eq!(storage_error_kind(&backend), Some(ErrorKind::Backend));
     assert!(is_retryable_storage_error(&unavailable));

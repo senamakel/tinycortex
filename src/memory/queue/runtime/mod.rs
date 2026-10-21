@@ -65,12 +65,10 @@ pub async fn run_worker(
                 tokio::task::yield_now().await;
             }
             Ok(false) => interruptible_sleep(opts.idle_backoff, shutdown).await,
-            Err(err) => {
-                match backoff_for(&err, opts) {
-                    Some(backoff) => interruptible_sleep(backoff, shutdown).await,
-                    None => return Err(err),
-                }
-            }
+            Err(err) => match backoff_for(&err, opts) {
+                Some(backoff) => interruptible_sleep(backoff, shutdown).await,
+                None => return Err(err),
+            },
         }
     }
     Ok(())
@@ -89,7 +87,8 @@ pub async fn run_scheduler(
     shutdown: &Shutdown,
 ) -> Result<()> {
     while !shutdown.is_triggered() {
-        if let Err(err) = crate::memory::queue::store_settle::recover_stale_locks_async(config).await
+        if let Err(err) =
+            crate::memory::queue::store_settle::recover_stale_locks_async(config).await
         {
             if worker::is_fatal_storage_error(&err) {
                 return Err(err);
@@ -145,12 +144,8 @@ fn backoff_for(err: &anyhow::Error, opts: &WorkerLoopConfig) -> Option<Duration>
         return Some(opts.host_io_backoff);
     }
     match worker::storage_error_kind(err) {
-        Some(tinystoragedrivers_types::ErrorKind::Conflict) => {
-            Some(opts.conflict_backoff)
-        }
-        Some(tinystoragedrivers_types::ErrorKind::Unavailable) => {
-            Some(opts.unavailable_backoff)
-        }
+        Some(tinystoragedrivers_types::ErrorKind::Conflict) => Some(opts.conflict_backoff),
+        Some(tinystoragedrivers_types::ErrorKind::Unavailable) => Some(opts.unavailable_backoff),
         Some(_) => None,
         None => Some(opts.error_backoff),
     }

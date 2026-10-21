@@ -9,10 +9,10 @@ use crate::memory::queue::store::{
 use crate::memory::queue::test_support::RecordingDelegates;
 use crate::memory::queue::types::{FlushStalePayload, JobStatus, NewJob};
 use tempfile::TempDir;
-use tokio::time::sleep;
 use tinystoragedrivers_api::Storage;
 use tinystoragedrivers_testkit::{memory_storage, Failing};
 use tinystoragedrivers_types::{ErrorKind, Scope, StorageError};
+use tokio::time::sleep;
 
 fn test_config() -> (TempDir, MemoryConfig) {
     let tmp = TempDir::new().unwrap();

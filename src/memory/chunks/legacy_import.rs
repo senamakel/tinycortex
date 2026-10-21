@@ -12,7 +12,7 @@ use super::raw_refs::RawRef;
 use super::types::{Chunk, SourceKind};
 use super::versioned::{self, StateChange};
 use crate::memory::config::MemoryConfig;
-use crate::memory::queue::{NewJob, store};
+use crate::memory::queue::{store, NewJob};
 use crate::memory::score::store::ScoreRow;
 use crate::memory::store::entity_index::transaction::{
     stage_node_occurrences_async, EntityOccurrence,
@@ -181,9 +181,7 @@ pub async fn import_legacy_batch(
             .collect();
         let state_map = states
             .into_iter()
-            .map(|(collection, rows)| {
-                (collection, rows.into_iter().collect::<HashMap<_, _>>())
-            })
+            .map(|(collection, rows)| (collection, rows.into_iter().collect::<HashMap<_, _>>()))
             .collect::<HashMap<_, _>>();
         let mut chunks_to_write = Vec::new();
         let mut expected = Vec::new();
@@ -388,14 +386,23 @@ pub async fn import_legacy_batch(
             }
         }
 
-        let staged_jobs = store::stage_import_jobs_at_snapshot(config, &snapshot, &batch.jobs).await?;
+        let staged_jobs =
+            store::stage_import_jobs_at_snapshot(config, &snapshot, &batch.jobs).await?;
         expected.extend(staged_jobs.expected);
         changes.extend(staged_jobs.changes);
         let counts = LegacyImportCounts {
             chunks: batch.chunks.len(),
-            scores: batch.chunks.iter().filter(|record| record.score.is_some()).count(),
+            scores: batch
+                .chunks
+                .iter()
+                .filter(|record| record.score.is_some())
+                .count(),
             entities: batch.entities.len()
-                + batch.chunks.iter().map(|record| record.entities.len()).sum::<usize>(),
+                + batch
+                    .chunks
+                    .iter()
+                    .map(|record| record.entities.len())
+                    .sum::<usize>(),
             trees: batch.trees.len() + batch.summaries.len(),
             jobs: staged_jobs.publish.len(),
         };
@@ -429,7 +436,10 @@ fn validate_batch(batch: &LegacyImportBatch) -> Result<()> {
             "legacy import contains an empty or duplicate chunk ID"
         );
         if let Some(score) = &record.score {
-            anyhow::ensure!(score.chunk_id == record.chunk.id, "legacy score/chunk ID mismatch");
+            anyhow::ensure!(
+                score.chunk_id == record.chunk.id,
+                "legacy score/chunk ID mismatch"
+            );
         }
         for occurrence in &record.entities {
             anyhow::ensure!(
@@ -455,16 +465,29 @@ fn validate_batch(batch: &LegacyImportBatch) -> Result<()> {
             );
         }
         for reference in &record.raw_refs {
-            anyhow::ensure!(safe_relative_path(&reference.path), "invalid legacy raw-ref path");
+            anyhow::ensure!(
+                safe_relative_path(&reference.path),
+                "invalid legacy raw-ref path"
+            );
             if let Some(end) = reference.end {
                 anyhow::ensure!(end >= reference.start, "legacy raw-ref range is reversed");
             }
         }
     }
     let tree_ids: HashSet<_> = batch.trees.iter().map(|tree| tree.id.as_str()).collect();
-    anyhow::ensure!(tree_ids.len() == batch.trees.len(), "duplicate legacy tree ID");
-    let summary_ids: HashSet<_> = batch.summaries.iter().map(|node| node.id.as_str()).collect();
-    anyhow::ensure!(summary_ids.len() == batch.summaries.len(), "duplicate legacy summary ID");
+    anyhow::ensure!(
+        tree_ids.len() == batch.trees.len(),
+        "duplicate legacy tree ID"
+    );
+    let summary_ids: HashSet<_> = batch
+        .summaries
+        .iter()
+        .map(|node| node.id.as_str())
+        .collect();
+    anyhow::ensure!(
+        summary_ids.len() == batch.summaries.len(),
+        "duplicate legacy summary ID"
+    );
     for summary in &batch.summaries {
         anyhow::ensure!(
             tree_ids.contains(summary.tree_id.as_str()),
@@ -495,7 +518,10 @@ fn validate_batch(batch: &LegacyImportBatch) -> Result<()> {
             "invalid legacy entity occurrence"
         );
         if let Some(tree_id) = &occurrence.tree_id {
-            anyhow::ensure!(tree_ids.contains(tree_id.as_str()), "entity references unknown tree");
+            anyhow::ensure!(
+                tree_ids.contains(tree_id.as_str()),
+                "entity references unknown tree"
+            );
         }
     }
     Ok(())
@@ -509,7 +535,10 @@ fn add_desired(
 ) -> Result<()> {
     let identity = (collection.to_owned(), key.to_owned());
     if let Some(previous) = desired.insert(identity, value.clone()) {
-        anyhow::ensure!(previous == value, "conflicting duplicate imported owner row");
+        anyhow::ensure!(
+            previous == value,
+            "conflicting duplicate imported owner row"
+        );
     }
     Ok(())
 }
@@ -521,19 +550,27 @@ fn merge_changes(
     staged_changes: Vec<StateChange>,
 ) -> Result<()> {
     for condition in staged_expected {
-        if let Some(previous) = expected.iter().find(|item| {
-            item.collection == condition.collection && item.key == condition.key
-        }) {
-            anyhow::ensure!(previous.value == condition.value, "conflicting import preconditions");
+        if let Some(previous) = expected
+            .iter()
+            .find(|item| item.collection == condition.collection && item.key == condition.key)
+        {
+            anyhow::ensure!(
+                previous.value == condition.value,
+                "conflicting import preconditions"
+            );
         } else {
             expected.push(condition);
         }
     }
     for change in staged_changes {
-        if let Some(previous) = changes.iter().find(|item| {
-            item.collection == change.collection && item.key == change.key
-        }) {
-            anyhow::ensure!(previous.value == change.value, "conflicting import mutations");
+        if let Some(previous) = changes
+            .iter()
+            .find(|item| item.collection == change.collection && item.key == change.key)
+        {
+            anyhow::ensure!(
+                previous.value == change.value,
+                "conflicting import mutations"
+            );
         } else {
             changes.push(change);
         }

@@ -188,11 +188,8 @@ pub async fn plan_score_persistence_for_queue(
     timestamp_ms: i64,
     tree_id: Option<&str>,
 ) -> Result<Vec<JobMutation>> {
-    let chunks = versioned::get_chunks_batch_async(
-        config,
-        std::slice::from_ref(&result.chunk_id),
-    )
-    .await?;
+    let chunks =
+        versioned::get_chunks_batch_async(config, std::slice::from_ref(&result.chunk_id)).await?;
     anyhow::ensure!(
         chunks.contains_key(&result.chunk_id),
         "cannot plan score persistence for missing chunk {}",

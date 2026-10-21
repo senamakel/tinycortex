@@ -381,7 +381,7 @@ fn exclude_dropped_keeps_a_row_whose_lifecycle_was_never_written() {
             collection: CHUNK_LIFECYCLE.into(),
             key: bypassed.id.clone(),
             value: None,
-        }]
+        }],
     )
     .unwrap();
     assert!(versioned::read_state(&cfg, CHUNK_LIFECYCLE, &bypassed.id)

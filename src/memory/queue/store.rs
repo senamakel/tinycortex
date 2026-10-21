@@ -261,7 +261,6 @@ pub(crate) async fn stage_import_jobs_at_snapshot(
         let key = job_key(id);
         let proposed = record_from_new(config, job, id.to_owned());
         let existing = current.get(&key).cloned();
-        let is_new = existing.is_none();
         expected.insert(key.clone(), existing.clone());
         let record = if let Some(value) = existing {
             let record = decode_job(&value)?;
@@ -278,24 +277,25 @@ pub(crate) async fn stage_import_jobs_at_snapshot(
             proposed
         };
 
-        if is_new {
-            if let Some(dedupe) = &job.dedupe_key {
+        if let Some(dedupe) = &job.dedupe_key {
             let dkey = dedupe_state_key(dedupe);
             let pointer = current.get(&dkey).cloned();
             expected.insert(dkey.clone(), pointer.clone());
-            if let Some(value) = pointer {
-                let active_id = value.as_str().context("decode queue dedupe pointer")?;
-                if active_id != id {
-                    if let Some(active_value) = current.get(&job_key(active_id)) {
-                        let active = decode_job(active_value)?;
-                        anyhow::ensure!(
-                            !matches!(active.status()?, JobStatus::Ready | JobStatus::Running),
-                            "imported dedupe key {dedupe} is already owned by active job {active_id}"
-                        );
-                    }
+            let pointer_id = pointer
+                .as_ref()
+                .map(|value| value.as_str().context("decode queue dedupe pointer"))
+                .transpose()?;
+            if let Some(active_id) = pointer_id.filter(|active_id| *active_id != id) {
+                if let Some(active_value) = current.get(&job_key(active_id)) {
+                    let active = decode_job(active_value)?;
+                    anyhow::ensure!(
+                        !matches!(active.status()?, JobStatus::Ready | JobStatus::Running),
+                        "imported dedupe key {dedupe} is already owned by active job {active_id}"
+                    );
                 }
             }
-            changes.insert(dkey, Some(Value::String(id.to_owned())));
+            if pointer_id != Some(id) {
+                changes.insert(dkey, Some(Value::String(id.to_owned())));
             }
         }
 

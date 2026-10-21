@@ -47,9 +47,9 @@ mod recovery;
 
 #[path = "embeddings.rs"]
 mod embeddings;
-mod legacy_import;
 #[path = "embeddings_query.rs"]
 mod embeddings_query;
+mod legacy_import;
 #[path = "migrations.rs"]
 mod migrations;
 #[path = "produce.rs"]
@@ -106,11 +106,6 @@ pub use types::{
 };
 
 pub use collections::collections;
-pub use legacy_import::{
-    import_legacy_batch, LegacyChunkRecord, LegacyContentPointer, LegacyEmbedding,
-    LegacyEntityEdge, LegacyEntityOccurrence, LegacyImportBatch, LegacyImportCounts,
-    LegacySourceGate,
-};
 pub use connection::{shared_connection, with_connection};
 pub(crate) use embeddings::summary_reembed_skip_key;
 pub use embeddings::{
@@ -127,6 +122,11 @@ pub use embeddings_query::{
     get_chunk_embeddings_batch_async, get_chunk_embeddings_for_signature_batch,
     get_chunk_embeddings_for_signature_batch_async, has_uncovered_reembed_work,
     has_uncovered_reembed_work_async,
+};
+pub use legacy_import::{
+    import_legacy_batch, LegacyChunkRecord, LegacyContentPointer, LegacyEmbedding,
+    LegacyEntityEdge, LegacyEntityOccurrence, LegacyImportBatch, LegacyImportCounts,
+    LegacySourceGate,
 };
 pub use raw_refs::{
     get_chunk_content_path, get_chunk_content_pointers, get_chunk_raw_refs,
