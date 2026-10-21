@@ -5,7 +5,22 @@ fn delete_chunks_by_source_removes_safe_content_files_but_rejects_escape_paths()
     let (_tmp, cfg) = test_config();
     let safe = sample_chunk("slack:c-1", 0, 1_700_000_000_000);
     let unsafe_chunk = sample_chunk("slack:c-1", 1, 1_700_000_001_000);
-    upsert_chunks(&cfg, &[safe.clone(), unsafe_chunk.clone()]).unwrap();
+    upsert_staged_chunks(
+        &cfg,
+        &[
+            StagedChunk {
+                chunk: safe.clone(),
+                content_path: "chunks/safe.md".into(),
+                content_sha256: "safe-hash".into(),
+            },
+            StagedChunk {
+                chunk: unsafe_chunk.clone(),
+                content_path: "../outside.md".into(),
+                content_sha256: "unsafe-hash".into(),
+            },
+        ],
+    )
+    .unwrap();
 
     let root = content_root(&cfg);
     let safe_rel = "chunks/safe.md";
@@ -15,19 +30,6 @@ fn delete_chunks_by_source_removes_safe_content_files_but_rejects_escape_paths()
 
     let outside_path = root.parent().unwrap().join("outside.md");
     std::fs::write(&outside_path, "outside").unwrap();
-
-    with_connection(&cfg, |conn| {
-        conn.execute(
-            "UPDATE mem_tree_chunks SET content_path = ?1 WHERE id = ?2",
-            params![safe_rel, safe.id],
-        )?;
-        conn.execute(
-            "UPDATE mem_tree_chunks SET content_path = ?1 WHERE id = ?2",
-            params!["../outside.md", unsafe_chunk.id],
-        )?;
-        Ok(())
-    })
-    .unwrap();
 
     let deleted = delete_chunks_by_source(&cfg, SourceKind::Chat, "slack:c-1").unwrap();
 
@@ -150,13 +152,14 @@ fn corrupt_surviving_raw_refs_make_deletion_cleanup_fail_closed() {
         }],
     )
     .unwrap();
-    with_connection(&cfg, |conn| {
-        conn.execute(
-            "UPDATE mem_tree_chunks SET raw_refs_json='corrupt' WHERE id=?1",
-            params![corrupt.id],
-        )?;
-        Ok(())
-    })
+    super::versioned::write_state_changes(
+        &cfg,
+        &[super::versioned::StateChange {
+            collection: super::collections::RAW_REFS.into(),
+            key: corrupt.id.clone(),
+            value: Some(serde_json::Value::String("corrupt".into())),
+        }],
+    )
     .unwrap();
     let absolute = content_root(&cfg).join(&raw_path);
     std::fs::create_dir_all(absolute.parent().unwrap()).unwrap();
@@ -202,13 +205,14 @@ fn raw_refs_round_trip_and_prefix_listing_tolerates_corrupt_rows() {
         }],
     )
     .unwrap();
-    with_connection(&cfg, |conn| {
-        conn.execute(
-            "UPDATE mem_tree_chunks SET raw_refs_json = 'not valid json' WHERE id = ?1",
-            params![corrupt.id],
-        )?;
-        Ok(())
-    })
+    super::versioned::write_state_changes(
+        &cfg,
+        &[super::versioned::StateChange {
+            collection: super::collections::RAW_REFS.into(),
+            key: corrupt.id.clone(),
+            value: Some(serde_json::Value::String("not valid json".into())),
+        }],
+    )
     .unwrap();
 
     let got = get_chunk_raw_refs(&cfg, &c1.id).unwrap().unwrap();
@@ -228,33 +232,62 @@ fn raw_refs_round_trip_and_prefix_listing_tolerates_corrupt_rows() {
 fn content_pointer_accessors_return_only_complete_non_deleted_rows() {
     let (_tmp, cfg) = test_config();
     let chunk = sample_chunk("notion:page-1", 0, 1_700_000_000_000);
-    upsert_chunks(&cfg, std::slice::from_ref(&chunk)).unwrap();
-    with_connection(&cfg, |conn| {
-        conn.execute(
-            "UPDATE mem_tree_chunks SET content_path = ?1, content_sha256 = ?2 WHERE id = ?3",
-            params!["chunks/notion/page-1.md", "abc123", chunk.id],
-        )?;
-        conn.execute(
-            "INSERT OR IGNORE INTO mem_tree_trees (id, kind, scope, created_at_ms)
-             VALUES ('tree-content-pointers', 'source', 'notion:page-1', 0)",
-            [],
-        )?;
-        conn.execute(
-            "INSERT INTO mem_tree_summaries (
-                id, tree_id, tree_kind, level, child_ids_json, content, token_count,
-                entities_json, topics_json, time_range_start_ms, time_range_end_ms,
-                score, sealed_at_ms, deleted, content_path, content_sha256
-             ) VALUES
-                ('summary-live', 'tree-content-pointers', 'source', 1, '[]', 'live', 1,
-                 '[]', '[]', 0, 0, 1.0, 0, 0, 'summaries/live.md', 'sum123'),
-                ('summary-deleted', 'tree-content-pointers', 'source', 1, '[]', 'deleted', 1,
-                 '[]', '[]', 0, 0, 1.0, 0, 1, 'summaries/deleted.md', 'sum456'),
-                ('summary-incomplete', 'tree-content-pointers', 'source', 1, '[]', 'incomplete', 1,
-                 '[]', '[]', 0, 0, 1.0, 0, 0, 'summaries/incomplete.md', NULL)",
-            [],
-        )?;
-        Ok(())
-    })
+    upsert_staged_chunks(
+        &cfg,
+        &[StagedChunk {
+            chunk: chunk.clone(),
+            content_path: "chunks/notion/page-1.md".into(),
+            content_sha256: "abc123".into(),
+        }],
+    )
+    .unwrap();
+    super::versioned::write_state_changes(
+        &cfg,
+        &[
+            super::versioned::StateChange {
+                collection: super::collections::SUMMARY_CONTENT_POINTERS.into(),
+                key: "summary:summary-live".into(),
+                value: Some(serde_json::json!({
+                    "summary_id": "summary-live",
+                    "content_path": "summaries/live.md",
+                    "content_sha256": "sum123"
+                })),
+            },
+            super::versioned::StateChange {
+                collection: super::collections::SUMMARY_CONTENT_POINTERS.into(),
+                key: "summary:summary-deleted".into(),
+                value: Some(serde_json::json!({
+                    "summary_id": "summary-deleted",
+                    "content_path": "summaries/deleted.md",
+                    "content_sha256": "sum456"
+                })),
+            },
+            super::versioned::StateChange {
+                collection: super::collections::SUMMARY_CONTENT_POINTERS.into(),
+                key: "summary:summary-incomplete".into(),
+                value: Some(serde_json::json!({
+                    "summary_id": "summary-incomplete",
+                    "content_path": "summaries/incomplete.md",
+                    "content_sha256": ""
+                })),
+            },
+            super::versioned::StateChange {
+                collection: super::collections::SUMMARIES.into(),
+                key: "summary:summary-live".into(),
+                value: Some(serde_json::json!({"deleted": false})),
+            },
+            super::versioned::StateChange {
+                collection: super::collections::SUMMARIES.into(),
+                key: "summary:summary-deleted".into(),
+                value: Some(serde_json::json!({"deleted": true})),
+            },
+            super::versioned::StateChange {
+                collection: super::collections::SUMMARIES.into(),
+                key: "summary:summary-incomplete".into(),
+                value: Some(serde_json::json!({"deleted": false})),
+            },
+        ],
+    )
     .unwrap();
 
     assert_eq!(
@@ -268,13 +301,18 @@ fn content_pointer_accessors_return_only_complete_non_deleted_rows() {
     assert!(get_chunk_content_pointers(&cfg, "missing")
         .unwrap()
         .is_none());
-    with_connection(&cfg, |conn| {
-        conn.execute(
-            "UPDATE mem_tree_chunks SET content_path = '', content_sha256 = '' WHERE id = ?1",
-            rusqlite::params![chunk.id],
-        )?;
-        Ok(())
-    })
+    super::versioned::write_state_changes(
+        &cfg,
+        &[super::versioned::StateChange {
+            collection: super::collections::CHUNK_CONTENT_POINTERS.into(),
+            key: chunk.id.clone(),
+            value: Some(serde_json::json!({
+                "chunk_id": chunk.id,
+                "content_path": "",
+                "content_sha256": ""
+            })),
+        }],
+    )
     .unwrap();
     assert!(get_chunk_content_path(&cfg, &chunk.id).unwrap().is_none());
     assert!(get_chunk_content_pointers(&cfg, &chunk.id)
