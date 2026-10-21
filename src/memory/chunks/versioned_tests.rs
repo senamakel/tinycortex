@@ -423,9 +423,14 @@ async fn explicit_json_null_state_is_rejected_before_head_advance() {
     )
     .unwrap_err();
 
-    assert!(error.to_string().contains("JSON null state values are unsupported"));
+    assert!(error
+        .to_string()
+        .contains("JSON null state values are unsupported"));
     assert_eq!(capture_head(&config).unwrap(), before);
-    assert_eq!(read_state(&config, CHUNK_LIFECYCLE, "null-state").unwrap(), None);
+    assert_eq!(
+        read_state(&config, CHUNK_LIFECYCLE, "null-state").unwrap(),
+        None
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
