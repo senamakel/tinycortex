@@ -174,7 +174,11 @@ async fn loads_from_a_real_persona_workspace() {
     .await
     .unwrap();
 
-    let retriever = PersonaRetriever::load(&config).unwrap();
+    let load_config = config.clone();
+    let retriever = std::thread::spawn(move || PersonaRetriever::load(&load_config))
+        .join()
+        .unwrap()
+        .unwrap();
     assert_eq!(retriever.len(), 2);
 
     let counts = retriever.facet_counts();

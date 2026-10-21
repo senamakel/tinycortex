@@ -267,6 +267,8 @@ fn extraction_coverage_from_snapshot(
 
 pub use super::store_sources::{
     claim_source_ingest, count_chunks_by_lifecycle_status, count_raw_paths_ingested_with_prefix,
-    delete_source_ingest, filter_raw_paths_not_ingested, get_chunk_lifecycle_status,
-    is_source_ingested, mark_raw_paths_ingested, set_chunk_lifecycle_status, RAW_FILE_GATE_KIND,
+    count_raw_paths_ingested_with_prefix_async, delete_source_ingest,
+    filter_raw_paths_not_ingested, filter_raw_paths_not_ingested_async, get_chunk_lifecycle_status,
+    is_source_ingested, mark_raw_paths_ingested, mark_raw_paths_ingested_async,
+    set_chunk_lifecycle_status, RAW_FILE_GATE_KIND,
 };
