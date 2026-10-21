@@ -322,4 +322,3 @@ pub async fn list_stale_buffers_async(
     buffers.sort_by_key(|buffer| buffer.oldest_at);
     Ok(buffers)
 }
-

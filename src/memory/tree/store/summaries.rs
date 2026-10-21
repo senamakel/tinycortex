@@ -7,15 +7,12 @@
 
 use std::collections::HashMap;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use chrono::Utc;
-use rusqlite::{params, Transaction};
 
-use super::common::{ms_to_utc, pack_embedding_blob};
-use super::types::{SummaryNode, TreeKind};
+use super::types::SummaryNode;
 use crate::memory::chunks::{signature_variants, tree_active_signature};
 use crate::memory::config::MemoryConfig;
-use crate::memory::score::embed::decode_optional_blob;
 use crate::memory::store::content::StagedSummary;
 
 /// Fetch one summary by id. Soft-deleted rows are returned with `deleted = true`.
