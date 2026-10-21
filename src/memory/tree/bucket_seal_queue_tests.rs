@@ -127,7 +127,7 @@ impl QueueDelegates for SealDelegate {
         String::new()
     }
 
-    fn has_uncovered_reembed_work(
+    async fn has_uncovered_reembed_work(
         &self,
         _: &crate::memory::config::MemoryConfig,
         _: &str,

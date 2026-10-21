@@ -127,7 +127,7 @@ pub async fn plan_document_subtree_for_queue(
         let summary = store::stage_summary_changes(node, None, &signature)?;
         accumulated.add_many(summary.expected, summary.changes)?;
         if node.embedding.is_some() {
-            let skip_key = crate::memory::chunks::embeddings::summary_reembed_skip_key(
+            let skip_key = crate::memory::chunks::summary_reembed_skip_key(
                 &node.id,
                 &signature,
             );

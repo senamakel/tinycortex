@@ -279,7 +279,11 @@ pub trait QueueDelegates: Send + Sync {
     fn active_signature(&self, config: &MemoryConfig) -> String;
 
     /// Whether any chunk/summary lacks a vector at `signature`.
-    fn has_uncovered_reembed_work(&self, config: &MemoryConfig, signature: &str) -> Result<bool>;
+    async fn has_uncovered_reembed_work(
+        &self,
+        config: &MemoryConfig,
+        signature: &str,
+    ) -> Result<bool>;
 }
 
 /// Handler outcome, expected state, compute-only mutations, and durable
@@ -398,7 +402,9 @@ async fn handle_extract(
     // Anything admitted arms the re-embed backfill so the embedding pass starts
     // promptly (extract no longer embeds inline).
     if decision.kept {
-        if let Some(job) = crate::memory::queue::ops::planned_reembed_backfill(config, delegates)? {
+        if let Some(job) =
+            crate::memory::queue::ops::planned_reembed_backfill(config, delegates).await?
+        {
             follow_ups.push(job);
         }
     }

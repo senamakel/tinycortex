@@ -174,7 +174,7 @@ impl QueueDelegates for RecordingDelegates {
         self.signature.clone()
     }
 
-    fn has_uncovered_reembed_work(&self, _config: &MemoryConfig, _signature: &str) -> Result<bool> {
+    async fn has_uncovered_reembed_work(&self, _config: &MemoryConfig, _signature: &str) -> Result<bool> {
         Ok(self.uncovered)
     }
 }

@@ -112,7 +112,7 @@ pub use embeddings::{
     mark_chunk_reembed_skipped, mark_summary_reembed_skipped, mark_summary_reembed_skipped_async,
     plan_chunk_embedding_for_queue, set_chunk_embedding, set_chunk_embedding_for_signature,
     set_chunk_embedding_for_signature_tx, set_summary_embedding_for_signature_tx,
-    tree_active_signature, REEMBED_SKIP_KEY_MAX_LEN,
+    summary_reembed_skip_key, tree_active_signature, REEMBED_SKIP_KEY_MAX_LEN,
 };
 pub use embeddings_query::{
     get_chunk_embedding, get_chunk_embedding_async, get_chunk_embedding_for_signature,

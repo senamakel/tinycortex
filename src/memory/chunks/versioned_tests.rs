@@ -314,14 +314,31 @@ async fn listing_chunk_state_resolves_many_lifecycle_keys_in_bounded_queries() {
         .map(|index| chunk(&format!("state-list-{index:04}"), "state listing fixture"))
         .collect::<Vec<_>>();
     super::super::store::upsert_chunks(&config, &chunks).unwrap();
+    let score_rows = chunks
+        .iter()
+        .map(|chunk| StateChange {
+            collection: super::super::collections::SCORES.into(),
+            key: chunk.id.clone(),
+            value: Some(serde_json::json!({"chunk_id":chunk.id,"total":0.5})),
+        })
+        .collect::<Vec<_>>();
+    assert!(commit_if_state_matches(&config, &[], &[], &score_rows).unwrap());
 
-    let (listed, states) = list_chunk_snapshot(&config, &[CHUNK_LIFECYCLE]).unwrap();
+    let (listed, states) = list_chunk_snapshot(
+        &config,
+        &[CHUNK_LIFECYCLE, super::super::collections::SCORES],
+    )
+    .unwrap();
 
     assert_eq!(listed.len(), chunks.len());
     assert_eq!(states[CHUNK_LIFECYCLE].len(), chunks.len());
+    assert_eq!(
+        states[super::super::collections::SCORES].len(),
+        chunks.len()
+    );
     assert!(
-        state_version_queries.load(Ordering::SeqCst) <= 4,
-        "listing {} lifecycle keys issued {} state-version queries",
+        state_version_queries.load(Ordering::SeqCst) <= 8,
+        "listing {} lifecycle and score keys issued {} state-version queries",
         chunks.len(),
         state_version_queries.load(Ordering::SeqCst)
     );

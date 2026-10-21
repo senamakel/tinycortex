@@ -39,21 +39,21 @@ pub fn backfill_in_progress() -> bool {
 /// owner state that established the need; this helper never publishes a queue
 /// hint. The "active signature" and "is there uncovered work?" probes are
 /// delegated, since they read the embedding store the queue does not own.
-pub fn plan_reembed_backfill(
+pub async fn plan_reembed_backfill(
     config: &MemoryConfig,
     delegates: &dyn QueueDelegates,
 ) -> Result<Option<NewJob>> {
-    planned_reembed_backfill(config, delegates)
+    planned_reembed_backfill(config, delegates).await
 }
 
 /// Build the deduplicated re-embed follow-up without persisting it. Workers
 /// use this to commit follow-up creation atomically with parent settlement.
-pub(crate) fn planned_reembed_backfill(
+pub(crate) async fn planned_reembed_backfill(
     config: &MemoryConfig,
     delegates: &dyn QueueDelegates,
 ) -> Result<Option<NewJob>> {
     let sig = delegates.active_signature(config);
-    if delegates.has_uncovered_reembed_work(config, &sig)? {
+    if delegates.has_uncovered_reembed_work(config, &sig).await? {
         let job = NewJob::reembed_backfill(&ReembedBackfillPayload { signature: sig })?;
         return Ok(Some(job));
     }

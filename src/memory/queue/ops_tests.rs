@@ -20,21 +20,21 @@ fn backfill_flag_setters_are_wired() {
     set_backfill_in_progress(false);
 }
 
-#[test]
-fn plan_reembed_backfill_returns_only_uncovered_signature_intents() {
+#[tokio::test]
+async fn plan_reembed_backfill_returns_only_uncovered_signature_intents() {
     // Covered space → no intent.
     let (_t0, covered) = test_config();
     let mut d = RecordingDelegates::admitting();
     d.uncovered = false;
-    assert!(plan_reembed_backfill(&covered, &d).unwrap().is_none());
+    assert!(plan_reembed_backfill(&covered, &d).await.unwrap().is_none());
 
     // Uncovered space → stable intent identity on repeated planning, without
     // publishing a queue hint from this helper.
     let (_t1, cfg) = test_config();
     let mut d2 = RecordingDelegates::admitting();
     d2.uncovered = true;
-    let first = plan_reembed_backfill(&cfg, &d2).unwrap().unwrap();
-    let second = plan_reembed_backfill(&cfg, &d2).unwrap().unwrap();
+    let first = plan_reembed_backfill(&cfg, &d2).await.unwrap().unwrap();
+    let second = plan_reembed_backfill(&cfg, &d2).await.unwrap().unwrap();
     assert_eq!(first.kind, second.kind);
     assert_eq!(first.payload_json, second.payload_json);
     assert_eq!(first.dedupe_key, second.dedupe_key);

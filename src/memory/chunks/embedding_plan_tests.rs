@@ -77,7 +77,7 @@ impl QueueDelegates for ReembedDelegate {
         "queue-reembed-model".to_owned()
     }
 
-    fn has_uncovered_reembed_work(
+    async fn has_uncovered_reembed_work(
         &self,
         _: &crate::memory::config::MemoryConfig,
         _: &str,
