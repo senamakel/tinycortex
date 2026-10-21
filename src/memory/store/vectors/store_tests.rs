@@ -186,13 +186,11 @@ fn reopening_prepared_store_with_different_dims_errors() {
 }
 
 #[test]
-fn reopening_prepared_store_with_different_backend_errors() {
+fn reopening_prepared_store_with_different_backend_name_and_same_dims_succeeds() {
     let config = crate::memory::chunks::test_support::host_config("unused-vector-workspace");
     VectorStore::from_config(&config, Arc::new(FakeEmbedding { dims: 2 })).unwrap();
-    let error = VectorStore::from_config(&config, Arc::new(MismatchEmbedding))
-        .err()
-        .expect("backend mismatch must fail closed");
-    assert!(error.to_string().contains("backend mismatch"));
+    VectorStore::from_config(&config, Arc::new(MismatchEmbedding))
+        .expect("the historical store only guards embedding dimensions");
 }
 
 #[test]
