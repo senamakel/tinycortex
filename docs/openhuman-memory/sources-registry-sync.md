@@ -66,6 +66,25 @@ active accounts, use the same upsert/remove methods so pre-existing accounts
 become visible without a restart. `EntityStore` keeps the per-toolkit Composio
 entity id in host KV; production hosts should bind a durable storage scope.
 
+### Host adapter handoff
+
+The OpenHuman host adapter implements `SourceConfigPort` over its configuration
+owner. `read()` returns a revision tied to the exact `memory_sources` value;
+`compare_and_set()` replaces only that value when the revision still matches,
+preserving unrelated configuration and reporting conflicts without partial
+writes. The host performs the one-time import of existing TOML entries before
+exposing the port. It must not install an empty-source fallback when import or
+configuration access fails.
+
+Provider operations and config writes cannot share a transaction. After a
+successful connect, persist/reuse the per-toolkit entity id, then CAS-upsert the
+connected account's source. If that config update fails, report it and let
+active-account reconciliation retry the upsert. For disconnect/revocation,
+remove the source by connected-account id after the provider confirms the
+terminal state; reconciliation also removes source entries whose accounts are
+no longer active. Keep the entity id when removing one connection so a later
+connection for that toolkit retains its identity.
+
 ## Source Readers
 
 The `SourceReader` trait must support listing items and reading item content.
