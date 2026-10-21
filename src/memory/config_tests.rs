@@ -37,6 +37,26 @@ async fn storage_preparation_installs_chunk_collection_declarations() {
         .is_ok());
 }
 
+#[cfg(feature = "people")]
+#[tokio::test]
+async fn storage_preparation_installs_people_collection_declarations() {
+    let scope = tinystoragedrivers_types::Scope::new("test:people-preparation").unwrap();
+    let storage = tinystoragedrivers_testkit::memory_storage(&scope);
+    let config = MemoryConfig::open_with_storage("workspace", storage)
+        .await
+        .unwrap();
+
+    for spec in crate::memory::people::collections() {
+        config
+            .storage()
+            .unwrap()
+            .documents()
+            .validate_collection_spec(&spec)
+            .await
+            .unwrap();
+    }
+}
+
 #[test]
 fn host_bundle_is_not_exposed_before_collection_preparation() {
     let scope = tinystoragedrivers_types::Scope::new("test:unprepared").unwrap();

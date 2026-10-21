@@ -68,3 +68,64 @@ async fn interactions_round_trip() {
     let ints = s.interactions_for(pid).await.unwrap();
     assert_eq!(ints.len(), 2);
 }
+
+#[test]
+fn opening_people_requires_prepared_host_storage() {
+    let config = crate::memory::config::MemoryConfig::new("workspace");
+
+    let error = PeopleStore::open(&config).unwrap_err();
+
+    assert!(error.to_string().contains("prepared host storage"));
+}
+
+#[tokio::test]
+async fn failed_owner_commit_exposes_neither_person_nor_initial_aliases() {
+    use std::sync::Arc;
+    use tinystoragedrivers_api::Storage;
+    use tinystoragedrivers_testkit::Failing;
+    use tinystoragedrivers_types::{ErrorKind, Scope};
+
+    let workspace = tempfile::tempdir().unwrap();
+    let scope = Scope::new("test:people-head-failure").unwrap();
+    let raw = tinystoragedrivers_testkit::memory_storage(&scope);
+    let failing = Failing::new(raw.documents().clone());
+    let faults = failing.faults.clone();
+    let storage = Storage::new(
+        Arc::new(failing),
+        raw.streams().clone(),
+        raw.kv().clone(),
+        raw.blobs().clone(),
+        raw.queues().clone(),
+        raw.secrets().clone(),
+    );
+    let config = crate::memory::config::MemoryConfig::open_with_storage(workspace.path(), storage)
+        .await
+        .unwrap();
+    let store = PeopleStore::open(&config).unwrap();
+    let now = Utc::now();
+    let person = Person {
+        id: PersonId::new(),
+        display_name: Some("Atomic person".into()),
+        primary_email: None,
+        primary_phone: None,
+        handles: vec![],
+        created_at: now,
+        updated_at: now,
+    };
+    faults.fail_operation_nth("documents.put_with", 1, ErrorKind::Unavailable);
+
+    assert!(store
+        .insert_person(&person, &[Handle::Email("atomic@example.com".into())])
+        .await
+        .is_err());
+
+    faults.clear();
+    assert!(store.get(person.id).await.unwrap().is_none());
+    assert_eq!(
+        store
+            .lookup(&Handle::Email("atomic@example.com".into()))
+            .await
+            .unwrap(),
+        None
+    );
+}
