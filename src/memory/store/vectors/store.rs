@@ -52,8 +52,8 @@ struct VectorRecord {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct VectorMetadata {
+    /// Informational provider name from the writer that initialized the store.
     backend_name: String,
-    backend_signature: String,
     dimensions: usize,
 }
 
@@ -77,7 +77,9 @@ pub struct SearchResult {
 ///
 /// The store never opens a database or creates an in-memory production
 /// fallback. `MemoryConfig::prepare_storage` declares its collections, and
-/// this constructor validates the persisted embedding identity and dimension.
+/// this constructor validates the persisted embedding dimension. The provider
+/// name is retained as provenance; as in the historical SQLite store, it does
+/// not prevent reopening with a different provider of the same dimension.
 pub struct VectorStore {
     documents: Arc<dyn DocumentStore>,
     blocking: Blocking,
@@ -94,7 +96,6 @@ impl VectorStore {
         let blocking = config.storage_blocking()?.clone();
         let expected = VectorMetadata {
             backend_name: backend.name().to_owned(),
-            backend_signature: backend.signature(),
             dimensions: backend.dimensions(),
         };
         let docs = Arc::clone(&documents);
@@ -120,7 +121,6 @@ impl VectorStore {
             documents.as_ref(),
             VectorMetadata {
                 backend_name: backend.name().to_owned(),
-                backend_signature: backend.signature(),
                 dimensions: backend.dimensions(),
             },
         )
@@ -399,16 +399,6 @@ fn validate_metadata(
             "vector store dimension mismatch: database was created with {}-dim embeddings but the current backend ({}) uses {} dims",
             stored.dimensions, expected.backend_name, expected.dimensions
         )));
-    }
-    if stored.backend_signature != expected.backend_signature
-        || stored.backend_name != expected.backend_name
-    {
-        return Err(tinystoragedrivers_types::StorageError::invalid_input(
-            format!(
-                "vector store backend mismatch: database uses {} but the current backend is {}",
-                stored.backend_signature, expected.backend_signature
-            ),
-        ));
     }
     Ok(())
 }
