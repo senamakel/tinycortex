@@ -478,6 +478,7 @@ async fn handle_seal(
         follow_ups,
         expected,
         mutations,
+        document_projection: None,
     })
 }
 

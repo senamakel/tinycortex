@@ -175,7 +175,7 @@ fn settle_planned_job(
             follow_ups,
             expected,
             mutations,
-            document_projection,
+            ..
         }) => {
             let arms_reembed = follow_ups
                 .iter()
@@ -191,24 +191,6 @@ fn settle_planned_job(
                 set_backfill_in_progress(arms_reembed);
             } else if committed && arms_reembed {
                 set_backfill_in_progress(true);
-            }
-
-            if committed {
-                if let Some(projection) = document_projection {
-                    if let Err(error) = delegates
-                        .document_summaries_committed(
-                            config,
-                            &projection.tree_id,
-                            &projection.summaries,
-                        )
-                        .await
-                    {
-                        log::error!(
-                            "document summary projection failed after durable settlement for tree {}: {error:#}",
-                            projection.tree_id
-                        );
-                    }
-                }
             }
 
             // A same-level seal enqueue can be suppressed while this row is

@@ -497,6 +497,7 @@ pub async fn delete_orphaned_source_tree_async(
     }
     let mut expected = Vec::new();
     let mut changes = Vec::new();
+    let mut content_paths = Vec::new();
     for (key, value) in state_rows(&states, c::INGESTED_SOURCES) {
         if value.get("source_kind").and_then(serde_json::Value::as_str)
             == Some(source_kind.as_str())
@@ -533,6 +534,7 @@ pub async fn delete_orphaned_source_tree_async(
             if staged.snapshot != snapshot {
                 return Ok(false);
             }
+            content_paths.extend(staged.content_paths);
             expected.extend(staged.expected);
             changes.extend(staged.changes);
             expected.push(StateChange {
@@ -542,14 +544,18 @@ pub async fn delete_orphaned_source_tree_async(
             });
         }
     }
-    versioned::commit_if_state_matches_at_snapshot_async(
+    let committed = versioned::commit_if_state_matches_at_snapshot_async(
         config,
         &snapshot,
         &expected,
         &[],
         &changes,
     )
-    .await
+    .await?;
+    if committed {
+        remove_unreferenced_content_files_async(config, &content_paths).await?;
+    }
+    Ok(committed)
 }
 
 /// Remove every chunk and its coupled tree state. The count is the number of
