@@ -394,8 +394,8 @@ async fn legacy_import_without_lifecycle_preserves_missing_admission() {
     upsert_chunks_at(
         &config,
         &snapshot,
-        &[value.clone()],
-        &[value.clone()],
+        std::slice::from_ref(&value),
+        std::slice::from_ref(&value),
         &[],
         None,
     )
@@ -635,7 +635,12 @@ async fn chunk_and_state_changes_publish_at_the_same_commit_head() {
         value: Some(serde_json::json!({"ingested_at_ms": 1})),
     };
 
-    commit_operation(&config, &[value.clone()], std::slice::from_ref(&state)).unwrap();
+    commit_operation(
+        &config,
+        std::slice::from_ref(&value),
+        std::slice::from_ref(&state),
+    )
+    .unwrap();
 
     assert_eq!(
         super::super::store::get_chunk(&config, &value.id).unwrap(),
@@ -662,7 +667,12 @@ async fn interruption_before_head_keeps_chunk_and_state_changes_invisible() {
         tinystoragedrivers_types::ErrorKind::Backend,
     );
 
-    assert!(commit_operation(&config, &[value.clone()], std::slice::from_ref(&state)).is_err());
+    assert!(commit_operation(
+        &config,
+        std::slice::from_ref(&value),
+        std::slice::from_ref(&state)
+    )
+    .is_err());
     assert_eq!(
         super::super::store::get_chunk(&config, &value.id).unwrap(),
         None
@@ -673,7 +683,12 @@ async fn interruption_before_head_keeps_chunk_and_state_changes_invisible() {
     );
 
     faults.clear();
-    commit_operation(&config, &[value.clone()], std::slice::from_ref(&state)).unwrap();
+    commit_operation(
+        &config,
+        std::slice::from_ref(&value),
+        std::slice::from_ref(&state),
+    )
+    .unwrap();
     assert_eq!(
         super::super::store::get_chunk(&config, &value.id).unwrap(),
         Some(value)

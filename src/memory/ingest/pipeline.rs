@@ -278,21 +278,17 @@ async fn persist_ingest_operation(
                 changes.push(StateChange {
                     collection: SCORES.into(),
                     key: chunk.id.clone(),
-                    value: Some(serde_json::json!({
-                        "chunk_id": chunk.id,
-                        "total": score.total,
-                        "token_count_signal": score.signals.token_count,
-                        "unique_words_signal": score.signals.unique_words,
-                        "metadata_weight": score.signals.metadata_weight,
-                        "source_weight": score.signals.source_weight,
-                        "interaction_weight": score.signals.interaction,
-                        "entity_density": score.signals.entity_density,
-                        "dropped": !score.kept,
-                        "reason": score.drop_reason,
-                        "computed_at_ms": Utc::now().timestamp_millis(),
-                        "canonical_entities": score.canonical_entities,
-                        "llm_importance_reason": score.extracted.llm_importance_reason,
-                    })),
+                    value: Some(serde_json::to_value(
+                        crate::memory::score::store::ScoreRow {
+                            chunk_id: chunk.id.clone(),
+                            total: score.total,
+                            signals: score.signals.clone(),
+                            dropped: !score.kept,
+                            reason: score.drop_reason.clone(),
+                            computed_at_ms: Utc::now().timestamp_millis(),
+                            llm_importance_reason: score.extracted.llm_importance_reason.clone(),
+                        },
+                    )?),
                 });
                 changes.push(StateChange {
                     collection: CHUNK_LIFECYCLE.into(),
