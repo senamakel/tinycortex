@@ -131,22 +131,22 @@ async fn concurrent_appends_preserve_every_message_and_thread_count() {
 
     let tasks = (0..100)
         .map(|index| {
-        let store = store.clone();
-        tokio::spawn(async move {
-            store
-                .append_message_async(
-                    "concurrent-appends",
-                    ConversationMessage {
-                        id: format!("user:{index}"),
-                        content: format!("message {index}"),
-                        message_type: "text".into(),
-                        extra_metadata: serde_json::json!({}),
-                        sender: "user".into(),
-                        created_at: format!("2025-02-03T04:{:02}:00Z", index % 60),
-                    },
-                )
-                .await
-        })
+            let store = store.clone();
+            tokio::spawn(async move {
+                store
+                    .append_message_async(
+                        "concurrent-appends",
+                        ConversationMessage {
+                            id: format!("user:{index}"),
+                            content: format!("message {index}"),
+                            message_type: "text".into(),
+                            extra_metadata: serde_json::json!({}),
+                            sender: "user".into(),
+                            created_at: format!("2025-02-03T04:{:02}:00Z", index % 60),
+                        },
+                    )
+                    .await
+            })
         })
         .collect::<Vec<_>>();
     for task in tasks {
@@ -230,7 +230,10 @@ async fn updates_truncation_delete_recreate_and_purge_preserve_logical_transcrip
         )
         .await
         .unwrap();
-    assert_eq!(updated.extra_metadata, serde_json::json!({"reaction": "👍"}));
+    assert_eq!(
+        updated.extra_metadata,
+        serde_json::json!({"reaction": "👍"})
+    );
     assert_eq!(
         store
             .delete_messages_from_async("lifecycle", "m2")
@@ -254,7 +257,11 @@ async fn updates_truncation_delete_recreate_and_purge_preserve_logical_transcrip
         .delete_thread_async("lifecycle", "2025-02-03T04:12:00Z")
         .await
         .unwrap());
-    assert!(store.get_messages_async("lifecycle").await.unwrap().is_empty());
+    assert!(store
+        .get_messages_async("lifecycle")
+        .await
+        .unwrap()
+        .is_empty());
     store
         .ensure_thread_async(CreateConversationThread {
             id: "lifecycle".into(),
@@ -266,7 +273,11 @@ async fn updates_truncation_delete_recreate_and_purge_preserve_logical_transcrip
         })
         .await
         .unwrap();
-    assert!(store.get_messages_async("lifecycle").await.unwrap().is_empty());
+    assert!(store
+        .get_messages_async("lifecycle")
+        .await
+        .unwrap()
+        .is_empty());
 
     store
         .ensure_thread_async(CreateConversationThread {
