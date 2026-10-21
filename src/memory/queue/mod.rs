@@ -80,8 +80,8 @@ pub use store_settle::{
 };
 pub use testing::drain_until_idle;
 pub use types::{
-    AppendBufferPayload, AppendTarget, ExtractChunkPayload, FlushStalePayload, Job, JobFailure,
-    JobKind, JobOutcome, JobStatus, NewJob, NodeRef, ReembedBackfillPayload, SealDocumentPayload,
-    SealPayload,
+    AppendBufferPayload, AppendTarget, ExtractChunkPayload, FlushStalePayload, ImportedJob, Job,
+    JobFailure, JobKind, JobOutcome, JobStatus, NewJob, NodeRef, ReembedBackfillPayload,
+    SealDocumentPayload, SealPayload,
 };
 pub use worker::{bootstrap, llm_gate, run_once};

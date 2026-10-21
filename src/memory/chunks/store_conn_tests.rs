@@ -18,12 +18,12 @@ use super::{
     claim_source_ingest_tx, clear_chunk_reembed_skipped, clear_reembed_skipped_for_signature,
     content_root, count_chunks, db_path_for, delete_chunks_by_owner, delete_chunks_by_source,
     extraction_coverage, get_chunk, get_chunk_embedding, get_chunk_embedding_for_signature,
-    get_chunk_embedding_for_signature_async,
-    get_chunk_embeddings_for_signature_batch, get_chunks_batch, is_source_ingested, list_chunks,
-    import_legacy_batch, mark_chunk_reembed_skipped, set_chunk_embedding,
-    set_chunk_embedding_for_signature, tree_active_signature, upsert_chunks,
-    upsert_staged_chunks, LegacyChunkRecord, LegacyEmbedding, LegacyImportBatch, ListChunksQuery,
-    DB_DIR, GLOBAL_TOPIC_PURGE_MIGRATION_VERSION, CHUNK_STATUS_ADMITTED,
+    get_chunk_embedding_for_signature_async, get_chunk_embeddings_for_signature_batch,
+    get_chunks_batch, import_legacy_batch, is_source_ingested, list_chunks,
+    mark_chunk_reembed_skipped, set_chunk_embedding, set_chunk_embedding_for_signature,
+    tree_active_signature, upsert_chunks, upsert_staged_chunks, LegacyChunkRecord, LegacyEmbedding,
+    LegacyImportBatch, ListChunksQuery, CHUNK_STATUS_ADMITTED, DB_DIR,
+    GLOBAL_TOPIC_PURGE_MIGRATION_VERSION,
 };
 use crate::memory::config::MemoryConfig;
 use chrono::{TimeZone, Utc};
@@ -197,7 +197,10 @@ async fn typed_legacy_embedding_import_preserves_signature_dimension_and_idempot
     let after_retry = super::versioned::capture_state_snapshot_async(&cfg)
         .await
         .unwrap();
-    assert_eq!(before_retry, after_retry, "retry must not append another owner commit");
+    assert_eq!(
+        before_retry, after_retry,
+        "retry must not append another owner commit"
+    );
 }
 
 #[test]

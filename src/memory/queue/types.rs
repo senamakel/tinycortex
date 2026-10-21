@@ -293,6 +293,44 @@ pub struct NewJob {
     pub max_attempts: Option<u32>,
 }
 
+/// A durable source job imported from a previous TinyCortex store.
+///
+/// Unlike [`NewJob`], this preserves historical lifecycle and timestamps. A
+/// `Running` source job is recovered as `Ready` in the destination because its
+/// old lease/queue receipt cannot be reused; attempts and `started_at_ms` remain
+/// as history. Terminal source jobs remain terminal and are never republished.
+#[derive(Clone, Debug)]
+pub struct ImportedJob {
+    /// Stable source job identifier.
+    pub id: String,
+    /// Job discriminator selecting the destination handler.
+    pub kind: JobKind,
+    /// Serialized job payload, preserved byte-for-byte.
+    pub payload_json: String,
+    /// Optional active-work dedupe key.
+    pub dedupe_key: Option<String>,
+    /// Historical lifecycle state. `Running` is recovered to `Ready`.
+    pub status: JobStatus,
+    /// Historical attempts already spent before import.
+    pub attempts: u32,
+    /// Historical retry budget.
+    pub max_attempts: u32,
+    /// Historical availability time in UTC milliseconds.
+    pub available_at_ms: i64,
+    /// Original row creation time in UTC milliseconds.
+    pub created_at_ms: i64,
+    /// Original first-claim time, when recorded.
+    pub started_at_ms: Option<i64>,
+    /// Original terminal time, when recorded.
+    pub completed_at_ms: Option<i64>,
+    /// Last historical diagnostic, when present.
+    pub last_error: Option<String>,
+    /// Typed failure code, when present.
+    pub failure_reason: Option<String>,
+    /// Typed failure class, when present.
+    pub failure_class: Option<String>,
+}
+
 impl NewJob {
     /// Build a [`JobKind::ExtractChunk`] enqueue request.
     pub fn extract_chunk(p: &ExtractChunkPayload) -> Result<Self> {

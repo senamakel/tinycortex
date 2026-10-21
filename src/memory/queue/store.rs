@@ -16,7 +16,9 @@ use uuid::Uuid;
 
 use crate::memory::chunks::versioned::{self, StateChange};
 use crate::memory::config::MemoryConfig;
-use crate::memory::queue::types::{Job, JobKind, JobStatus, NewJob, RETIRED_JOB_KINDS};
+use crate::memory::queue::types::{
+    ImportedJob, Job, JobKind, JobStatus, NewJob, RETIRED_JOB_KINDS,
+};
 
 pub(crate) const JOBS: &str = "memory_tree_jobs";
 pub(crate) const JOB_PREFIX: &str = "job:";
@@ -228,7 +230,7 @@ pub(crate) struct StagedImportJobs {
 pub(crate) async fn stage_import_jobs_at_snapshot(
     config: &MemoryConfig,
     snapshot: &versioned::HeadSnapshot,
-    jobs: &[NewJob],
+    jobs: &[ImportedJob],
 ) -> Result<StagedImportJobs> {
     let rows = versioned::list_state_at_snapshot_async(config, snapshot, JOBS).await?;
     let current: HashMap<_, _> = rows.into_iter().collect();
@@ -239,11 +241,12 @@ pub(crate) async fn stage_import_jobs_at_snapshot(
     let mut publish = Vec::new();
 
     for job in jobs {
-        let id = job
-            .id
-            .as_deref()
-            .context("typed queue import requires a stable job ID")?;
+        let id = job.id.as_str();
         anyhow::ensure!(!id.is_empty(), "typed queue import job ID cannot be empty");
+        anyhow::ensure!(
+            job.max_attempts > 0,
+            "typed queue import job {id} has a zero attempt budget"
+        );
         anyhow::ensure!(
             seen_ids.insert(id.to_owned()),
             "typed queue import contains duplicate job ID {id}"
@@ -259,7 +262,7 @@ pub(crate) async fn stage_import_jobs_at_snapshot(
         }
 
         let key = job_key(id);
-        let proposed = record_from_new(config, job, id.to_owned());
+        let mut proposed = record_from_imported(job);
         let existing = current.get(&key).cloned();
         expected.insert(key.clone(), existing.clone());
         let record = if let Some(value) = existing {
@@ -268,34 +271,43 @@ pub(crate) async fn stage_import_jobs_at_snapshot(
                 record.kind == proposed.kind
                     && record.payload_json == proposed.payload_json
                     && record.dedupe_key == proposed.dedupe_key
-                    && record.max_attempts == proposed.max_attempts,
+                    && record.max_attempts == proposed.max_attempts
+                    && record.created_at_ms == proposed.created_at_ms,
                 "stable imported queue job ID {id} was reused with a different intent"
             );
+            // Source import is idempotent and must never roll back progress
+            // made by a destination worker since a previous import attempt.
             record
         } else {
+            if job.status == JobStatus::Running {
+                proposed.status = JobStatus::Ready.as_str().to_owned();
+            }
             changes.insert(key, Some(encode_job(&proposed)?));
             proposed
         };
 
-        if let Some(dedupe) = &job.dedupe_key {
-            let dkey = dedupe_state_key(dedupe);
-            let pointer = current.get(&dkey).cloned();
-            expected.insert(dkey.clone(), pointer.clone());
-            let pointer_id = pointer
-                .as_ref()
-                .map(|value| value.as_str().context("decode queue dedupe pointer"))
-                .transpose()?;
-            if let Some(active_id) = pointer_id.filter(|active_id| *active_id != id) {
-                if let Some(active_value) = current.get(&job_key(active_id)) {
-                    let active = decode_job(active_value)?;
-                    anyhow::ensure!(
+        let active = matches!(record.status()?, JobStatus::Ready | JobStatus::Running);
+        if active {
+            if let Some(dedupe) = &job.dedupe_key {
+                let dkey = dedupe_state_key(dedupe);
+                let pointer = current.get(&dkey).cloned();
+                expected.insert(dkey.clone(), pointer.clone());
+                let pointer_id = pointer
+                    .as_ref()
+                    .map(|value| value.as_str().context("decode queue dedupe pointer"))
+                    .transpose()?;
+                if let Some(active_id) = pointer_id.filter(|active_id| *active_id != id) {
+                    if let Some(active_value) = current.get(&job_key(active_id)) {
+                        let active = decode_job(active_value)?;
+                        anyhow::ensure!(
                         !matches!(active.status()?, JobStatus::Ready | JobStatus::Running),
                         "imported dedupe key {dedupe} is already owned by active job {active_id}"
                     );
+                    }
                 }
-            }
-            if pointer_id != Some(id) {
-                changes.insert(dkey, Some(Value::String(id.to_owned())));
+                if pointer_id != Some(id) {
+                    changes.insert(dkey, Some(Value::String(id.to_owned())));
+                }
             }
         }
 
@@ -323,6 +335,33 @@ pub(crate) async fn stage_import_jobs_at_snapshot(
             .collect(),
         publish,
     })
+}
+
+fn record_from_imported(job: &ImportedJob) -> JobRecord {
+    let recovered_status = match job.status {
+        JobStatus::Running => JobStatus::Ready,
+        status => status,
+    };
+    JobRecord {
+        id: job.id.clone(),
+        kind: job.kind.as_str().to_owned(),
+        payload_json: job.payload_json.clone(),
+        dedupe_key: job.dedupe_key.clone(),
+        status: recovered_status.as_str().to_owned(),
+        attempts: job.attempts,
+        max_attempts: job.max_attempts,
+        available_at_ms: job.available_at_ms,
+        locked_until_ms: None,
+        last_error: job.last_error.clone(),
+        failure_reason: job.failure_reason.clone(),
+        failure_class: job.failure_class.clone(),
+        created_at_ms: job.created_at_ms,
+        started_at_ms: job.started_at_ms,
+        completed_at_ms: job.completed_at_ms,
+        hint_generation: 0,
+        lease_epoch: 0,
+        lease_token: None,
+    }
 }
 
 /// Publish the queue hints for an import only after its owner-state CAS has

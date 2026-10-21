@@ -12,7 +12,7 @@ use super::raw_refs::RawRef;
 use super::types::{Chunk, SourceKind};
 use super::versioned::{self, StateChange};
 use crate::memory::config::MemoryConfig;
-use crate::memory::queue::{store, NewJob};
+use crate::memory::queue::{store, ImportedJob};
 use crate::memory::score::store::ScoreRow;
 use crate::memory::store::entity_index::transaction::{
     stage_node_occurrences_async, EntityOccurrence,
@@ -149,7 +149,7 @@ pub struct LegacyImportBatch {
     /// Source-ingest gates.
     pub source_gates: Vec<LegacySourceGate>,
     /// Durable extract jobs with stable IDs supplied by the source adapter.
-    pub jobs: Vec<NewJob>,
+    pub jobs: Vec<ImportedJob>,
 }
 
 /// Counts imported logical records. Existing identical records count as
@@ -568,7 +568,11 @@ fn validate_batch(batch: &LegacyImportBatch) -> Result<()> {
             summary.id
         );
     }
-    let summary_ids: HashSet<_> = batch.summaries.iter().map(|summary| summary.id.as_str()).collect();
+    let summary_ids: HashSet<_> = batch
+        .summaries
+        .iter()
+        .map(|summary| summary.id.as_str())
+        .collect();
     let mut summary_embedding_keys = HashSet::new();
     for embedding in &batch.summary_embeddings {
         anyhow::ensure!(
@@ -579,8 +583,10 @@ fn validate_batch(batch: &LegacyImportBatch) -> Result<()> {
             !embedding.model_signature.trim().is_empty()
                 && !embedding.vector.is_empty()
                 && embedding.vector.iter().all(|value| value.is_finite())
-                && summary_embedding_keys
-                    .insert((embedding.summary_id.as_str(), embedding.model_signature.as_str())),
+                && summary_embedding_keys.insert((
+                    embedding.summary_id.as_str(),
+                    embedding.model_signature.as_str()
+                )),
             "invalid or duplicate legacy summary embedding"
         );
     }

@@ -73,11 +73,25 @@ fn fixture_batch() -> LegacyImportBatch {
         tree_id: Some(tree.id.clone()),
         is_user: false,
     };
-    let mut job = NewJob::extract_chunk(&crate::memory::queue::ExtractChunkPayload {
-        chunk_id: chunk.id.clone(),
-    })
-    .unwrap();
-    job.id = Some("legacy-extract-job".into());
+    let job = ImportedJob {
+        id: "legacy-extract-job".into(),
+        kind: crate::memory::queue::JobKind::ExtractChunk,
+        payload_json: serde_json::to_string(&crate::memory::queue::ExtractChunkPayload {
+            chunk_id: chunk.id.clone(),
+        })
+        .unwrap(),
+        dedupe_key: None,
+        status: crate::memory::queue::JobStatus::Ready,
+        attempts: 2,
+        max_attempts: 7,
+        available_at_ms: 1_749_999_999_000,
+        created_at_ms: 1_749_000_000_000,
+        started_at_ms: Some(1_749_999_000_000),
+        completed_at_ms: None,
+        last_error: Some("historical retry".into()),
+        failure_reason: None,
+        failure_class: None,
+    };
     LegacyImportBatch {
         chunks: vec![LegacyChunkRecord {
             chunk,
@@ -100,15 +114,18 @@ fn fixture_batch() -> LegacyImportBatch {
                 llm_importance_reason: None,
             }),
             lifecycle_status: Some("pending_extraction".into()),
-            embeddings: vec![LegacyEmbedding {
-                model_signature: "fixture/model@1".into(),
-                vector: vec![0.25, 0.5],
-                created_at_ms: 1_750_000_000_000,
-            }, LegacyEmbedding {
-                model_signature: "fixture/model@2".into(),
-                vector: vec![0.125, 0.25, 0.5],
-                created_at_ms: 1_749_999_999_000,
-            }],
+            embeddings: vec![
+                LegacyEmbedding {
+                    model_signature: "fixture/model@1".into(),
+                    vector: vec![0.25, 0.5],
+                    created_at_ms: 1_750_000_000_000,
+                },
+                LegacyEmbedding {
+                    model_signature: "fixture/model@2".into(),
+                    vector: vec![0.125, 0.25, 0.5],
+                    created_at_ms: 1_749_999_999_000,
+                },
+            ],
             entities: vec![occurrence.clone()],
         }],
         trees: vec![tree.clone()],
@@ -185,7 +202,7 @@ async fn typed_import_commits_chunk_adjuncts_tree_entities_and_jobs_together() {
     assert!(super::super::versioned::read_state_async(
         &config,
         c::CHUNK_EMBEDDINGS,
-        &format!("[\\"{chunk_id}\\",\\"fixture/model@2\\"]")
+        &format!("[\"{chunk_id}\",\"fixture/model@2\"]")
     )
     .await
     .unwrap()
@@ -193,7 +210,7 @@ async fn typed_import_commits_chunk_adjuncts_tree_entities_and_jobs_together() {
     let summary_embedding = super::super::versioned::read_state_async(
         &config,
         c::SUMMARY_EMBEDDINGS,
-        "[\\"legacy-summary\\",\\"fixture/summary-model@1\\"]",
+        "[\"legacy-summary\",\"fixture/summary-model@1\"]",
     )
     .await
     .unwrap()
@@ -230,12 +247,14 @@ async fn typed_import_commits_chunk_adjuncts_tree_entities_and_jobs_together() {
     .await
     .unwrap()
     .is_some());
-    assert!(
-        crate::memory::queue::store::get_job_async(&config, "legacy-extract-job")
-            .await
-            .unwrap()
-            .is_some()
-    );
+    let imported_job = crate::memory::queue::store::get_job_async(&config, "legacy-extract-job")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(imported_job.created_at_ms, 1_749_000_000_000);
+    assert_eq!(imported_job.attempts, 2);
+    assert_eq!(imported_job.max_attempts, 7);
+    assert_eq!(imported_job.last_error.as_deref(), Some("historical retry"));
 
     let before_retry = super::super::versioned::capture_state_snapshot_async(&config)
         .await
@@ -315,10 +334,12 @@ async fn typed_import_rejects_conflicting_existing_entity_occurrence_without_mut
             .unwrap(),
         before
     );
-    assert!(super::super::versioned::get_chunk_async(&config, &batch.chunks[0].chunk.id)
-        .await
-        .unwrap()
-        .is_none());
+    assert!(
+        super::super::versioned::get_chunk_async(&config, &batch.chunks[0].chunk.id)
+            .await
+            .unwrap()
+            .is_none()
+    );
 }
 
 fn hex(value: &str) -> String {

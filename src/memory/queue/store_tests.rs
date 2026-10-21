@@ -152,16 +152,32 @@ async fn a_deferred_job_can_be_reclaimed_before_queue_dedupe_expires() {
 #[tokio::test]
 async fn typed_import_jobs_stage_dedupe_atomically_before_hint_publication() {
     let (_tmp, cfg) = test_config();
-    let mut job = NewJob::extract_chunk(&ExtractChunkPayload {
+    let job = NewJob::extract_chunk(&ExtractChunkPayload {
         chunk_id: "legacy-import-chunk".into(),
     })
     .unwrap();
-    job.id = Some("legacy-import-job".into());
+    let imported = |id: &str, job: &NewJob| ImportedJob {
+        id: id.to_owned(),
+        kind: job.kind,
+        payload_json: job.payload_json.clone(),
+        dedupe_key: job.dedupe_key.clone(),
+        status: JobStatus::Ready,
+        attempts: 0,
+        max_attempts: 3,
+        available_at_ms: 1_750_000_000_000,
+        created_at_ms: 1_700_000_000_000,
+        started_at_ms: None,
+        completed_at_ms: None,
+        last_error: None,
+        failure_reason: None,
+        failure_class: None,
+    };
+    let job = imported("legacy-import-job", &job);
 
     let snapshot = crate::memory::chunks::versioned::capture_state_snapshot_async(&cfg)
         .await
         .unwrap();
-    let staged = stage_import_jobs_at_snapshot(&cfg, &snapshot, &[job.clone()])
+    let staged = stage_import_jobs_at_snapshot(&cfg, &snapshot, std::slice::from_ref(&job))
         .await
         .unwrap();
     assert_eq!(staged.publish.len(), 1);
@@ -173,7 +189,7 @@ async fn typed_import_jobs_stage_dedupe_atomically_before_hint_publication() {
     // A conflicting dedupe owner rejects the import plan before either the
     // job row or its hint can be published.
     let mut conflict = job.clone();
-    conflict.id = Some("different-import-job".into());
+    conflict.id = "different-import-job".into();
     let active = staged.changes.clone();
     crate::memory::chunks::versioned::commit_if_state_matches_async(
         &cfg,
@@ -223,6 +239,87 @@ async fn typed_import_jobs_stage_dedupe_atomically_before_hint_publication() {
             .status,
         JobStatus::Ready
     );
+}
+
+#[tokio::test]
+async fn typed_import_preserves_job_history_and_recovers_running_work() {
+    let (_tmp, cfg) = test_config();
+    let statuses = [
+        ("ready", JobStatus::Ready),
+        ("running", JobStatus::Running),
+        ("done", JobStatus::Done),
+        ("failed", JobStatus::Failed),
+        ("cancelled", JobStatus::Cancelled),
+    ];
+    let jobs: Vec<_> = statuses
+        .iter()
+        .enumerate()
+        .map(|(index, (name, status))| ImportedJob {
+            id: format!("legacy-{name}"),
+            kind: JobKind::ExtractChunk,
+            payload_json: format!(r#"{{"chunk_id":"chunk-{name}"}}"#),
+            dedupe_key: Some(format!("extract:chunk-{name}")),
+            status: *status,
+            attempts: index as u32,
+            max_attempts: 4,
+            available_at_ms: 1_750_000_000_000 + index as i64,
+            created_at_ms: 1_700_000_000_000 + index as i64,
+            started_at_ms: (index > 0).then_some(1_700_000_100_000 + index as i64),
+            completed_at_ms: status
+                .is_terminal()
+                .then_some(1_700_000_200_000 + index as i64),
+            last_error: (index > 0).then(|| format!("source error {name}")),
+            failure_reason: (*status == JobStatus::Failed).then(|| "historical_failure".into()),
+            failure_class: (*status == JobStatus::Failed).then(|| "transient".into()),
+        })
+        .collect();
+    let snapshot = crate::memory::chunks::versioned::capture_state_snapshot_async(&cfg)
+        .await
+        .unwrap();
+    let staged = stage_import_jobs_at_snapshot(&cfg, &snapshot, &jobs)
+        .await
+        .unwrap();
+    assert_eq!(
+        staged.publish.len(),
+        2,
+        "only Ready and recovered Running jobs publish"
+    );
+    assert!(
+        crate::memory::chunks::versioned::commit_if_state_matches_async(
+            &cfg,
+            &staged.expected,
+            &[],
+            &staged.changes,
+        )
+        .await
+        .unwrap()
+    );
+
+    for (name, source_status) in statuses {
+        let row = get_job_async(&cfg, &format!("legacy-{name}"))
+            .await
+            .unwrap()
+            .unwrap();
+        let expected_status = if source_status == JobStatus::Running {
+            JobStatus::Ready
+        } else {
+            source_status
+        };
+        assert_eq!(row.status, expected_status);
+        let index = statuses.iter().position(|entry| entry.0 == name).unwrap() as u32;
+        assert_eq!(row.created_at_ms, 1_700_000_000_000 + index as i64);
+        assert_eq!(row.attempts, index);
+        assert_eq!(
+            row.started_at_ms,
+            (index > 0).then_some(1_700_000_100_000 + index as i64)
+        );
+        assert_eq!(
+            row.completed_at_ms,
+            source_status
+                .is_terminal()
+                .then_some(1_700_000_200_000 + index as i64)
+        );
+    }
 }
 
 #[tokio::test]
