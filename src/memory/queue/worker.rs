@@ -1,29 +1,21 @@
 //! Worker driver: claim one job, run its handler under the LLM gate, settle.
 //!
-//! OpenHuman spawned a `tokio` worker pool plus a wall-clock scheduler here.
-//! `tokio` is a dev-only dependency in this crate and the runtime/spawn plumbing
-//! (graceful-shutdown hooks, Sentry reporting, the corrupt-DB quarantine path)
-//! is out of the ported surface, so the durable primitive is [`run_once`]: a
+//! The durable primitive is [`run_once`]: a
 //! single claim→handle→settle step that a host drives in its own loop (and that
 //! [`drain_until_idle`](crate::memory::queue::drain_until_idle) calls to settle
 //! the queue deterministically in tests).
 //!
-//! The SQLite error classifiers ([`is_sqlite_busy`] et al.) are ported verbatim
-//! so a host loop can reproduce OpenHuman's "back off, don't page" policy for
-//! transient write-lock / I/O / disk-full / corruption conditions.
-//! [`is_host_io_error`] extends that family to persistent **host-filesystem**
-//! failures (EIO/ENOSPC/EROFS — a dying SD card or full/read-only mount) that
-//! surface as `std::io::Error` rather than a SQLite code; a host loop is meant
-//! to use it to back off long and page once instead of flooding (Sentry
-//! CORE-RUST-19J). The `tokio`-feature runtime loop's `backoff_for`
-//! (`memory::queue::runtime`) includes this classifier.
-//! The Sentry-once emission and the storage-degraded flag stay host-owned
-//! regardless.
+//! Queue storage errors retain their typed categories. `Unavailable` and
+//! `Conflict` can be retried by a host loop; a generic `Backend` error is
+//! returned as fatal because the storage port has no corruption category and
+//! the host cannot safely infer one from diagnostic text. [`is_host_io_error`]
+//! recognizes persistent filesystem failures surfaced by file operations.
 
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
 
 use anyhow::Result;
+use tinystoragedrivers_types::{ErrorKind, StorageError};
 
 use crate::memory::config::MemoryConfig;
 use crate::memory::queue::gate::{LlmGate, Permit};
@@ -375,73 +367,24 @@ async fn settle_planned_job_async(
     }
 }
 
-/// Classify whether an error is transient SQLite write-lock contention
-/// (`SQLITE_BUSY` or `SQLITE_LOCKED`): back off and re-poll, don't escalate.
-pub fn is_sqlite_busy(err: &anyhow::Error) -> bool {
-    if let Some(rusqlite::Error::SqliteFailure(sqlite_err, _)) =
-        err.downcast_ref::<rusqlite::Error>()
-    {
-        return matches!(
-            sqlite_err.code,
-            rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
-        );
-    }
-    let msg = format!("{err:#}").to_ascii_lowercase();
-    msg.contains("database is locked") || msg.contains("database table is locked")
+/// Return the typed storage category, including through `anyhow::Context`.
+pub(crate) fn storage_error_kind(err: &anyhow::Error) -> Option<ErrorKind> {
+    err.downcast_ref::<StorageError>().map(StorageError::kind)
 }
 
-/// Classify whether an error is a transient I/O failure that should be silently
-/// backed off (WAL truncate, the `-shm` cold-start family, `CANTOPEN`, the
-/// connection circuit breaker).
-pub fn is_sqlite_io_transient(err: &anyhow::Error) -> bool {
-    if let Some(rusqlite::Error::SqliteFailure(f, _)) = err.downcast_ref::<rusqlite::Error>() {
-        // 14 CANTOPEN, 1546 TRUNCATE, 4618 SHMOPEN, 4874 SHMSIZE, 5386 SHMMAP,
-        // 8714 IN_PAGE.
-        if matches!(f.extended_code, 14 | 1546 | 4618 | 4874 | 5386 | 8714) {
-            return true;
-        }
-        if f.code == rusqlite::ErrorCode::CannotOpen {
-            return true;
-        }
-    }
-    let msg = format!("{err:#}").to_ascii_lowercase();
-    msg.contains("circuit breaker open")
-        || msg.contains("disk i/o error")
-        || msg.contains("unable to open database file")
-        || msg.contains("xshmmap")
-        || msg.contains("truncate file")
+/// Whether a typed storage failure is retryable without changing the request.
+pub(crate) fn is_retryable_storage_error(err: &anyhow::Error) -> bool {
+    matches!(
+        storage_error_kind(err),
+        Some(ErrorKind::Unavailable | ErrorKind::Conflict)
+    )
 }
 
-/// Classify `SQLITE_FULL` (disk full): a persistent host condition — back off
-/// long and stay silent until the user frees space.
-pub fn is_sqlite_disk_full(err: &anyhow::Error) -> bool {
-    if let Some(rusqlite::Error::SqliteFailure(sqlite_err, _)) =
-        err.downcast_ref::<rusqlite::Error>()
-    {
-        if sqlite_err.code == rusqlite::ErrorCode::DiskFull {
-            return true;
-        }
-    }
-    let msg = format!("{err:#}").to_ascii_lowercase();
-    msg.contains("database or disk is full")
-        || msg.contains("insertion failed because database is full")
-}
-
-/// Classify `SQLITE_CORRUPT` / `SQLITE_NOTADB`: persistent on-disk damage that
-/// never clears on its own — a host should quarantine + rebuild, not re-poll.
-pub fn is_sqlite_corrupt(err: &anyhow::Error) -> bool {
-    if let Some(rusqlite::Error::SqliteFailure(sqlite_err, _)) =
-        err.downcast_ref::<rusqlite::Error>()
-    {
-        if matches!(
-            sqlite_err.code,
-            rusqlite::ErrorCode::DatabaseCorrupt | rusqlite::ErrorCode::NotADatabase
-        ) {
-            return true;
-        }
-    }
-    let msg = format!("{err:#}").to_ascii_lowercase();
-    msg.contains("database disk image is malformed") || msg.contains("file is not a database")
+/// Whether the error is a typed generic backend failure that the host must
+/// surface. The storage contract has no corruption category; diagnostic text
+/// is not used to guess one or trigger filesystem recovery.
+pub(crate) fn is_fatal_storage_error(err: &anyhow::Error) -> bool {
+    matches!(storage_error_kind(err), Some(ErrorKind::Backend))
 }
 
 /// Classify a persistent **host-filesystem** I/O failure (EIO `5`, ENOSPC `28`,
@@ -450,9 +393,8 @@ pub fn is_sqlite_corrupt(err: &anyhow::Error) -> bool {
 /// clear on their own, so a host loop should back off long and page **once**
 /// rather than re-poll and flood (Sentry CORE-RUST-19J).
 ///
-/// Distinct from [`is_sqlite_disk_full`]: `SQLITE_FULL` arrives as a SQLite code
-/// and stays in that arm; this family is the raw OS error bubbling out of
-/// `create_dir_all` / `File` operations, often through anyhow context layers,
+/// This family is the raw OS error bubbling out of `create_dir_all` / `File`
+/// operations, often through anyhow context layers,
 /// so both the typed downcast and the flattened `(os error N)` text are checked.
 /// EACCES (`13`) and ENOENT (`2`) are deliberately excluded — those are genuine
 /// bugs that must keep reporting.
