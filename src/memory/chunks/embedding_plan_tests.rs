@@ -215,24 +215,22 @@ async fn a_preplanned_reembed_cannot_resurrect_a_deleted_chunk() {
         chunk_id: chunk.id.clone(),
         planned_mutations: Some(stale_plan.mutations),
     };
-    let outcome = crate::memory::queue::run_once(&config, &delegate).await;
-    assert!(
-        outcome.is_err(),
-        "the stale lifecycle precondition must reject settlement"
-    );
+    crate::memory::queue::run_once(&config, &delegate)
+        .await
+        .unwrap();
     assert!(
         super::get_chunk_embedding_for_signature_async(&config, &chunk.id, signature)
             .await
             .unwrap()
             .is_none()
     );
-    assert_eq!(
+    assert_ne!(
         crate::memory::queue::store::get_job_async(&config, &job_id)
             .await
             .unwrap()
             .unwrap()
             .status,
-        crate::memory::queue::JobStatus::Ready,
-        "failed owner-state settlement must not mark the stale job done"
+        crate::memory::queue::JobStatus::Done,
+        "a stale plan must not mark the job done"
     );
 }

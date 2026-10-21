@@ -96,6 +96,58 @@ fn delete_chunk_by_id_takes_one_chunk_and_leaves_the_source() {
     assert_eq!(delete_chunk_by_id(&cfg, "no-such-chunk").unwrap(), 0);
 }
 
+#[test]
+fn deleting_a_chunk_tombstones_lifecycle_and_removes_versioned_sidecars() {
+    let (_tmp, cfg) = test_config();
+    let chunk = chunk_with("delete-sidecars", 0, 3_000, "sidecar body");
+    upsert_chunks(&cfg, std::slice::from_ref(&chunk)).unwrap();
+    let signature = "delete-sidecars-model";
+    super::set_chunk_embedding_for_signature(&cfg, &chunk.id, signature, &[0.1, 0.2]).unwrap();
+    super::set_chunk_raw_refs(
+        &cfg,
+        &chunk.id,
+        &[super::RawRef {
+            path: "raw/delete-sidecars.md".into(),
+            start: 0,
+            end: None,
+        }],
+    )
+    .unwrap();
+    let entity = crate::memory::store::entity_index::types::CanonicalEntity {
+        canonical_id: "email:sidecar@example.com".into(),
+        kind: crate::memory::store::entity_index::types::EntityKind::Email,
+        surface: "sidecar@example.com".into(),
+        span_start: 0,
+        span_end: 20,
+        score: 1.0,
+    };
+    let entity_index =
+        crate::memory::store::entity_index::EntityIndex::for_memory_config(&cfg).unwrap();
+    entity_index
+        .index_entity(&entity, &chunk.id, "leaf", 3_000, None)
+        .unwrap();
+
+    assert_eq!(delete_chunk_by_id(&cfg, &chunk.id).unwrap(), 1);
+    assert_eq!(
+        super::get_chunk_lifecycle_status(&cfg, &chunk.id)
+            .unwrap()
+            .as_deref(),
+        Some("deleted")
+    );
+    assert!(
+        super::get_chunk_embedding_for_signature(&cfg, &chunk.id, signature)
+            .unwrap()
+            .is_none()
+    );
+    assert!(super::get_chunk_raw_refs(&cfg, &chunk.id)
+        .unwrap()
+        .is_none());
+    assert!(entity_index
+        .list_entity_ids_for_node(&chunk.id)
+        .unwrap()
+        .is_empty());
+}
+
 /// Seed one row in every table `purge_all` empties, so a table name that does
 /// not exist in the schema fails the test rather than passing silently.
 fn seed_full_tier(cfg: &MemoryConfig, chunk: &Chunk) {

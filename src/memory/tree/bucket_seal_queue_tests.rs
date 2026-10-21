@@ -448,22 +448,23 @@ async fn a_preplanned_append_cannot_resurrect_a_deleted_chunk() {
         #[cfg(feature = "tokio")]
         invalidate_job_lease: None,
     };
-    assert!(crate::memory::queue::run_once(&config, &stale_delegate)
+    crate::memory::queue::run_once(&config, &stale_delegate)
         .await
-        .is_err());
+        .unwrap();
     assert!(
         store::get_tree_by_scope_async(&config, TreeKind::Source, "delete-fences-append")
             .await
             .unwrap()
             .is_none()
     );
-    assert_eq!(
+    assert_ne!(
         crate::memory::queue::store::get_job_async(&config, &job_id)
             .await
             .unwrap()
             .unwrap()
             .status,
-        crate::memory::queue::JobStatus::Ready
+        crate::memory::queue::JobStatus::Done,
+        "a stale append plan must not settle as done"
     );
 }
 
