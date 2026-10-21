@@ -191,7 +191,7 @@ impl KvStore {
                 .await
                 .map_err(|error| format!("read before writing KV key '{key}': {error}"))?;
             if let Some(current) = current {
-                Self::checked_entry(current.clone(), kind, encoded_namespace(&encoded), &key)?;
+                Self::checked_entry(current.clone(), kind, namespace.as_deref(), &key)?;
                 match self
                     .port
                     .cas(&storage_key, encoded.clone(), Precondition::Version(current.version))
@@ -258,10 +258,6 @@ impl KvStore {
     }
 
     async fn list_entries(&self, namespace: Option<&str>) -> Result<Vec<Entry>, String> {
-        let prefix = match namespace {
-            Some(_) => format!("{KEY_PREFIX}namespace:"),
-            None => format!("{KEY_PREFIX}global:"),
-        };
         // The actual digest keys share KEY_PREFIX; list that bounded family and
         // select by the identity envelope. Drivers return stable key order.
         let mut cursor = None;
@@ -345,7 +341,7 @@ impl KvStore {
 
     /// Insert or update a namespace-scoped key.
     pub fn set_namespace(&self, namespace: &str, key: &str, value: &Value) -> Result<(), String> {
-        let (namespace, key) = Self::normalize_namespace_write(namespace, key)?;
+        let (namespace, key) = normalize_write_identity(namespace, key)?;
         let store = self.clone();
         self.blocking
             .run(async move {
@@ -363,7 +359,7 @@ impl KvStore {
         key: &str,
         value: &Value,
     ) -> Result<(), String> {
-        let (namespace, key) = Self::normalize_namespace_write(namespace, key)?;
+        let (namespace, key) = normalize_write_identity(namespace, key)?;
         self.put_entry(EntryKind::Namespace, Some(namespace), key, value.clone())
             .await
     }
@@ -511,7 +507,7 @@ impl KvStore {
     }
 }
 
-fn normalize_namespace_write(namespace: &str, key: &str) -> Result<(String, String), String> {
+fn normalize_write_identity(namespace: &str, key: &str) -> Result<(String, String), String> {
     if safety::has_likely_secret(namespace) || safety::has_likely_secret(key) {
         return Err("kv namespace/key cannot contain secrets".to_string());
     }
@@ -519,10 +515,6 @@ fn normalize_namespace_write(namespace: &str, key: &str) -> Result<(String, Stri
         KvStore::normalize_namespace_write(namespace),
         KvStore::normalized_namespace_key(key),
     ))
-}
-
-fn encoded_namespace(value: &Value) -> Option<&str> {
-    value.get("namespace").and_then(Value::as_str)
 }
 
 fn list_value(entry: Entry) -> Value {
