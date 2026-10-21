@@ -5,6 +5,7 @@
 //! together, even though TSD's document port exposes conditional single-record
 //! writes rather than a cross-record transaction.
 
+use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock, RwLock};
 
@@ -351,7 +352,7 @@ impl PeopleStore {
             }
             interactions.push(record.interaction);
         }
-        interactions.sort_by(|left, right| right.ts.cmp(&left.ts));
+        interactions.sort_by_key(|interaction| Reverse(interaction.ts));
         Ok(interactions)
     }
 
@@ -377,7 +378,7 @@ impl PeopleStore {
             }
         }
         for interactions in out.values_mut() {
-            interactions.sort_by(|left, right| right.ts.cmp(&left.ts));
+            interactions.sort_by_key(|interaction| Reverse(interaction.ts));
         }
         Ok(out)
     }
