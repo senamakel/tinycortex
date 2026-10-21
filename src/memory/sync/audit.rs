@@ -4,7 +4,6 @@ use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use tinystoragedrivers_api::StreamStore;
 
 use crate::memory::config::MemoryConfig;
@@ -83,19 +82,21 @@ pub async fn read_audit_log_async(config: &MemoryConfig) -> anyhow::Result<Vec<S
 
 async fn read_entries(streams: &dyn tinystoragedrivers_api::StreamStore) -> anyhow::Result<Vec<SyncAuditEntry>> {
     let len = streams.len(AUDIT_STREAM).await?;
-    let entries = streams
-        .read_window(AUDIT_STREAM, 0, usize::try_from(len).unwrap_or(usize::MAX))
-        .await?;
-    let mut entries: Vec<_> = entries
-        .into_iter()
-        .filter_map(|entry| match serde_json::from_value::<SyncAuditEntry>(entry.value) {
-            Ok(entry) => Some(entry),
-            Err(error) => {
-                tracing::warn!(%error, "[memory_sync:audit] malformed audit record skipped");
-                None
+    let mut offset = 0_u64;
+    let mut entries = Vec::new();
+    while offset < len {
+        let page = streams.read_window(AUDIT_STREAM, offset, 512).await?;
+        anyhow::ensure!(!page.is_empty(), "audit stream ended before its reported length");
+        for record in page {
+            offset = record.offset.saturating_add(1);
+            match serde_json::from_value::<SyncAuditEntry>(record.value) {
+                Ok(entry) => entries.push(entry),
+                Err(error) => {
+                    tracing::warn!(%error, "[memory_sync:audit] malformed audit record skipped");
+                }
             }
-        })
-        .collect();
+        }
+    }
     entries.reverse();
     Ok(entries)
 }

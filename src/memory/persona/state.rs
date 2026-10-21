@@ -11,10 +11,10 @@
 //!   the email list forces a re-scan).
 //! - Instruction files: content sha per path — re-digest only on change.
 //!
-//! A concrete [`FileStateStore`] persists the map as one JSON file under the
-//! workspace so cursors survive across process runs; tests use an in-memory
-//! store. Evidence ids are content-addressed (§6.3), so overlapping cursors are
-//! harmless — this state is a *fast-skip* optimisation, not a correctness gate.
+//! [`KvStateStore`] persists cursors through the host's scoped KV port, so they
+//! survive across process runs. Evidence ids are content-addressed (§6.3), so
+//! overlapping cursors are harmless — this state is a *fast-skip* optimisation,
+//! not a correctness gate.
 
 use std::path::Path;
 

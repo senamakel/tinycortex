@@ -9,7 +9,7 @@ use tempfile::TempDir;
 use crate::memory::chunks::test_support::host_config;
 use crate::memory::config::MemoryConfig;
 use crate::memory::persona::config::PersonaConfig;
-use crate::memory::persona::state::FileStateStore;
+use crate::memory::persona::state::KvStateStore;
 use crate::memory::score::extract::{ChatPrompt, ChatProvider};
 use crate::memory::tree::summarise::ConcatSummariser;
 
@@ -149,7 +149,7 @@ async fn backfill_then_incremental_resume() {
     let (ws, _src, cfg, persona) = setup();
     let provider = MockChat;
     let summariser = ConcatSummariser::new();
-    let store = FileStateStore::open_in_workspace(ws.path()).unwrap();
+    let store = KvStateStore::from_config(&cfg).unwrap();
 
     let pipeline = Pipeline {
         config: &cfg,
@@ -189,7 +189,7 @@ async fn budget_cutoff_checkpoints() {
     persona.run_budget.max_sessions = 1; // only one transcript may digest
     let provider = MockChat;
     let summariser = ConcatSummariser::new();
-    let store = FileStateStore::open_in_workspace(ws.path()).unwrap();
+    let store = KvStateStore::from_config(&cfg).unwrap();
 
     let pipeline = Pipeline {
         config: &cfg,
@@ -215,7 +215,7 @@ async fn call_budget_exhaustion_checkpoints_and_resumes() {
     persona.run_budget.max_llm_calls = 1;
     persona.digest_concurrency = 1; // deterministic oldest-first ordering
     let summariser = ConcatSummariser::new();
-    let store = FileStateStore::open_in_workspace(ws.path()).unwrap();
+    let store = KvStateStore::from_config(&cfg).unwrap();
 
     let report = Pipeline {
         config: &cfg,
@@ -276,11 +276,10 @@ async fn call_budget_exhaustion_checkpoints_and_resumes() {
 #[test]
 fn compile_only_reassembles_without_llm() {
     let (ws, _src, cfg, persona) = setup();
-    let workspace = ws.path().to_path_buf();
     let path = std::thread::spawn(move || {
         let provider = MockChat;
         let summariser = ConcatSummariser::new();
-        let store = FileStateStore::open_in_workspace(&workspace).unwrap();
+        let store = KvStateStore::from_config(&cfg).unwrap();
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -321,7 +320,7 @@ async fn hard_provider_failure_does_not_commit_cursor() {
     // with a working provider re-processes it (evidence isn't lost).
     let (ws, _src, cfg, persona) = setup();
     let summariser = ConcatSummariser::new();
-    let store = FileStateStore::open_in_workspace(ws.path()).unwrap();
+    let store = KvStateStore::from_config(&cfg).unwrap();
 
     let failing = FailChat;
     let first = Pipeline {
@@ -367,7 +366,7 @@ async fn systemic_truncation_withholds_commits_and_retries() {
     let (ws, src, cfg, mut persona) = setup();
     persona.run_budget.max_llm_calls = 64; // decouple from the config default
     let summariser = ConcatSummariser::new();
-    let store = FileStateStore::open_in_workspace(ws.path()).unwrap();
+    let store = KvStateStore::from_config(&cfg).unwrap();
 
     let report = Pipeline {
         config: &cfg,
@@ -464,7 +463,7 @@ async fn fully_lost_session_commits_when_the_run_yields_observations() {
     persona.run_budget.max_llm_calls = 64; // decouple from the config default
 
     let summariser = ConcatSummariser::new();
-    let store = FileStateStore::open_in_workspace(ws.path()).unwrap();
+    let store = KvStateStore::from_config(&cfg).unwrap();
 
     let report = Pipeline {
         config: &cfg,
@@ -528,7 +527,7 @@ async fn clean_empty_digest_commits_cursor() {
     let (ws, src, cfg, mut persona) = setup();
     persona.run_budget.max_llm_calls = 64; // decouple from the config default
     let summariser = ConcatSummariser::new();
-    let store = FileStateStore::open_in_workspace(ws.path()).unwrap();
+    let store = KvStateStore::from_config(&cfg).unwrap();
 
     let report = Pipeline {
         config: &cfg,
@@ -587,7 +586,7 @@ async fn removed_directive_drops_out_on_rerun() {
     let (ws, src, cfg, persona) = setup();
     let provider = MockChat;
     let summariser = ConcatSummariser::new();
-    let store = FileStateStore::open_in_workspace(ws.path()).unwrap();
+    let store = KvStateStore::from_config(&cfg).unwrap();
     let claude_md = src.path().join("proj/CLAUDE.md");
 
     let first = Pipeline {
