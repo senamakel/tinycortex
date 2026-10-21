@@ -522,14 +522,14 @@ fn read_legacy_batch(root: &Path) -> Result<LegacyImportBatch> {
     Ok(batch)
 }
 
-fn read_chunk(
-    row: &Row<'_>,
-) -> rusqlite::Result<(
+type ImportedChunkRow = (
     Chunk,
     Option<LegacyContentPointer>,
     Vec<RawRef>,
     Option<String>,
-)> {
+);
+
+fn read_chunk(row: &Row<'_>) -> rusqlite::Result<ImportedChunkRow> {
     let source_kind = SourceKind::parse(&row.get::<_, String>(1)?).map_err(to_sql_error)?;
     let timestamp_ms: i64 = row.get(6)?;
     let source_ref: Option<String> = row.get(4)?;
@@ -619,11 +619,11 @@ fn datetime(timestamp_ms: i64) -> Result<DateTime<Utc>> {
 
 fn decode_f32(bytes: Vec<u8>) -> Result<Vec<f32>> {
     anyhow::ensure!(
-        bytes.len() % 4 == 0,
+        bytes.len().is_multiple_of(4),
         "legacy embedding byte length is not divisible by four"
     );
     Ok(bytes
-        .chunks_exact(4)
+        .chunks(4)
         .map(|part| f32::from_le_bytes([part[0], part[1], part[2], part[3]]))
         .collect())
 }

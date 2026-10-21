@@ -72,6 +72,28 @@ pub async fn plan_seal_one_level_for_queue(
     })
 }
 
+/// Plan sealing a buffer by its tree id and level for a host queue delegate.
+///
+/// This owner-level entry point resolves the tree and buffer itself so hosts
+/// can settle sealing mutations with the queue lease without reading or
+/// rewriting Cortex records directly.
+pub async fn plan_tree_level_seal_for_queue(
+    config: &MemoryConfig,
+    tree_id: &str,
+    level: u32,
+    services: &SealServices<'_>,
+    strategy: &LabelStrategy,
+) -> Result<crate::memory::queue::DelegateOutput<Option<crate::memory::queue::SealPayload>>> {
+    let Some(tree) = store::get_tree_async(config, tree_id).await? else {
+        return Ok(crate::memory::queue::DelegateOutput {
+            result: None,
+            mutations: Vec::new(),
+        });
+    };
+    let buffer = store::get_buffer_async(config, tree_id, level).await?;
+    plan_seal_one_level_for_queue(config, &tree, &buffer, services, strategy).await
+}
+
 /// Plan a queue append from its typed node and destination references.
 ///
 /// Cortex resolves the node's stored token/time metadata, rejects missing or

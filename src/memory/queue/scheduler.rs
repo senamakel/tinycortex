@@ -50,6 +50,7 @@ pub fn self_heal(config: &MemoryConfig) -> Result<u64> {
     requeue_transient_failed(config)
 }
 
+#[cfg(any(feature = "tokio", test))]
 pub(crate) async fn self_heal_async(config: &MemoryConfig) -> Result<u64> {
     crate::memory::queue::store_settle::requeue_transient_failed_async(config).await
 }

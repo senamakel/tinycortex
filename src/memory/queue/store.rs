@@ -174,6 +174,7 @@ pub(crate) fn all_job_records(config: &MemoryConfig) -> Result<Vec<(Value, JobRe
         .collect()
 }
 
+#[cfg(any(feature = "tokio", test))]
 pub(crate) async fn all_job_records_async(
     config: &MemoryConfig,
 ) -> Result<Vec<(Value, JobRecord)>> {
@@ -425,6 +426,7 @@ pub(crate) fn publish_record(config: &MemoryConfig, record: &JobRecord) -> Resul
     enqueue_hint(config, record)
 }
 
+#[cfg(any(feature = "tokio", test))]
 pub(crate) async fn publish_record_async(config: &MemoryConfig, record: &JobRecord) -> Result<()> {
     enqueue_hint_async(config, record).await
 }
@@ -1209,6 +1211,7 @@ pub fn purge_retired_jobs(config: &MemoryConfig) -> Result<usize> {
     anyhow::bail!("retired queue job cleanup conflicted within retry budget")
 }
 
+#[cfg(any(feature = "tokio", test))]
 pub(crate) async fn purge_retired_jobs_async(config: &MemoryConfig) -> Result<usize> {
     for _ in 0..PUBLISH_RETRIES {
         let records = versioned::list_state_async(config, JOBS).await?;

@@ -46,8 +46,8 @@ pub mod types;
 pub use bucket_seal::{
     append_leaf, append_leaf_deferred, append_to_buffer, cascade_all_from,
     cascade_all_from_with_services, plan_append_node_for_queue, plan_seal_one_level_for_queue,
-    seal_document_subtree_with_services, seal_one_level_with_services, should_seal,
-    SealLevelResult, MERGE_LEVEL_BASE,
+    plan_tree_level_seal_for_queue, seal_document_subtree_with_services,
+    seal_one_level_with_services, should_seal, SealLevelResult, MERGE_LEVEL_BASE,
 };
 pub use direct_ingest::{ingest_summary, SummaryIngestInput, SummaryIngestOutcome};
 pub use document_seal::{plan_document_subtree_for_queue, DocumentSealPlanResult};

@@ -306,6 +306,7 @@ pub fn retry_all_failed(config: &MemoryConfig) -> Result<u64> {
     requeue_failed(config)
 }
 
+#[cfg(any(feature = "tokio", test))]
 pub(crate) async fn requeue_transient_failed_async(config: &MemoryConfig) -> Result<u64> {
     let jobs = store::all_job_records_async(config).await?;
     let active_keys: std::collections::HashSet<String> = jobs

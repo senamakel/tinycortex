@@ -15,6 +15,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
 
 use anyhow::Result;
+#[cfg(any(feature = "tokio", test))]
 use tinystoragedrivers_types::{ErrorKind, StorageError};
 
 use crate::memory::config::MemoryConfig;
@@ -371,6 +372,7 @@ async fn settle_planned_job_async(
 }
 
 /// Return the typed storage category, including through `anyhow::Context`.
+#[cfg(any(feature = "tokio", test))]
 pub(crate) fn storage_error_kind(err: &anyhow::Error) -> Option<ErrorKind> {
     err.downcast_ref::<StorageError>().map(StorageError::kind)
 }
@@ -387,6 +389,7 @@ pub(crate) fn is_retryable_storage_error(err: &anyhow::Error) -> bool {
 /// Whether the error is a typed generic backend failure that the host must
 /// surface. The storage contract has no corruption category; diagnostic text
 /// is not used to guess one or trigger filesystem recovery.
+#[cfg(any(feature = "tokio", test))]
 pub(crate) fn is_fatal_storage_error(err: &anyhow::Error) -> bool {
     matches!(storage_error_kind(err), Some(ErrorKind::Backend))
 }
