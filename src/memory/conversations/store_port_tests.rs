@@ -30,14 +30,12 @@ async fn conversation_store_uses_prepared_streams_and_rebuildable_document_index
         sender: "assistant".into(),
         created_at: "2025-02-03T04:06:00Z".into(),
     };
-    store
-        .append_message_async("thread:alpha", message.clone())
-        .await
-        .unwrap();
-    store
-        .append_message_async("thread:alpha", message.clone())
-        .await
-        .unwrap();
+    let (first, retry) = tokio::join!(
+        store.append_message_async("thread:alpha", message.clone()),
+        store.append_message_async("thread:alpha", message.clone()),
+    );
+    assert_eq!(first.unwrap(), message);
+    assert_eq!(retry.unwrap(), message);
     let messages = store.get_messages_async("thread:alpha").await.unwrap();
     assert_eq!(messages, vec![message]);
 
