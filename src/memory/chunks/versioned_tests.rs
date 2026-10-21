@@ -351,19 +351,21 @@ async fn listing_chunk_state_resolves_many_lifecycle_keys_in_bounded_queries() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn upserting_many_chunks_checks_deleted_lifecycles_in_bounded_queries() {
-    let (config, state_version_queries) = config_with_state_version_query_counter().await;
+async fn plain_upsert_keeps_default_lifecycle_implicit() {
+    let config = config().await;
     let chunks = (0..64)
         .map(|index| chunk(&format!("lifecycle-write-{index:04}"), "write fixture"))
         .collect::<Vec<_>>();
 
-    assert_eq!(super::super::store::upsert_chunks(&config, &chunks).unwrap(), chunks.len());
-
+    assert_eq!(
+        super::super::store::upsert_chunks(&config, &chunks).unwrap(),
+        chunks.len()
+    );
+    let (_, listed, states) = list_chunk_snapshot(&config, &[CHUNK_LIFECYCLE]).unwrap();
+    assert_eq!(listed.len(), chunks.len());
     assert!(
-        state_version_queries.load(Ordering::SeqCst) <= 8,
-        "upserting {} chunks issued {} per-key lifecycle queries",
-        chunks.len(),
-        state_version_queries.load(Ordering::SeqCst)
+        states[CHUNK_LIFECYCLE].is_empty(),
+        "fresh plain upsert should not materialize one default lifecycle row per chunk"
     );
 }
 
