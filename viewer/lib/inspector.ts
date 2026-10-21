@@ -151,14 +151,17 @@ const snapshotForRequest = cache(async (workspace: string, chunkLimit: number): 
     throw new Error("TINYCORTEX_STORAGE_URL and TINYCORTEX_STORAGE_SCOPE are required");
   }
 
-  const env: NodeJS.ProcessEnv = { PATH: process.env.PATH };
+  const env: NodeJS.ProcessEnv = {
+    PATH: process.env.PATH,
+    NODE_ENV: process.env.NODE_ENV,
+  };
   for (const name of ["HOME", "TMPDIR", "SSL_CERT_FILE", "SSL_CERT_DIR", "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY"]) {
     if (process.env[name]) env[name] = process.env[name];
   }
   env.TINYCORTEX_WORKSPACE = workspace;
   env.TINYCORTEX_STORAGE_URL = storageUrl;
   env.TINYCORTEX_STORAGE_SCOPE = scope;
-  env.TINYCORTEX_INSPECTOR_CHUNK_LIMIT = String(boundedLimit);
+  env.TINYCORTEX_INSPECTOR_CHUNK_LIMIT = String(chunkLimit);
 
   const stdout: Buffer[] = [];
   let stdoutBytes = 0;

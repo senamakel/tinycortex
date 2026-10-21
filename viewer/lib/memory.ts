@@ -41,7 +41,11 @@ export type SkillDoc = {
 
 const SKILLDOC_NS_PREFIX = "skilldoc"; // ':' is sanitized to '_' by the KV store
 
-function rowToDoc(namespace: string | null, value: Record<string, unknown>, updatedAt: number): SkillDoc {
+function rowToDoc(namespace: string | null, stored: unknown, updatedAt: number): SkillDoc {
+  const value =
+    stored && typeof stored === "object" && !Array.isArray(stored)
+      ? (stored as Record<string, unknown>)
+      : {};
   const toolkit =
     (typeof value.toolkit === "string" && value.toolkit) ||
     (namespace?.startsWith(`${SKILLDOC_NS_PREFIX}:`)
