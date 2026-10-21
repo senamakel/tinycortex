@@ -14,6 +14,8 @@ pub mod scorer;
 pub mod store;
 pub mod types;
 
+pub use collections::collections;
+
 #[cfg(test)]
 pub(crate) mod test_support;
 

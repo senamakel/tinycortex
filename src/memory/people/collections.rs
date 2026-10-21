@@ -15,8 +15,10 @@ pub fn collections() -> Vec<CollectionSpec> {
         CollectionSpec::new(super::store::PEOPLE_HANDLES)
             .index(IndexSpec::new("by_handle", ["kind", "value"]).unique())
             .index(IndexSpec::new("by_person", ["person_id"])),
-        CollectionSpec::new(super::store::PEOPLE_INTERACTIONS)
-            .index(IndexSpec::new("by_person_time", ["person_id", "timestamp"])),
+        CollectionSpec::new(super::store::PEOPLE_INTERACTIONS).index(IndexSpec::new(
+            "by_person_time",
+            ["interaction.person_id", "interaction.ts"],
+        )),
     ]
 }
 

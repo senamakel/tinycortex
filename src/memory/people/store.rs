@@ -6,7 +6,6 @@
 //! writes rather than a cross-record transaction.
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
 use std::sync::{Arc, OnceLock, RwLock};
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -25,23 +24,24 @@ pub(crate) const PEOPLE_INTERACTIONS: &str = "memory_people_interactions";
 const WRITE_RETRIES: usize = 12;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-struct HandleRecord {
-    kind: String,
-    value: String,
-    person_id: PersonId,
+pub(crate) struct HandleRecord {
+    pub(crate) kind: String,
+    pub(crate) value: String,
+    pub(crate) person_id: PersonId,
+    /// Historical alias insertion time in Unix seconds.
+    pub(crate) created_at: i64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-struct InteractionRecord {
-    id: String,
-    interaction: Interaction,
+pub(crate) struct InteractionRecord {
+    pub(crate) id: String,
+    pub(crate) interaction: Interaction,
 }
 
 /// Process-global handle to the active workspace's configured people store.
 /// Hosts bind it with [`init`] only after preparing their memory storage.
 #[derive(Clone)]
 struct GlobalPeopleStore {
-    workspace: PathBuf,
     store: Arc<PeopleStore>,
 }
 
@@ -60,23 +60,16 @@ pub fn for_config(config: &MemoryConfig) -> Result<Arc<PeopleStore>> {
     Ok(Arc::new(PeopleStore::open(config)?))
 }
 
-/// Bind or rebind the process-global people store to the prepared workspace.
+/// Bind or rebind the process-global people store to the prepared host storage.
 ///
-/// Repeated calls for the same workspace return its existing handle. A
-/// different workspace replaces the global binding, preserving the active-user
-/// switch behavior without deriving a database path from the workspace.
+/// Every call adopts the supplied configuration. Workspace paths do not
+/// identify a storage backend, so they cannot safely be used to reuse a handle.
 pub fn init(config: &MemoryConfig) -> Result<Arc<PeopleStore>> {
     let mut slot = global_slot()
         .write()
         .map_err(|_| anyhow!("[people:store] global write lock poisoned"))?;
-    if let Some(existing) = slot.as_ref() {
-        if existing.workspace == config.workspace {
-            return Ok(Arc::clone(&existing.store));
-        }
-    }
     let store = for_config(config)?;
     *slot = Some(GlobalPeopleStore {
-        workspace: config.workspace.clone(),
         store: Arc::clone(&store),
     });
     Ok(store)
@@ -178,6 +171,7 @@ impl PeopleStore {
                         kind: kind.to_owned(),
                         value: value.to_owned(),
                         person_id: person.id,
+                        created_at: Utc::now().timestamp(),
                     })?),
                 },
             ];
@@ -229,6 +223,7 @@ impl PeopleStore {
                     kind: kind.to_owned(),
                     value: value.to_owned(),
                     person_id,
+                    created_at: Utc::now().timestamp(),
                 })?),
             }];
             if versioned::commit_if_state_matches_async(&self.config, &expected, &[], &changes)
@@ -285,19 +280,42 @@ impl PeopleStore {
 
     /// Record one interaction for an existing person.
     pub async fn record_interaction(&self, interaction: Interaction) -> Result<()> {
+        self.record_interaction_with_id(interaction, uuid::Uuid::new_v4().to_string())
+            .await
+    }
+
+    /// Record one imported interaction under a stable source row identifier.
+    /// Repeating the same import is idempotent; a reused ID with different
+    /// content fails closed.
+    pub async fn record_interaction_with_id(
+        &self,
+        interaction: Interaction,
+        source_id: String,
+    ) -> Result<()> {
         let owner_key = interaction.person_id.to_string();
         let interaction = Interaction {
             ts: seconds_precision(interaction.ts),
             ..interaction
         };
+        let id = format!("legacy:{source_id}");
+        let key = format!("{}:{id}", interaction.person_id);
         for _ in 0..WRITE_RETRIES {
             let Some(person) =
                 versioned::read_state_async(&self.config, PEOPLE, &owner_key).await?
             else {
                 bail!("person {} does not exist", interaction.person_id)
             };
-            let id = uuid::Uuid::new_v4().to_string();
-            let key = format!("{}:{id}", interaction.person_id);
+            if let Some(existing) =
+                versioned::read_state_async(&self.config, PEOPLE_INTERACTIONS, &key).await?
+            {
+                let existing: InteractionRecord = serde_json::from_value(existing)
+                    .context("decode existing imported interaction")?;
+                anyhow::ensure!(
+                    existing.id == id && existing.interaction == interaction,
+                    "interaction source ID was reused with different content"
+                );
+                return Ok(());
+            }
             let expected = [StateChange {
                 collection: PEOPLE.to_owned(),
                 key: owner_key.clone(),
@@ -307,7 +325,7 @@ impl PeopleStore {
                 collection: PEOPLE_INTERACTIONS.to_owned(),
                 key: key.clone(),
                 value: Some(serde_json::to_value(InteractionRecord {
-                    id,
+                    id: id.clone(),
                     interaction: interaction.clone(),
                 })?),
             }];
@@ -327,6 +345,7 @@ impl PeopleStore {
         for (key, value) in records {
             let record: InteractionRecord = serde_json::from_value(value)
                 .with_context(|| format!("invalid interaction record at key {key}"))?;
+            validate_interaction_key(&key, &record)?;
             if record.interaction.person_id != person_id {
                 continue;
             }
@@ -350,6 +369,7 @@ impl PeopleStore {
         for (key, value) in records {
             let record: InteractionRecord = serde_json::from_value(value)
                 .with_context(|| format!("invalid interaction record at key {key}"))?;
+            validate_interaction_key(&key, &record)?;
             if requested.contains(&record.interaction.person_id) {
                 out.entry(record.interaction.person_id)
                     .or_default()
@@ -432,6 +452,7 @@ async fn stage_person_insert(
                 kind: kind.to_owned(),
                 value: value.to_owned(),
                 person_id: person.id,
+                created_at: Utc::now().timestamp(),
             })?),
         });
     }
@@ -440,6 +461,18 @@ async fn stage_person_insert(
 
 fn handle_key(kind: &str, value: &str) -> String {
     format!("{kind}:{value}")
+}
+
+pub(crate) fn interaction_key(record: &InteractionRecord) -> String {
+    format!("{}:{}", record.interaction.person_id, record.id)
+}
+
+fn validate_interaction_key(key: &str, record: &InteractionRecord) -> Result<()> {
+    anyhow::ensure!(
+        interaction_key(record) == key,
+        "interaction record key does not match its body at {key}"
+    );
+    Ok(())
 }
 
 fn decode_handle(key: &str, value: Value) -> Result<HandleRecord> {
