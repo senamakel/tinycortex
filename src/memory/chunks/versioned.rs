@@ -2268,6 +2268,12 @@ fn make_manifest(
     changes: &[StateChange],
     default_lifecycle_status: Option<&str>,
 ) -> Result<OperationManifest> {
+    anyhow::ensure!(
+        changes
+            .iter()
+            .all(|change| !change.value.as_ref().is_some_and(Value::is_null)),
+        "JSON null state values are unsupported; use a tombstone or a tagged domain value"
+    );
     let mut digest = Sha256::new();
     digest.update(snapshot.op_id.as_deref().unwrap_or("root").as_bytes());
     for chunk in chunks {
