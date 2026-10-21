@@ -2,6 +2,7 @@
 
 use anyhow::{Context, Result};
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 
 use super::collections as c;
 use super::raw_refs::RawRef;
@@ -15,7 +16,16 @@ pub fn delete_chunks_by_source(
     kind: SourceKind,
     source_id: &str,
 ) -> Result<usize> {
-    delete_filtered(config, DeleteFilter::Source(kind, source_id, false))
+    run_delete_sync(delete_chunks_by_source_async(config, kind, source_id))
+}
+
+/// Async counterpart to [`delete_chunks_by_source`].
+pub async fn delete_chunks_by_source_async(
+    config: &MemoryConfig,
+    kind: SourceKind,
+    source_id: &str,
+) -> Result<usize> {
+    delete_filtered_async(config, DeleteFilter::Source(kind, source_id, false)).await
 }
 
 /// Delete chunks whose source id has the exact literal prefix.
@@ -24,7 +34,16 @@ pub fn delete_chunks_by_source_prefix(
     kind: SourceKind,
     prefix: &str,
 ) -> Result<usize> {
-    delete_filtered(config, DeleteFilter::Source(kind, prefix, true))
+    run_delete_sync(delete_chunks_by_source_prefix_async(config, kind, prefix))
+}
+
+/// Async counterpart to [`delete_chunks_by_source_prefix`].
+pub async fn delete_chunks_by_source_prefix_async(
+    config: &MemoryConfig,
+    kind: SourceKind,
+    prefix: &str,
+) -> Result<usize> {
+    delete_filtered_async(config, DeleteFilter::Source(kind, prefix, true)).await
 }
 
 /// Delete chunks owned by `owner`, preserving sources that still have another
@@ -34,12 +53,40 @@ pub fn delete_chunks_by_owner(
     kind: SourceKind,
     owner: &str,
 ) -> Result<usize> {
-    delete_filtered(config, DeleteFilter::Owner(kind, owner))
+    run_delete_sync(delete_chunks_by_owner_async(config, kind, owner))
+}
+
+/// Async counterpart to [`delete_chunks_by_owner`].
+pub async fn delete_chunks_by_owner_async(
+    config: &MemoryConfig,
+    kind: SourceKind,
+    owner: &str,
+) -> Result<usize> {
+    delete_filtered_async(config, DeleteFilter::Owner(kind, owner)).await
 }
 
 /// Delete one chunk and its dependent indexes. Unknown ids are a no-op.
 pub fn delete_chunk_by_id(config: &MemoryConfig, chunk_id: &str) -> Result<usize> {
-    delete_filtered(config, DeleteFilter::Id(chunk_id))
+    run_delete_sync(delete_chunk_by_id_async(config, chunk_id))
+}
+
+/// Async counterpart to [`delete_chunk_by_id`].
+pub async fn delete_chunk_by_id_async(config: &MemoryConfig, chunk_id: &str) -> Result<usize> {
+    delete_filtered_async(config, DeleteFilter::Id(chunk_id)).await
+}
+
+fn run_delete_sync<F, T>(future: F) -> Result<T>
+where
+    F: Future<Output = Result<T>>,
+{
+    if tokio::runtime::Handle::try_current().is_ok() {
+        anyhow::bail!("synchronous chunk deletion cannot run inside a Tokio runtime; use its async counterpart");
+    }
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("build chunk deletion runtime")?
+        .block_on(future)
 }
 
 #[derive(Clone, Copy)]
@@ -47,7 +94,6 @@ enum DeleteFilter<'a> {
     Source(SourceKind, &'a str, bool),
     Owner(SourceKind, &'a str),
     Id(&'a str),
-    All,
 }
 
 fn matches(filter: DeleteFilter<'_>, chunk: &Chunk) -> bool {
@@ -64,17 +110,16 @@ fn matches(filter: DeleteFilter<'_>, chunk: &Chunk) -> bool {
             chunk.metadata.source_kind == kind && chunk.metadata.owner == owner
         }
         DeleteFilter::Id(id) => chunk.id == id,
-        DeleteFilter::All => true,
     }
 }
 
-fn delete_filtered(config: &MemoryConfig, filter: DeleteFilter<'_>) -> Result<usize> {
+async fn delete_filtered_async(config: &MemoryConfig, filter: DeleteFilter<'_>) -> Result<usize> {
     use c::{
         CHUNK_CONTENT_POINTERS, CHUNK_EMBEDDINGS, CHUNK_LIFECYCLE, CHUNK_REEMBED_SKIPS,
         INGESTED_SOURCES, RAW_REFS, SCORES,
     };
     for _ in 0..8 {
-        let (snapshot, chunks, states) = versioned::list_chunk_snapshot_with_head(
+        let (snapshot, chunks, states) = versioned::list_chunk_snapshot_with_head_async(
             config,
             &[
                 CHUNK_CONTENT_POINTERS,
@@ -84,13 +129,31 @@ fn delete_filtered(config: &MemoryConfig, filter: DeleteFilter<'_>) -> Result<us
                 RAW_REFS,
                 SCORES,
             ],
-        )?;
+        )
+        .await?;
         let selected = chunks
             .iter()
             .filter(|chunk| matches(filter, chunk))
             .cloned()
             .collect::<Vec<_>>();
         if selected.is_empty() {
+            if matches!(filter, DeleteFilter::Source(_, _, _)) {
+                let mut expected = Vec::new();
+                let mut changes = Vec::new();
+                stage_ingest_gates(&mut expected, &mut changes, filter, &[], &[], &states);
+                if !changes.is_empty()
+                    && !versioned::commit_if_state_matches_at_snapshot_async(
+                        config,
+                        &snapshot,
+                        &expected,
+                        &[],
+                        &changes,
+                    )
+                    .await?
+                {
+                    continue;
+                }
+            }
             return Ok(0);
         }
         let selected_ids = selected
@@ -203,13 +266,14 @@ fn delete_filtered(config: &MemoryConfig, filter: DeleteFilter<'_>) -> Result<us
         );
         for chunk in &selected {
             let staged =
-                crate::memory::store::entity_index::transaction::stage_delete_node_entities(
+                crate::memory::store::entity_index::transaction::stage_delete_node_entities_async(
                     config, &chunk.id,
-                )?;
+                )
+                .await?;
             expected.extend(staged.expected);
             changes.extend(staged.changes);
         }
-        stage_empty_source_trees(
+        stage_empty_source_trees_async(
             config,
             &snapshot,
             &selected,
@@ -217,8 +281,17 @@ fn delete_filtered(config: &MemoryConfig, filter: DeleteFilter<'_>) -> Result<us
             &mut expected,
             &mut changes,
             &mut content_paths,
-        )?;
-        if versioned::commit_if_state_matches_at_snapshot(config, &snapshot, &expected, &changes)? {
+        )
+        .await?;
+        if versioned::commit_if_state_matches_at_snapshot_async(
+            config,
+            &snapshot,
+            &expected,
+            &[],
+            &changes,
+        )
+        .await?
+        {
             remove_chunk_content_files(config, &content_paths);
             return Ok(selected.len());
         }
@@ -313,7 +386,6 @@ fn stage_ingest_gates(
                     }
             }
             DeleteFilter::Owner(_, _) | DeleteFilter::Id(_) => false,
-            DeleteFilter::All => true,
         };
         let orphaned = selected_sources
             .iter()
@@ -334,7 +406,7 @@ fn stage_ingest_gates(
     }
 }
 
-fn stage_empty_source_trees(
+async fn stage_empty_source_trees_async(
     config: &MemoryConfig,
     snapshot: &HeadSnapshot,
     selected: &[Chunk],
@@ -343,14 +415,7 @@ fn stage_empty_source_trees(
     changes: &mut Vec<StateChange>,
     content_paths: &mut Vec<String>,
 ) -> Result<()> {
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?;
-    let tree_rows = runtime.block_on(versioned::list_state_at_snapshot_async(
-        config,
-        snapshot,
-        c::TREES,
-    ))?;
+    let tree_rows = versioned::list_state_at_snapshot_async(config, snapshot, c::TREES).await?;
     let scopes = selected
         .iter()
         .map(|chunk| {
@@ -384,13 +449,8 @@ fn stage_empty_source_trees(
         let Some(tree_id) = value.get("id").and_then(serde_json::Value::as_str) else {
             continue;
         };
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .context("build tree deletion staging runtime")?;
-        let staged = runtime.block_on(
-            crate::memory::tree::store::stage_tree_cascade_deletion_async(config, tree_id),
-        )?;
+        let staged =
+            crate::memory::tree::store::stage_tree_cascade_deletion_async(config, tree_id).await?;
         if let Some(staged) = staged {
             if staged.snapshot != *snapshot {
                 anyhow::bail!("owner head changed while staging source tree deletion");
@@ -414,8 +474,22 @@ pub fn delete_orphaned_source_tree(
     source_kind: SourceKind,
     source_id: &str,
 ) -> Result<bool> {
+    run_delete_sync(delete_orphaned_source_tree_async(
+        config,
+        source_kind,
+        source_id,
+    ))
+}
+
+/// Async counterpart to [`delete_orphaned_source_tree`].
+pub async fn delete_orphaned_source_tree_async(
+    config: &MemoryConfig,
+    source_kind: SourceKind,
+    source_id: &str,
+) -> Result<bool> {
     let (snapshot, chunks, states) =
-        versioned::list_chunk_snapshot_with_head(config, &[c::INGESTED_SOURCES, c::TREES])?;
+        versioned::list_chunk_snapshot_with_head_async(config, &[c::INGESTED_SOURCES, c::TREES])
+            .await?;
     if chunks.iter().any(|chunk| {
         chunk.metadata.source_kind == source_kind && chunk.metadata.source_id == source_id
     }) {
@@ -453,12 +527,9 @@ pub fn delete_orphaned_source_tree(
             .get("id")
             .and_then(serde_json::Value::as_str)
             .context("source tree missing id")?;
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()?;
-        if let Some(staged) = runtime.block_on(
-            crate::memory::tree::store::stage_tree_cascade_deletion_async(config, tree_id),
-        )? {
+        if let Some(staged) =
+            crate::memory::tree::store::stage_tree_cascade_deletion_async(config, tree_id).await?
+        {
             if staged.snapshot != snapshot {
                 return Ok(false);
             }
@@ -471,14 +542,132 @@ pub fn delete_orphaned_source_tree(
             });
         }
     }
-    versioned::commit_if_state_matches_at_snapshot(config, &snapshot, &expected, &changes)
+    versioned::commit_if_state_matches_at_snapshot_async(
+        config,
+        &snapshot,
+        &expected,
+        &[],
+        &changes,
+    )
+    .await
 }
 
-/// Remove every chunk and its coupled tree state. Returns the number of
-/// records removed from this owner, matching the old cross-table count only
-/// approximately because immutable versions are retained for snapshot safety.
+/// Remove every chunk and its coupled tree state. The count is the number of
+/// logical rows removed from the same table families as the previous purge;
+/// retained immutable history is not included.
 pub fn purge_all(config: &MemoryConfig) -> Result<usize> {
-    delete_filtered(config, DeleteFilter::All)
+    run_delete_sync(purge_all_async(config))
+}
+
+/// Async counterpart to [`purge_all`].
+pub async fn purge_all_async(config: &MemoryConfig) -> Result<usize> {
+    use c::{
+        BUFFERS, CHUNK_CONTENT_POINTERS, CHUNK_EMBEDDINGS, CHUNK_LIFECYCLE, CHUNK_REEMBED_SKIPS,
+        ENTITY_EDGES, ENTITY_HOTNESS, ENTITY_INDEX, INGESTED_SOURCES, INGEST_OUTBOX, RAW_REFS,
+        SCORES, SUMMARIES, SUMMARY_CONTENT_POINTERS, SUMMARY_EMBEDDINGS, TREES,
+    };
+    const OWNED_COLLECTIONS: &[&str] = &[
+        BUFFERS,
+        CHUNK_CONTENT_POINTERS,
+        CHUNK_EMBEDDINGS,
+        CHUNK_REEMBED_SKIPS,
+        ENTITY_EDGES,
+        ENTITY_HOTNESS,
+        ENTITY_INDEX,
+        INGESTED_SOURCES,
+        INGEST_OUTBOX,
+        RAW_REFS,
+        SCORES,
+        SUMMARIES,
+        SUMMARY_CONTENT_POINTERS,
+        SUMMARY_EMBEDDINGS,
+        TREES,
+    ];
+    for _ in 0..8 {
+        let (snapshot, chunks, states) =
+            versioned::list_chunk_snapshot_with_head_async(config, OWNED_COLLECTIONS).await?;
+        let mut expected = Vec::new();
+        let mut changes = Vec::new();
+        let mut content_paths = Vec::new();
+        let mut logical_rows = chunks.len();
+        for chunk in &chunks {
+            stage_delete(
+                &mut expected,
+                &mut changes,
+                CHUNK_LIFECYCLE,
+                &chunk.id,
+                state_rows(&states, CHUNK_LIFECYCLE)
+                    .iter()
+                    .find(|(key, _)| key == &chunk.id)
+                    .map(|(_, value)| value.clone()),
+                Some(serde_json::json!({"status":"deleted"})),
+            );
+        }
+        for collection in OWNED_COLLECTIONS {
+            for (key, value) in state_rows(&states, collection) {
+                if *collection == CHUNK_CONTENT_POINTERS || *collection == SUMMARY_CONTENT_POINTERS
+                {
+                    if let Some(path) = value
+                        .get("content_path")
+                        .and_then(serde_json::Value::as_str)
+                    {
+                        content_paths.push(path.to_owned());
+                    }
+                }
+                if *collection == RAW_REFS {
+                    if let Ok(refs) = serde_json::from_value::<Vec<RawRef>>(value.clone()) {
+                        content_paths.extend(refs.into_iter().map(|raw_ref| raw_ref.path));
+                    }
+                }
+                if purge_row_counts_toward_legacy_total(collection, key) {
+                    logical_rows += 1;
+                }
+                stage_delete(
+                    &mut expected,
+                    &mut changes,
+                    collection,
+                    key,
+                    Some(value.clone()),
+                    None,
+                );
+            }
+        }
+        let (job_expected, job_changes) =
+            crate::memory::queue::store::stage_purge_jobs_at_snapshot(config, &snapshot).await?;
+        logical_rows += job_expected
+            .iter()
+            .filter(|change| {
+                change
+                    .key
+                    .starts_with(crate::memory::queue::store::JOB_PREFIX)
+            })
+            .count();
+        expected.extend(job_expected);
+        changes.extend(job_changes);
+        if versioned::commit_if_state_matches_at_snapshot_async(
+            config,
+            &snapshot,
+            &expected,
+            &[],
+            &changes,
+        )
+        .await?
+        {
+            remove_chunk_content_files(config, &content_paths);
+            return Ok(logical_rows);
+        }
+    }
+    anyhow::bail!("memory owner changed too frequently to purge safely")
+}
+
+fn purge_row_counts_toward_legacy_total(collection: &str, key: &str) -> bool {
+    match collection {
+        c::TREES => key.starts_with("tree:"),
+        c::ENTITY_INDEX => key.starts_with("occ:"),
+        c::CHUNK_CONTENT_POINTERS | c::RAW_REFS | c::INGEST_OUTBOX => false,
+        c::SUMMARY_CONTENT_POINTERS => false,
+        _ => true,
+    }
 }
 
 /// Remove staged content files only when no committed chunk or summary points
@@ -487,17 +676,26 @@ pub(crate) fn remove_unreferenced_content_files(
     config: &MemoryConfig,
     candidates: &[String],
 ) -> Result<()> {
+    run_delete_sync(remove_unreferenced_content_files_async(config, candidates))
+}
+
+/// Async counterpart for ingest pipelines running on Tokio.
+pub(crate) async fn remove_unreferenced_content_files_async(
+    config: &MemoryConfig,
+    candidates: &[String],
+) -> Result<()> {
     if candidates.is_empty() {
         return Ok(());
     }
-    let (snapshot, chunks, states) = versioned::list_chunk_snapshot_with_head(
+    let (snapshot, chunks, states) = versioned::list_chunk_snapshot_with_head_async(
         config,
         &[
             c::RAW_REFS,
             c::CHUNK_CONTENT_POINTERS,
             c::SUMMARY_CONTENT_POINTERS,
         ],
-    )?;
+    )
+    .await?;
     let wanted = candidates
         .iter()
         .map(String::as_str)
@@ -524,7 +722,7 @@ pub(crate) fn remove_unreferenced_content_files(
     }
     // The extra head check ensures an append or pointer update during the scan
     // cannot make an unreferenced decision stale.
-    if versioned::capture_head(config)? != snapshot || corrupt {
+    if versioned::capture_state_snapshot_async(config).await? != snapshot || corrupt {
         return Ok(());
     }
     let safe = wanted

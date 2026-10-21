@@ -142,10 +142,14 @@ pub use store::{
     upsert_staged_chunks_tx, CHUNK_STATUS_ADMITTED, CHUNK_STATUS_BUFFERED, CHUNK_STATUS_DROPPED,
     CHUNK_STATUS_PENDING_EXTRACTION, CHUNK_STATUS_SEALED, RAW_FILE_GATE_KIND,
 };
-pub(crate) use store_delete::remove_unreferenced_content_files;
 pub use store_delete::{
-    delete_chunk_by_id, delete_chunks_by_owner, delete_chunks_by_source,
-    delete_chunks_by_source_prefix, delete_orphaned_source_tree, purge_all,
+    delete_chunk_by_id, delete_chunk_by_id_async, delete_chunks_by_owner,
+    delete_chunks_by_owner_async, delete_chunks_by_source, delete_chunks_by_source_async,
+    delete_chunks_by_source_prefix, delete_chunks_by_source_prefix_async,
+    delete_orphaned_source_tree, delete_orphaned_source_tree_async, purge_all, purge_all_async,
+};
+pub(crate) use store_delete::{
+    remove_unreferenced_content_files, remove_unreferenced_content_files_async,
 };
 pub use store_list::{
     count_chunks_matching, list_chunk_details, list_chunks, source_totals, ChunkDetailRow,

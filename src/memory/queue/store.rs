@@ -179,6 +179,34 @@ pub(crate) async fn all_job_records_async(
         .collect()
 }
 
+/// Stage removal of every durable queue record at an already captured owner
+/// snapshot. Callers combine this with the rest of a purge's expected values
+/// and mutations, then commit with
+/// `commit_if_state_matches_at_snapshot_async`; any enqueue before that commit
+/// advances the head and forces the caller to replan. Queue messages are only
+/// wake-up hints, so messages left behind by the purge are harmless.
+pub(crate) async fn stage_purge_jobs_at_snapshot(
+    config: &MemoryConfig,
+    snapshot: &versioned::HeadSnapshot,
+) -> Result<(Vec<StateChange>, Vec<StateChange>)> {
+    let rows = versioned::list_state_at_snapshot_async(config, snapshot, JOBS).await?;
+    let mut expected = Vec::with_capacity(rows.len());
+    let mut changes = Vec::with_capacity(rows.len());
+    for (key, value) in rows {
+        expected.push(StateChange {
+            collection: JOBS.to_owned(),
+            key: key.clone(),
+            value: Some(value),
+        });
+        changes.push(StateChange {
+            collection: JOBS.to_owned(),
+            key,
+            value: None,
+        });
+    }
+    Ok((expected, changes))
+}
+
 pub(crate) fn replace_record(
     config: &MemoryConfig,
     old_value: &Value,

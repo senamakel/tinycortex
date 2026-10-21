@@ -40,6 +40,7 @@ fn chunk(seq: u32, ts_ms: i64) -> Chunk {
 struct SealDelegate {
     summariser: ConcatSummariser,
     observer: NoopSealObserver,
+    stale_append: Option<DelegateOutput<AppendDecision>>,
     #[cfg(feature = "tokio")]
     invalidate_job_lease: Option<String>,
 }
@@ -60,6 +61,9 @@ impl QueueDelegates for SealDelegate {
         node: &NodeRef,
         target: &AppendTarget,
     ) -> Result<Option<DelegateOutput<AppendDecision>>> {
+        if let Some(output) = &self.stale_append {
+            return Ok(Some(output.clone()));
+        }
         plan_append_node_for_queue(config, node, target).await
     }
 
@@ -156,6 +160,7 @@ async fn queued_append_publishes_buffer_with_lease_settlement() {
     let delegate = SealDelegate {
         summariser: ConcatSummariser,
         observer: NoopSealObserver,
+        stale_append: None,
         #[cfg(feature = "tokio")]
         invalidate_job_lease: None,
     };
@@ -249,6 +254,7 @@ async fn queued_seal_keeps_plan_invisible_until_lease_settlement() {
     let delegate = SealDelegate {
         summariser: ConcatSummariser,
         observer: NoopSealObserver,
+        stale_append: None,
         #[cfg(feature = "tokio")]
         invalidate_job_lease: None,
     };
@@ -356,6 +362,7 @@ async fn stale_seal_lease_cannot_publish_tree_mutations() {
     let delegate = SealDelegate {
         summariser: ConcatSummariser,
         observer: NoopSealObserver,
+        stale_append: None,
         invalidate_job_lease: Some(job_id.clone()),
     };
 
@@ -388,6 +395,76 @@ async fn stale_seal_lease_cannot_publish_tree_mutations() {
         .unwrap()
         .unwrap();
     assert_ne!(job.status, crate::memory::queue::JobStatus::Done);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_preplanned_append_cannot_resurrect_a_deleted_chunk() {
+    let (_tmp, config) = config();
+    let chunk = chunk(8, 1_700_000_000_000);
+    upsert_chunks_async(&config, std::slice::from_ref(&chunk))
+        .await
+        .unwrap();
+    let payload = AppendBufferPayload {
+        node: NodeRef::Leaf {
+            chunk_id: chunk.id.clone(),
+        },
+        target: AppendTarget::Source {
+            source_id: "delete-fences-append".to_owned(),
+        },
+    };
+    let planning_delegate = SealDelegate {
+        summariser: ConcatSummariser,
+        observer: NoopSealObserver,
+        stale_append: None,
+        #[cfg(feature = "tokio")]
+        invalidate_job_lease: None,
+    };
+    let stale_plan = planning_delegate
+        .append_node(&config, &payload.node, &payload.target)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        store::get_tree_by_scope_async(&config, TreeKind::Source, "delete-fences-append")
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    crate::memory::chunks::delete_chunk_by_id_async(&config, &chunk.id)
+        .await
+        .unwrap();
+    let job_id = crate::memory::queue::store::enqueue_async(
+        &config,
+        &NewJob::append_buffer(&payload).unwrap(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let stale_delegate = SealDelegate {
+        summariser: ConcatSummariser,
+        observer: NoopSealObserver,
+        stale_append: Some(stale_plan),
+        #[cfg(feature = "tokio")]
+        invalidate_job_lease: None,
+    };
+    assert!(crate::memory::queue::run_once(&config, &stale_delegate)
+        .await
+        .is_err());
+    assert!(
+        store::get_tree_by_scope_async(&config, TreeKind::Source, "delete-fences-append")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        crate::memory::queue::store::get_job_async(&config, &job_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        crate::memory::queue::JobStatus::Ready
+    );
 }
 
 #[test]

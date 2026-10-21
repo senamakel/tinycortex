@@ -9,6 +9,7 @@ use tempfile::TempDir;
 
 struct ReembedDelegate {
     chunk_id: String,
+    planned_mutations: Option<Vec<crate::memory::queue::JobMutation>>,
 }
 
 #[async_trait]
@@ -59,12 +60,16 @@ impl QueueDelegates for ReembedDelegate {
         config: &crate::memory::config::MemoryConfig,
         signature: &str,
     ) -> Result<DelegateOutput<ReembedProgress>> {
-        let output =
+        let mutations = if let Some(mutations) = &self.planned_mutations {
+            mutations.clone()
+        } else {
             plan_chunk_embedding_for_queue(config, &self.chunk_id, signature, &[0.25, -0.5, 0.75])
-                .await?;
+                .await?
+                .mutations
+        };
         Ok(DelegateOutput {
             result: ReembedProgress::Covered,
-            mutations: output.mutations,
+            mutations,
         })
     }
 
@@ -132,6 +137,7 @@ async fn queued_reembed_planner_keeps_vector_invisible_until_settlement() {
     .unwrap();
     let delegate = ReembedDelegate {
         chunk_id: chunk.id.clone(),
+        planned_mutations: None,
     };
     assert!(crate::memory::queue::run_once(&config, &delegate)
         .await
@@ -150,5 +156,83 @@ async fn queued_reembed_planner_keeps_vector_invisible_until_settlement() {
             .unwrap()
             .status,
         crate::memory::queue::JobStatus::Done
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_preplanned_reembed_cannot_resurrect_a_deleted_chunk() {
+    let tmp = TempDir::new().unwrap();
+    let config = crate::memory::chunks::test_support::host_config(tmp.path());
+    let timestamp = chrono::Utc::now();
+    let chunk = Chunk {
+        id: chunk_id(SourceKind::Chat, "delete-fences-reembed", 1, "body"),
+        content: "body".to_owned(),
+        metadata: Metadata {
+            source_kind: SourceKind::Chat,
+            source_id: "delete-fences-reembed".to_owned(),
+            owner: "alice@example.com".to_owned(),
+            timestamp,
+            time_range: (timestamp, timestamp),
+            tags: Vec::new(),
+            source_ref: None,
+            path_scope: None,
+        },
+        token_count: 1,
+        seq_in_source: 1,
+        created_at: timestamp,
+        partial_message: false,
+    };
+    upsert_chunks_async(&config, std::slice::from_ref(&chunk))
+        .await
+        .unwrap();
+    let signature = "delete-fences-reembed-model";
+    let stale_plan = plan_chunk_embedding_for_queue(&config, &chunk.id, signature, &[0.25, -0.5])
+        .await
+        .unwrap();
+    assert!(
+        super::get_chunk_embedding_for_signature_async(&config, &chunk.id, signature)
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    super::delete_chunk_by_id_async(&config, &chunk.id)
+        .await
+        .unwrap();
+    assert!(get_chunk_async(&config, &chunk.id).await.unwrap().is_none());
+
+    let job_id = crate::memory::queue::store::enqueue_async(
+        &config,
+        &NewJob::reembed_backfill(&ReembedBackfillPayload {
+            signature: signature.to_owned(),
+        })
+        .unwrap(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let delegate = ReembedDelegate {
+        chunk_id: chunk.id.clone(),
+        planned_mutations: Some(stale_plan.mutations),
+    };
+    let outcome = crate::memory::queue::run_once(&config, &delegate).await;
+    assert!(
+        outcome.is_err(),
+        "the stale lifecycle precondition must reject settlement"
+    );
+    assert!(
+        super::get_chunk_embedding_for_signature_async(&config, &chunk.id, signature)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        crate::memory::queue::store::get_job_async(&config, &job_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        crate::memory::queue::JobStatus::Ready,
+        "failed owner-state settlement must not mark the stale job done"
     );
 }
