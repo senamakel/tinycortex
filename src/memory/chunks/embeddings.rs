@@ -12,7 +12,6 @@ use super::signature::format_signature;
 use super::versioned::{list_state, write_chunk_state_changes, write_state_changes, StateChange};
 use anyhow::{Context, Result};
 use chrono::Utc;
-use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 
 use crate::memory::config::MemoryConfig;
@@ -51,33 +50,6 @@ pub fn tree_active_signature(config: &MemoryConfig) -> String {
 pub fn set_chunk_embedding(config: &MemoryConfig, chunk_id: &str, embedding: &[f32]) -> Result<()> {
     let signature = tree_active_signature(config);
     set_chunk_embedding_for_signature(config, chunk_id, &signature, embedding)
-}
-
-/// Core upsert into `mem_tree_summary_embeddings` over an arbitrary
-/// `&Connection`. Used only by the legacy→sidecar migration here.
-///
-/// # Errors
-/// Returns `Err` if serializing the vector fails or the SQLite write fails.
-fn upsert_summary_embedding_conn(
-    conn: &Connection,
-    summary_id: &str,
-    model_signature: &str,
-    embedding: &[f32],
-) -> Result<()> {
-    let bytes = embedding_to_blob(embedding);
-    let dim = i64::try_from(embedding.len()).context("embedding dimension does not fit i64")?;
-    let created_at = Utc::now().timestamp_millis() as f64 / 1000.0;
-    conn.execute(
-        "INSERT INTO mem_tree_summary_embeddings
-             (summary_id, model_signature, vector, dim, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5)
-             ON CONFLICT(summary_id, model_signature) DO UPDATE SET
-                vector = excluded.vector,
-                dim = excluded.dim,
-                created_at = excluded.created_at",
-        rusqlite::params![summary_id, model_signature, bytes, dim, created_at],
-    )?;
-    Ok(())
 }
 
 /// Store a chunk embedding for a specific provider/model/dimension signature.
@@ -196,34 +168,6 @@ pub async fn plan_chunk_embedding_for_queue(
             },
         ],
     })
-}
-
-/// Legacy SQLite transaction seam retained for source compatibility during
-/// the tree-owned migration. Chunk embeddings cannot be written through it.
-///
-/// # Errors
-/// Always returns an error directing callers to host storage.
-pub fn set_chunk_embedding_for_signature_tx(
-    tx: &rusqlite::Transaction<'_>,
-    chunk_id: &str,
-    model_signature: &str,
-    embedding: &[f32],
-) -> Result<()> {
-    let _ = (tx, chunk_id, model_signature, embedding);
-    anyhow::bail!("chunk embeddings must be committed with host storage, not a SQLite transaction")
-}
-
-/// Transaction-scoped summary embedding upsert (used by the legacy migration).
-///
-/// # Errors
-/// Uses the same validation as the connection-scoped upsert helper.
-pub fn set_summary_embedding_for_signature_tx(
-    tx: &rusqlite::Transaction<'_>,
-    summary_id: &str,
-    model_signature: &str,
-    embedding: &[f32],
-) -> Result<()> {
-    upsert_summary_embedding_conn(tx, summary_id, model_signature, embedding)
 }
 
 /// Persistently record that `(chunk_id, signature)` cannot be re-embedded so a
