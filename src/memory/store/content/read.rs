@@ -9,8 +9,8 @@ use super::atomic::sha256_hex;
 use super::compose::split_front_matter;
 use crate::memory::chunks::{
     content_root, get_chunk, get_chunk_content_pointers, get_chunk_raw_refs,
-    get_summary_content_pointers, update_chunk_content_sha256, update_summary_content_sha256,
-    update_summary_content_sha256_async, RawRef,
+    get_summary_content_pointers, update_chunk_content_sha256, update_chunk_content_sha256_async,
+    update_summary_content_sha256, update_summary_content_sha256_async, RawRef,
 };
 use crate::memory::config::MemoryConfig;
 
