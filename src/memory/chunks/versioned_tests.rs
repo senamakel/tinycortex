@@ -361,7 +361,7 @@ async fn plain_upsert_keeps_default_lifecycle_implicit() {
         super::super::store::upsert_chunks(&config, &chunks).unwrap(),
         chunks.len()
     );
-    let (_, listed, states) = list_chunk_snapshot(&config, &[CHUNK_LIFECYCLE]).unwrap();
+    let (listed, states) = list_chunk_snapshot(&config, &[CHUNK_LIFECYCLE]).unwrap();
     assert_eq!(listed.len(), chunks.len());
     assert!(
         states[CHUNK_LIFECYCLE].is_empty(),

@@ -5,9 +5,9 @@ use super::embeddings::{clear_chunk_reembed_skipped, clear_reembed_skipped_for_s
 use super::types::{chunk_id, Chunk, Metadata, SourceKind, SourceRef};
 use super::{
     clear_summary_reembed_skipped, extraction_coverage, get_chunk_embedding,
-    get_chunk_embeddings_for_signature_batch, get_chunks_batch, has_uncovered_reembed_work,
-    mark_chunk_reembed_skipped, mark_summary_reembed_skipped, set_chunk_embedding_for_signature,
-    tree_active_signature, upsert_chunks,
+    get_chunk_embedding_for_signature, get_chunk_embeddings_for_signature_batch, get_chunks_batch,
+    has_uncovered_reembed_work, mark_chunk_reembed_skipped, mark_summary_reembed_skipped,
+    set_chunk_embedding_for_signature, tree_active_signature, upsert_chunks,
 };
 use crate::memory::chunks::collections::{CHUNK_REEMBED_SKIPS, SUMMARY_REEMBED_SKIPS};
 use crate::memory::chunks::versioned;
