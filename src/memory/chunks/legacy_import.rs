@@ -52,8 +52,8 @@ pub struct LegacyChunkRecord {
     pub score: Option<ScoreRow>,
     /// Historical lifecycle state; `None` leaves the destination default.
     pub lifecycle_status: Option<String>,
-    /// Optional embedding for one model signature.
-    pub embedding: Option<LegacyEmbedding>,
+    /// Embeddings for each stored model signature.
+    pub embeddings: Vec<LegacyEmbedding>,
     /// Entity occurrences indexed on this chunk by the old writer.
     pub entities: Vec<LegacyEntityOccurrence>,
 }
@@ -198,6 +198,7 @@ pub async fn import_legacy_batch(
                 c::TREES,
                 c::SUMMARIES,
                 c::SUMMARY_CONTENT_POINTERS,
+                c::SUMMARY_EMBEDDINGS,
                 c::ENTITY_INDEX,
                 c::ENTITY_EDGES,
             ],
@@ -270,7 +271,7 @@ pub async fn import_legacy_batch(
                     })),
                 )?;
             }
-            if let Some(embedding) = &record.embedding {
+            for embedding in &record.embeddings {
                 let key = super::embeddings::chunk_embedding_key(
                     &record.chunk.id,
                     &embedding.model_signature,
@@ -399,6 +400,18 @@ pub async fn import_legacy_batch(
         }
         for (node_id, occurrences) in staged_entities {
             let staged = stage_node_occurrences_async(config, &node_id, occurrences).await?;
+            for change in &staged.changes {
+                let current = state_map
+                    .get(&change.collection)
+                    .and_then(|rows| rows.get(&change.key));
+                if current.is_some() && current != change.value.as_ref() {
+                    anyhow::bail!(
+                        "legacy import conflicts with existing {} row {}",
+                        change.collection,
+                        change.key
+                    );
+                }
+            }
             merge_changes(&mut expected, &mut changes, staged.expected, staged.changes)?;
         }
 

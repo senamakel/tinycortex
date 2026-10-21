@@ -100,11 +100,15 @@ fn fixture_batch() -> LegacyImportBatch {
                 llm_importance_reason: None,
             }),
             lifecycle_status: Some("pending_extraction".into()),
-            embedding: Some(LegacyEmbedding {
+            embeddings: vec![LegacyEmbedding {
                 model_signature: "fixture/model@1".into(),
                 vector: vec![0.25, 0.5],
                 created_at_ms: 1_750_000_000_000,
-            }),
+            }, LegacyEmbedding {
+                model_signature: "fixture/model@2".into(),
+                vector: vec![0.125, 0.25, 0.5],
+                created_at_ms: 1_749_999_999_000,
+            }],
             entities: vec![occurrence.clone()],
         }],
         trees: vec![tree.clone()],
@@ -114,7 +118,12 @@ fn fixture_batch() -> LegacyImportBatch {
             path: "summaries/legacy-source/l1.md".into(),
             sha256: "b".repeat(64),
         }],
-        summary_embeddings: Vec::new(),
+        summary_embeddings: vec![LegacySummaryEmbedding {
+            summary_id: "legacy-summary".into(),
+            model_signature: "fixture/summary-model@1".into(),
+            vector: vec![0.75, 1.0, 1.25],
+            created_at_ms: 1_750_000_000_123,
+        }],
         entities: Vec::new(),
         edges: vec![LegacyEntityEdge {
             entity_a: "person:ada".into(),
@@ -173,6 +182,24 @@ async fn typed_import_commits_chunk_adjuncts_tree_entities_and_jobs_together() {
     .await
     .unwrap()
     .is_some());
+    assert!(super::super::versioned::read_state_async(
+        &config,
+        c::CHUNK_EMBEDDINGS,
+        &format!("[\\"{chunk_id}\\",\\"fixture/model@2\\"]")
+    )
+    .await
+    .unwrap()
+    .is_some());
+    let summary_embedding = super::super::versioned::read_state_async(
+        &config,
+        c::SUMMARY_EMBEDDINGS,
+        "[\\"legacy-summary\\",\\"fixture/summary-model@1\\"]",
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(summary_embedding["dim"], 3);
+    assert_eq!(summary_embedding["created_at_ms"], 1_750_000_000_123i64);
     assert!(super::super::versioned::read_state_async(
         &config,
         c::ENTITY_INDEX,
@@ -239,6 +266,59 @@ async fn typed_import_rejects_path_escape_before_writes() {
             .1
             .is_empty()
     );
+}
+
+#[tokio::test]
+async fn typed_import_rejects_conflicting_existing_entity_occurrence_without_mutating_it() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let config = crate::memory::chunks::test_support::host_config(tmp.path());
+    let mut batch = fixture_batch();
+    batch.chunks[0].score.as_mut().unwrap().chunk_id = batch.chunks[0].chunk.id.clone();
+
+    let original = LegacyEntityOccurrence {
+        entity_id: "person:ada".into(),
+        node_id: batch.chunks[0].chunk.id.clone(),
+        node_kind: "leaf".into(),
+        entity_kind: "person".into(),
+        surface: "A. Lovelace".into(),
+        score: 0.8,
+        timestamp_ms: 100,
+        tree_id: None,
+        is_user: false,
+    };
+    let key = format!("occ:{}:{}", hex("person:ada"), hex(&original.node_id));
+    let original_change = super::super::versioned::StateChange {
+        collection: c::ENTITY_INDEX.into(),
+        key: key.clone(),
+        value: Some(serde_json::to_value(&original).unwrap()),
+    };
+    let snapshot = super::super::versioned::capture_state_snapshot_async(&config)
+        .await
+        .unwrap();
+    super::super::versioned::commit_if_state_matches_at_snapshot_async(
+        &config,
+        &snapshot,
+        &[],
+        &[],
+        &[original_change],
+    )
+    .await
+    .unwrap();
+    let before = super::super::versioned::read_state_async(&config, c::ENTITY_INDEX, &key)
+        .await
+        .unwrap();
+
+    assert!(import_legacy_batch(&config, &batch).await.is_err());
+    assert_eq!(
+        super::super::versioned::read_state_async(&config, c::ENTITY_INDEX, &key)
+            .await
+            .unwrap(),
+        before
+    );
+    assert!(super::super::versioned::get_chunk_async(&config, &batch.chunks[0].chunk.id)
+        .await
+        .unwrap()
+        .is_none());
 }
 
 fn hex(value: &str) -> String {
