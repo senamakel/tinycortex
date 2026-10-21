@@ -15,6 +15,7 @@ pub mod types;
 mod tests;
 
 // ── Tree rows ───────────────────────────────────────────────────────────────
+pub(crate) use trees::stage_tree_cascade_deletion_async;
 pub use trees::{
     archive_tree, archive_tree_async, delete_tree_cascade_async, delete_tree_cascade_tx, get_tree,
     get_tree_async, get_tree_by_scope, get_tree_by_scope_async, get_tree_by_scope_conn,

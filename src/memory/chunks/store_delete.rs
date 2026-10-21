@@ -165,7 +165,7 @@ fn delete_filtered(config: &MemoryConfig, filter: DeleteFilter<'_>) -> Result<us
         let mut surviving_raw = HashSet::new();
         let mut corrupt_survivor = false;
         for (key, value) in state_rows(&states, RAW_REFS) {
-            if survivors.iter().any(|chunk| chunk.id == key) {
+            if survivors.iter().any(|chunk| chunk.id.as_str() == key) {
                 match serde_json::from_value::<Vec<RawRef>>(value.clone()) {
                     Ok(refs) => surviving_raw.extend(refs.into_iter().map(|raw_ref| raw_ref.path)),
                     Err(_) => corrupt_survivor = true,
@@ -176,7 +176,7 @@ fn delete_filtered(config: &MemoryConfig, filter: DeleteFilter<'_>) -> Result<us
             let gate_rows = state_rows(&states, INGESTED_SOURCES);
             for path in candidate_raw.difference(&surviving_raw) {
                 content_paths.push(path.clone());
-                for (key, value) in &gate_rows {
+                for (key, value) in gate_rows {
                     if value.get("source_kind").and_then(serde_json::Value::as_str)
                         == Some(super::store_sources::RAW_FILE_GATE_KIND)
                         && value.get("source_id").and_then(serde_json::Value::as_str) == Some(path)
@@ -458,7 +458,7 @@ pub fn delete_orphaned_source_tree(
             .build()?;
         if let Some(staged) = runtime.block_on(
             crate::memory::tree::store::stage_tree_cascade_deletion_async(config, tree_id),
-        )?? {
+        )? {
             if staged.snapshot != snapshot {
                 return Ok(false);
             }
@@ -479,6 +479,61 @@ pub fn delete_orphaned_source_tree(
 /// approximately because immutable versions are retained for snapshot safety.
 pub fn purge_all(config: &MemoryConfig) -> Result<usize> {
     delete_filtered(config, DeleteFilter::All)
+}
+
+/// Remove staged content files only when no committed chunk or summary points
+/// at them. Corrupt pointer state fails closed and keeps every candidate.
+pub(crate) fn remove_unreferenced_content_files(
+    config: &MemoryConfig,
+    candidates: &[String],
+) -> Result<()> {
+    if candidates.is_empty() {
+        return Ok(());
+    }
+    let (snapshot, chunks, states) = versioned::list_chunk_snapshot_with_head(
+        config,
+        &[
+            c::RAW_REFS,
+            c::CHUNK_CONTENT_POINTERS,
+            c::SUMMARY_CONTENT_POINTERS,
+        ],
+    )?;
+    let wanted = candidates
+        .iter()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+    let mut referenced = HashSet::new();
+    let mut corrupt = false;
+    for (key, value) in state_rows(&states, c::RAW_REFS) {
+        if chunks.iter().any(|chunk| chunk.id == *key) {
+            match serde_json::from_value::<Vec<RawRef>>(value.clone()) {
+                Ok(refs) => referenced.extend(refs.into_iter().map(|raw_ref| raw_ref.path)),
+                Err(_) => corrupt = true,
+            }
+        }
+    }
+    for collection in [c::CHUNK_CONTENT_POINTERS, c::SUMMARY_CONTENT_POINTERS] {
+        for (_, value) in state_rows(&states, collection) {
+            if let Some(path) = value
+                .get("content_path")
+                .and_then(serde_json::Value::as_str)
+            {
+                referenced.insert(path.to_owned());
+            }
+        }
+    }
+    // The extra head check ensures an append or pointer update during the scan
+    // cannot make an unreferenced decision stale.
+    if versioned::capture_head(config)? != snapshot || corrupt {
+        return Ok(());
+    }
+    let safe = wanted
+        .into_iter()
+        .filter(|path| !referenced.contains(*path))
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    remove_chunk_content_files(config, &safe);
+    Ok(())
 }
 
 /// Best-effort removal of vault paths after the owner head commits.

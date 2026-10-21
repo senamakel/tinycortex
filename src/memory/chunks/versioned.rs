@@ -380,7 +380,7 @@ fn restore_deleted_chunk_lifecycles(
     let explicit = changes
         .iter()
         .filter(|change| change.collection == CHUNK_LIFECYCLE)
-        .map(|change| change.key.as_str())
+        .map(|change| change.key.clone())
         .collect::<HashSet<_>>();
     let result = config.storage_blocking()?.run(async move {
         for chunk in chunks {
@@ -420,7 +420,7 @@ async fn restore_deleted_chunk_lifecycles_async(
     let explicit = changes
         .iter()
         .filter(|change| change.collection == CHUNK_LIFECYCLE)
-        .map(|change| change.key.as_str())
+        .map(|change| change.key.clone())
         .collect::<HashSet<_>>();
     let result = config
         .storage_blocking()?
