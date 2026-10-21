@@ -41,7 +41,6 @@ export type OwnerSnapshot = {
 };
 
 const MAX_STDOUT_BYTES = 16 * 1024 * 1024;
-const MAX_STDERR_BYTES = 8 * 1024;
 const INSPECT_TIMEOUT_MS = 30_000;
 
 function object(value: unknown): Record<string, unknown> {
@@ -164,7 +163,7 @@ const snapshotForRequest = cache(async (workspace: string, chunkLimit: number): 
   const stdout: Buffer[] = [];
   let stdoutBytes = 0;
   const raw = await new Promise<string>((resolve, reject) => {
-    const child = spawn(binary, [], { env, stdio: ["ignore", "pipe", "pipe"], shell: false });
+    const child = spawn(binary, [], { env, stdio: ["ignore", "pipe", "ignore"], shell: false });
     let settled = false;
     const finishError = (error: Error) => {
       if (settled) return;
@@ -185,7 +184,6 @@ const snapshotForRequest = cache(async (workspace: string, chunkLimit: number): 
       }
       stdout.push(part);
     });
-    child.stderr.on("data", () => {});
     child.on("error", () => finishError(new Error("could not start the owner inspector")));
     child.on("close", (code) => {
       if (settled) return;

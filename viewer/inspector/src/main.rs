@@ -4,13 +4,14 @@ use anyhow::{Context, Result};
 use tinystoragedrivers::{Scope, StorageBackend, StorageConfig};
 
 const MAX_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
-const CHUNK_LIMIT: usize = 300;
+const DEFAULT_CHUNK_LIMIT: usize = 300;
+const MAX_CHUNK_LIMIT: usize = 10_000;
 
 #[tokio::main]
 async fn main() {
-    if let Err(error) = run().await {
-        // Do not print the configured URL: Mongo URLs may contain credentials.
-        eprintln!("viewer snapshot failed: {error:#}");
+    if run().await.is_err() {
+        // Backend errors can include connection details; keep them out of logs.
+        eprintln!("viewer snapshot failed; check the configured storage URL and scope locally");
         std::process::exit(1);
     }
 }
@@ -19,6 +20,11 @@ async fn run() -> Result<()> {
     let workspace = required_env("TINYCORTEX_WORKSPACE")?;
     let storage_url = required_env("TINYCORTEX_STORAGE_URL")?;
     let scope_name = required_env("TINYCORTEX_STORAGE_SCOPE")?;
+    let chunk_limit = std::env::var("TINYCORTEX_INSPECTOR_CHUNK_LIMIT")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_CHUNK_LIMIT)
+        .clamp(1, MAX_CHUNK_LIMIT);
 
     let config = StorageConfig::parse(&storage_url).context("parse configured storage URL")?;
     let backend = tinystoragedrivers::open(&config)
@@ -28,7 +34,7 @@ async fn run() -> Result<()> {
     let storage = backend
         .for_scope(&scope)
         .context("open configured storage scope")?;
-    let snapshot = tinycortex::memory::inspection::read_snapshot(workspace, storage, CHUNK_LIMIT)
+    let snapshot = tinycortex::memory::inspection::read_snapshot(workspace, storage, chunk_limit)
         .await
         .context("read owner inspection snapshot")?;
 
