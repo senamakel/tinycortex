@@ -18,7 +18,7 @@
 
 use std::path::Path;
 
-use crate::memory::store::{kv::KvStore, state_kv::StateKvStore};
+use crate::memory::store::state_kv::StateKvStore;
 use anyhow::Result;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -128,7 +128,6 @@ pub async fn record_watermark(store: &dyn PersonaStateStore, key: &str, value: &
 #[derive(Clone)]
 pub struct KvStateStore {
     kv: StateKvStore,
-    legacy_kv: KvStore,
 }
 
 /// One opaque cursor value read by a host from the legacy persona state file.
@@ -145,7 +144,6 @@ impl KvStateStore {
     pub fn from_config(config: &crate::memory::config::MemoryConfig) -> Result<Self> {
         Ok(Self {
             kv: StateKvStore::from_config(config)?,
-            legacy_kv: KvStore::from_config(config).map_err(anyhow::Error::msg)?,
         })
     }
 
@@ -167,17 +165,13 @@ impl KvStateStore {
 #[async_trait]
 impl PersonaStateStore for KvStateStore {
     async fn get(&self, namespace: &str, key: &str) -> Result<Option<serde_json::Value>> {
-        self.legacy_kv
-            .get_namespace_async(NAMESPACE, &Self::key(namespace, key))
-            .await
-            .map_err(anyhow::Error::msg)
+        self.kv.get(NAMESPACE, &Self::key(namespace, key)).await
     }
 
     async fn set(&self, namespace: &str, key: &str, value: &serde_json::Value) -> Result<()> {
-        self.legacy_kv
-            .set_namespace_async(NAMESPACE, &Self::key(namespace, key), value)
+        self.kv
+            .set(NAMESPACE, &Self::key(namespace, key), value.clone())
             .await
-            .map_err(anyhow::Error::msg)
     }
 }
 
