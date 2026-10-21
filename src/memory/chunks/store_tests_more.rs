@@ -57,7 +57,10 @@ fn deleting_one_chunk_keeps_content_file_referenced_by_another_chunk() {
     std::fs::write(&absolute, "shared body").unwrap();
 
     assert_eq!(delete_chunk_by_id(&cfg, &first.id).unwrap(), 1);
-    assert!(absolute.exists(), "the surviving chunk still owns this file");
+    assert!(
+        absolute.exists(),
+        "the surviving chunk still owns this file"
+    );
     assert_eq!(
         get_chunk_content_path(&cfg, &second.id).unwrap().as_deref(),
         Some(shared_path)
@@ -333,13 +336,7 @@ fn staged_chunk_upsert_persists_preview_and_content_pointers() {
         content_sha256: "sha-staged".into(),
     };
 
-    let inserted = with_connection(&cfg, |conn| {
-        let tx = conn.unchecked_transaction()?;
-        let inserted = upsert_staged_chunks_tx(&tx, std::slice::from_ref(&staged))?;
-        tx.commit()?;
-        Ok(inserted)
-    })
-    .unwrap();
+    let inserted = upsert_staged_chunks(&cfg, std::slice::from_ref(&staged)).unwrap();
     assert_eq!(inserted, 1);
 
     let got = get_chunk(&cfg, &chunk.id).unwrap().unwrap();
@@ -400,17 +397,23 @@ fn plain_upsert_clears_staged_pointer_and_readmits_dropped_row() {
     let (_tmp, cfg) = test_config();
     let chunk = sample_chunk("notion:plain-replace", 0, 1_700_000_000_000);
     upsert_chunks(&cfg, std::slice::from_ref(&chunk)).unwrap();
-    with_connection(&cfg, |conn| {
-        conn.execute(
-            "UPDATE mem_tree_chunks
-                SET content_path = 'stale.md', content_sha256 = 'stale',
-                    lifecycle_status = 'dropped'
-              WHERE id = ?1",
-            rusqlite::params![chunk.id],
-        )?;
-        Ok(())
-    })
-    .unwrap();
+    let seeded = [
+        super::super::versioned::StateChange {
+            collection: super::super::collections::CHUNK_CONTENT_POINTERS.into(),
+            key: chunk.id.clone(),
+            value: Some(serde_json::json!({
+                "chunk_id": chunk.id,
+                "content_path": "stale.md",
+                "content_sha256": "stale"
+            })),
+        },
+        super::super::versioned::StateChange {
+            collection: super::super::collections::CHUNK_LIFECYCLE.into(),
+            key: chunk.id.clone(),
+            value: Some(serde_json::json!({"status":"dropped"})),
+        },
+    ];
+    assert!(super::super::versioned::commit_if_state_matches(&cfg, &[], &[], &seeded).unwrap());
 
     upsert_chunks(&cfg, std::slice::from_ref(&chunk)).unwrap();
     assert!(get_chunk_content_pointers(&cfg, &chunk.id)
