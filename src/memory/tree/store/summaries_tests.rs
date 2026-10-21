@@ -4,6 +4,7 @@ use chrono::{TimeZone, Utc};
 use tempfile::TempDir;
 
 use crate::memory::chunks::test_support::host_config;
+use crate::memory::tree::store::TreeKind;
 
 fn summary(id: &str) -> SummaryNode {
     let timestamp = Utc.timestamp_millis_opt(1_700_000_000_000).unwrap();

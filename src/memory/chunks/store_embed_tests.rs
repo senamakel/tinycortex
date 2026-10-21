@@ -1,28 +1,13 @@
-#![allow(unused_imports)]
-//! Unit tests for the chunk store (`super`) — upsert / list / lifecycle /
-//! embedding / delete / migration accessors against a tempdir-backed SQLite
-//! store.
-//!
-//! Tests use unique tempdirs so parallel cache checks cannot collide. Tests
-//! that must force a reopen reset only their own workspace path.
+//! Unit tests for owner-backed embedding records, skip markers, batch reads,
+//! and extraction coverage.
 
-use super::connection::{
-    clear_connection_cache_for, get_or_init_connection, invalidate_connection,
-    schema_apply_count_for_path_for_tests, with_connection, CB_THRESHOLD,
-};
-use super::embeddings::{active_embedding_dims, embedding_to_blob};
-use super::migrations::purge_global_topic_trees;
-use super::recovery::{is_transient_cold_start, try_cleanup_stale_files};
+use super::embeddings::{clear_chunk_reembed_skipped, clear_reembed_skipped_for_signature};
 use super::types::{chunk_id, Chunk, Metadata, SourceKind, SourceRef};
 use super::{
-    claim_source_ingest_tx, clear_chunk_reembed_skipped, clear_reembed_skipped_for_signature,
-    clear_summary_reembed_skipped, content_root, count_chunks, db_path_for, delete_chunks_by_owner,
-    delete_chunks_by_source, extraction_coverage, get_chunk, get_chunk_embedding,
-    get_chunk_embedding_for_signature, get_chunk_embeddings_for_signature_batch, get_chunks_batch,
-    has_uncovered_reembed_work, is_source_ingested, list_chunks, mark_chunk_reembed_skipped,
-    mark_summary_reembed_skipped, set_chunk_embedding, set_chunk_embedding_for_signature,
-    tree_active_signature, upsert_chunks, ListChunksQuery, DB_DIR,
-    GLOBAL_TOPIC_PURGE_MIGRATION_VERSION,
+    clear_summary_reembed_skipped, extraction_coverage, get_chunk_embedding,
+    get_chunk_embeddings_for_signature_batch, get_chunks_batch, has_uncovered_reembed_work,
+    mark_chunk_reembed_skipped, mark_summary_reembed_skipped, set_chunk_embedding_for_signature,
+    tree_active_signature, upsert_chunks,
 };
 use crate::memory::chunks::collections::{CHUNK_REEMBED_SKIPS, SUMMARY_REEMBED_SKIPS};
 use crate::memory::chunks::versioned;
@@ -35,8 +20,6 @@ use crate::memory::tree::store::{
     insert_tree, stage_summary_changes, SummaryNode, Tree, TreeKind, TreeStatus,
 };
 use chrono::{TimeZone, Utc};
-use rusqlite::params;
-use std::sync::Arc;
 use tempfile::TempDir;
 
 fn test_config() -> (TempDir, MemoryConfig) {
@@ -124,16 +107,9 @@ fn clear_chunk_reembed_skipped_is_idempotent() {
     mark_chunk_reembed_skipped(&cfg, &c.id, &sig, "test orphan").unwrap();
     clear_chunk_reembed_skipped(&cfg, &c.id, &sig).unwrap();
     clear_chunk_reembed_skipped(&cfg, &c.id, &sig).unwrap();
-    let count: i64 = with_connection(&cfg, |conn| {
-        Ok(conn.query_row(
-            "SELECT COUNT(*) FROM mem_tree_chunk_reembed_skipped
-              WHERE chunk_id = ?1 AND model_signature = ?2",
-            params![c.id, sig],
-            |r| r.get(0),
-        )?)
-    })
-    .unwrap();
-    assert_eq!(count, 0);
+    assert!(versioned::list_state(&cfg, CHUNK_REEMBED_SKIPS)
+        .unwrap()
+        .is_empty());
 }
 
 #[test]
@@ -146,16 +122,9 @@ fn setting_chunk_embedding_clears_matching_skip_marker() {
 
     set_chunk_embedding_for_signature(&cfg, &c.id, &sig, &[0.1, 0.2]).unwrap();
 
-    let count: i64 = with_connection(&cfg, |conn| {
-        Ok(conn.query_row(
-            "SELECT COUNT(*) FROM mem_tree_chunk_reembed_skipped
-              WHERE chunk_id = ?1 AND model_signature = ?2",
-            params![c.id, sig],
-            |r| r.get(0),
-        )?)
-    })
-    .unwrap();
-    assert_eq!(count, 0);
+    assert!(versioned::list_state(&cfg, CHUNK_REEMBED_SKIPS)
+        .unwrap()
+        .is_empty());
 }
 
 #[test]
