@@ -20,6 +20,8 @@ pub struct InspectionSnapshot {
     pub skill_documents: Vec<MemoryKvRecord>,
     /// Bounded newest-first chunk page.
     pub chunks: Vec<Chunk>,
+    /// Chunks referenced by summaries, fetched independently of the page.
+    pub graph_chunks: Vec<Chunk>,
     /// Number of chunks visible to the same owner scope.
     pub chunk_total: u64,
     /// Trees in the scope, in owner-defined order.
@@ -73,9 +75,37 @@ pub async fn read_snapshot(
         }
     }
 
+    let summary_ids = summaries
+        .iter()
+        .map(|summary| summary.id.as_str())
+        .collect::<std::collections::HashSet<_>>();
+    let referenced_chunk_ids = summaries
+        .iter()
+        .flat_map(|summary| summary.child_ids.iter())
+        .filter(|id| !summary_ids.contains(id.as_str()))
+        .take(10_000)
+        .cloned()
+        .collect::<std::collections::HashSet<_>>();
+    let mut referenced_chunk_ids = referenced_chunk_ids.into_iter().collect::<Vec<_>>();
+    referenced_chunk_ids.sort();
+    let graph_chunks = if referenced_chunk_ids.is_empty() {
+        Vec::new()
+    } else {
+        chunks::list_chunks_async(
+            &config,
+            &ListChunksQuery {
+                ids: referenced_chunk_ids,
+                limit: Some(10_000),
+                ..Default::default()
+            },
+        )
+        .await?
+    };
+
     Ok(InspectionSnapshot {
         skill_documents,
         chunks,
+        graph_chunks,
         chunk_total,
         trees,
         summaries,
