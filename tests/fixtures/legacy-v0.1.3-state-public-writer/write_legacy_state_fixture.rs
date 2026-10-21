@@ -133,7 +133,7 @@ async fn ingest(
     source: &str,
     channel: &str,
     text: &str,
-) -> Result<tinycortex::memory::ingest::IngestOutcome> {
+) -> Result<tinycortex::memory::ingest::IngestSummary> {
     Ok(ingest_chat(
         config,
         source,
