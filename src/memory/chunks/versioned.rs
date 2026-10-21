@@ -198,9 +198,8 @@ pub(crate) async fn upsert_chunks_async(config: &MemoryConfig, chunks: &[Chunk])
     }
     for _ in 0..CAS_RETRIES {
         let snapshot = capture_head_async(config).await?;
-        let defaults = chunk_upsert_state_changes(chunks, &[]);
         let changes =
-            restore_deleted_chunk_lifecycles_async(config, &snapshot, chunks, &defaults).await?;
+            prepare_chunk_upsert_state_changes_async(config, &snapshot, chunks, &[]).await?;
         match upsert_chunks_at_async(config, &snapshot, chunks, chunks, &changes).await {
             Ok(_) => return Ok(chunks.len()),
             Err(error) if is_storage_conflict(&error) => continue,
@@ -338,10 +337,9 @@ fn commit_operation(
             final_chunks.push(chunk.clone());
         }
     }
-    let changes_with_defaults = chunk_upsert_state_changes(chunks, changes);
     let mut final_changes = Vec::new();
     let mut change_positions = HashMap::new();
-    for change in &changes_with_defaults {
+    for change in changes {
         let key = format!("{}\0{}", change.collection, change.key);
         if let Some(position) = change_positions.get(&key).copied() {
             final_changes[position] = change.clone();
@@ -355,7 +353,7 @@ fn commit_operation(
     for _ in 0..CAS_RETRIES {
         let snapshot = capture_head(config)?;
         let effective_changes =
-            restore_deleted_chunk_lifecycles(config, &snapshot, &final_chunks, &final_changes)?;
+            prepare_chunk_upsert_state_changes(config, &snapshot, &final_chunks, &final_changes)?;
         if is_current_commit_retry(config, &snapshot, &final_chunks, &effective_changes)? {
             return Ok(chunks.len());
         }
@@ -370,110 +368,105 @@ fn commit_operation(
     }))
 }
 
-fn chunk_upsert_state_changes(chunks: &[Chunk], changes: &[StateChange]) -> Vec<StateChange> {
-    let mut all = Vec::with_capacity(changes.len() + chunks.len() * 2);
-    for chunk in chunks {
-        // A plain upsert is a fresh admission into the logical chunk store.
-        // Replacing a row clears stale staged-file metadata and resets a prior
-        // dropped/deleted lifecycle value, matching SQLite's row replacement.
-        all.push(StateChange {
-            collection: CHUNK_CONTENT_POINTERS.to_owned(),
-            key: chunk.id.clone(),
-            value: None,
-        });
-        all.push(StateChange {
-            collection: CHUNK_LIFECYCLE.to_owned(),
-            key: chunk.id.clone(),
-            value: Some(serde_json::json!({
-                "status": super::store::CHUNK_STATUS_ADMITTED
-            })),
-        });
-    }
-    all.extend_from_slice(changes);
-    all
-}
-
-fn restore_deleted_chunk_lifecycles(
+fn prepare_chunk_upsert_state_changes(
     config: &MemoryConfig,
     snapshot: &HeadSnapshot,
     chunks: &[Chunk],
     changes: &[StateChange],
 ) -> Result<Vec<StateChange>> {
+    if chunks.is_empty() {
+        return Ok(changes.to_vec());
+    }
     let documents = config.storage()?.documents().clone();
     let snapshot = snapshot.clone();
     let chunks = chunks.to_vec();
-    let mut restored = changes.to_vec();
-    let explicit = changes
-        .iter()
-        .filter(|change| change.collection == CHUNK_LIFECYCLE)
-        .map(|change| change.key.clone())
-        .collect::<HashSet<_>>();
+    let changes = changes.to_vec();
     let result = config.storage_blocking()?.run(async move {
-        for chunk in chunks {
-            if explicit.contains(chunk.id.as_str()) {
-                continue;
-            }
-            let lifecycle =
-                read_state_at(&*documents, &snapshot, CHUNK_LIFECYCLE, &chunk.id).await?;
-            if lifecycle
-                .as_ref()
-                .and_then(|value| value.get("status"))
-                .and_then(Value::as_str)
-                == Some("deleted")
-            {
-                restored.push(StateChange {
-                    collection: CHUNK_LIFECYCLE.to_owned(),
-                    key: chunk.id,
-                    value: None,
-                });
-            }
-        }
-        Ok::<_, tinystoragedrivers_types::StorageError>(restored)
+        prepare_chunk_upsert_state_changes_at(&*documents, &snapshot, &chunks, &changes).await
     })?;
     result.map_err(anyhow::Error::from)
 }
 
-async fn restore_deleted_chunk_lifecycles_async(
+async fn prepare_chunk_upsert_state_changes_async(
     config: &MemoryConfig,
     snapshot: &HeadSnapshot,
     chunks: &[Chunk],
     changes: &[StateChange],
 ) -> Result<Vec<StateChange>> {
+    if chunks.is_empty() {
+        return Ok(changes.to_vec());
+    }
     let documents = config.storage()?.documents().clone();
     let snapshot = snapshot.clone();
     let chunks = chunks.to_vec();
-    let mut restored = changes.to_vec();
-    let explicit = changes
-        .iter()
-        .filter(|change| change.collection == CHUNK_LIFECYCLE)
-        .map(|change| change.key.clone())
-        .collect::<HashSet<_>>();
+    let changes = changes.to_vec();
     let result = config
         .storage_blocking()?
         .run_async(async move {
-            for chunk in chunks {
-                if explicit.contains(chunk.id.as_str()) {
-                    continue;
-                }
-                let lifecycle =
-                    read_state_at(&*documents, &snapshot, CHUNK_LIFECYCLE, &chunk.id).await?;
-                if lifecycle
-                    .as_ref()
-                    .and_then(|value| value.get("status"))
-                    .and_then(Value::as_str)
-                    == Some("deleted")
-                {
-                    restored.push(StateChange {
-                        collection: CHUNK_LIFECYCLE.to_owned(),
-                        key: chunk.id,
-                        value: None,
-                    });
-                }
-            }
-            Ok::<_, tinystoragedrivers_types::StorageError>(restored)
+            prepare_chunk_upsert_state_changes_at(&*documents, &snapshot, &chunks, &changes).await
         })
         .await?;
     result.map_err(anyhow::Error::from)
+}
+
+async fn prepare_chunk_upsert_state_changes_at(
+    documents: &dyn tinystoragedrivers_api::DocumentStore,
+    snapshot: &HeadSnapshot,
+    chunks: &[Chunk],
+    changes: &[StateChange],
+) -> tinystoragedrivers_types::Result<Vec<StateChange>> {
+    let manifests = load_operation_manifests(documents).await?;
+    let visible = visible_operations_at_snapshot(snapshot, &manifests)?;
+    let collections = [
+        CHUNK_LIFECYCLE.to_owned(),
+        CHUNK_CONTENT_POINTERS.to_owned(),
+    ];
+    let states = bulk_state_values_at_snapshot(documents, snapshot, &visible, &collections).await?;
+    let lifecycle = states
+        .get(CHUNK_LIFECYCLE)
+        .into_iter()
+        .flatten()
+        .map(|(key, value)| (key.as_str(), value))
+        .collect::<HashMap<_, _>>();
+    let pointers = states
+        .get(CHUNK_CONTENT_POINTERS)
+        .into_iter()
+        .flatten()
+        .map(|(key, value)| (key.as_str(), value))
+        .collect::<HashMap<_, _>>();
+    let explicit = changes
+        .iter()
+        .map(|change| (change.collection.as_str(), change.key.as_str()))
+        .collect::<HashSet<_>>();
+    let mut prepared = changes.to_vec();
+    for chunk in chunks {
+        // New chunks have an implicit, never-written lifecycle value. A
+        // replacement only needs an explicit admitted row when it is clearing
+        // a prior lifecycle state such as dropped or sealed.
+        if !explicit.contains(&(CHUNK_LIFECYCLE, chunk.id.as_str()))
+            && lifecycle.contains_key(chunk.id.as_str())
+        {
+            prepared.push(StateChange {
+                collection: CHUNK_LIFECYCLE.to_owned(),
+                key: chunk.id.clone(),
+                value: Some(serde_json::json!({
+                    "status": super::store::CHUNK_STATUS_ADMITTED
+                })),
+            });
+        }
+        // Avoid persisting tombstones for pointers that never existed while
+        // still clearing staged-file metadata on a plain replacement.
+        if !explicit.contains(&(CHUNK_CONTENT_POINTERS, chunk.id.as_str()))
+            && pointers.contains_key(chunk.id.as_str())
+        {
+            prepared.push(StateChange {
+                collection: CHUNK_CONTENT_POINTERS.to_owned(),
+                key: chunk.id.clone(),
+                value: None,
+            });
+        }
+    }
+    Ok(prepared)
 }
 
 pub(crate) fn write_state_changes(config: &MemoryConfig, changes: &[StateChange]) -> Result<()> {
