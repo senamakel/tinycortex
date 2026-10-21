@@ -50,11 +50,8 @@ fn address_book_is_empty_on_non_mac() {
     assert!(address_book::read().unwrap().is_empty());
 }
 
-/// Regression for Sentry TAURI-RUST-8NM (store never seeded → `get()` always
-/// errored) and its #4378 follow-up (store stayed bound to the pre-login
-/// workspace after an active-user switch). Verify `init_from_workspace` seeds
-/// the global + creates the on-disk db, is an idempotent no-op for the same
-/// workspace, and **rebinds** to a different workspace like `memory::global`.
+/// Verify global binding accepts only prepared host configs, is an idempotent
+/// no-op for the same workspace, and rebinds to a different active workspace.
 ///
 /// Takes [`GLOBAL_STORE_LOCK`] because it mutates the process-global store
 /// slot that any test may observe through `get()`. `#[test]` alone does **not**
@@ -62,29 +59,25 @@ fn address_book_is_empty_on_non_mac() {
 /// lock is what makes that true, and it must be taken by every future test that
 /// touches the global.
 #[test]
-fn init_from_workspace_seeds_and_rebinds_global_store() {
+fn init_rebinds_global_store_using_prepared_host_configs() {
     use crate::memory::people::store;
 
     let _serial = GLOBAL_STORE_LOCK.lock();
 
-    let ws_a = tempfile::tempdir().unwrap();
-    let store_a = store::init_from_workspace(ws_a.path()).unwrap();
-    assert!(
-        ws_a.path().join("people").join("people.db").exists(),
-        "seed must create <workspace>/people/people.db"
-    );
+    let (ws_a, config_a) = crate::memory::people::test_support::config();
+    let store_a = store::init(&config_a).unwrap();
 
     // Previously-dead global is now reachable — the 8NM fix.
     let via_global = store::get().expect("people store reachable after seed");
     assert!(Arc::ptr_eq(&store_a, &via_global));
 
     // Same workspace → idempotent no-op, returns the same instance.
-    let again = store::init_from_workspace(ws_a.path()).unwrap();
+    let again = store::init(&config_a).unwrap();
     assert!(Arc::ptr_eq(&store_a, &again));
 
     // Different workspace (active-user switch) → rebind to a new store. #4378.
-    let ws_b = tempfile::tempdir().unwrap();
-    let store_b = store::init_from_workspace(ws_b.path()).unwrap();
+    let (ws_b, config_b) = crate::memory::people::test_support::config();
+    let store_b = store::init(&config_b).unwrap();
     assert!(
         !Arc::ptr_eq(&store_a, &store_b),
         "a new workspace must rebind to a fresh store, not reuse the old one"
@@ -95,14 +88,11 @@ fn init_from_workspace_seeds_and_rebinds_global_store() {
         "get() must return the rebound (workspace B) store after a switch"
     );
 
-    // Leave the global bound to a workspace that outlives this test. Both temp
-    // dirs above are deleted when they drop, and the global would keep pointing
-    // at whichever was bound last — so a later `get()` would hand back a store
-    // over a database file that no longer exists. Leaking one directory is the
-    // cheap way to keep the slot valid for the rest of the process; there is no
-    // unbind, because production never unbinds either.
-    let keep: &'static tempfile::TempDir = Box::leak(Box::new(tempfile::tempdir().unwrap()));
-    store::init_from_workspace(keep.path()).unwrap();
+    // Keep the testkit config's workspace stable while the process-global
+    // handle remains bound for tests running later in the process.
+    let keep: &'static (tempfile::TempDir, crate::memory::config::MemoryConfig) =
+        Box::leak(Box::new(crate::memory::people::test_support::config()));
+    store::init(&keep.1).unwrap();
 }
 
 #[test]
