@@ -5,6 +5,8 @@
 //! every transition is a head-CAS. This keeps correctness independent of a
 //! backend's optional queue dedupe support and fences stale workers.
 
+use std::collections::{BTreeMap, HashMap, HashSet};
+
 use anyhow::{Context, Result};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
@@ -205,6 +207,137 @@ pub(crate) async fn stage_purge_jobs_at_snapshot(
         });
     }
     Ok((expected, changes))
+}
+
+/// Queue rows staged as part of a typed source import. `expected` and
+/// `changes` are committed with the caller's imported domain state under the
+/// same captured owner snapshot; `publish` contains only ready records whose
+/// wake-up hints may be sent after that commit succeeds.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct StagedImportJobs {
+    pub(crate) expected: Vec<StateChange>,
+    pub(crate) changes: Vec<StateChange>,
+    pub(crate) publish: Vec<JobRecord>,
+}
+
+/// Stage imported queue jobs and their dedupe pointers against one captured
+/// owner snapshot. Imports must supply stable job IDs. A repeated ID is
+/// idempotent only when it describes the same job intent; an active dedupe
+/// pointer owned by another job is a conflict and leaves the caller's source
+/// untouched.
+pub(crate) async fn stage_import_jobs_at_snapshot(
+    config: &MemoryConfig,
+    snapshot: &versioned::HeadSnapshot,
+    jobs: &[NewJob],
+) -> Result<StagedImportJobs> {
+    let rows = versioned::list_state_at_snapshot_async(config, snapshot, JOBS).await?;
+    let current: HashMap<_, _> = rows.into_iter().collect();
+    let mut expected = BTreeMap::<String, Option<Value>>::new();
+    let mut changes = BTreeMap::<String, Option<Value>>::new();
+    let mut seen_ids = HashSet::new();
+    let mut seen_dedupe = HashMap::<String, String>::new();
+    let mut publish = Vec::new();
+
+    for job in jobs {
+        let id = job
+            .id
+            .as_deref()
+            .context("typed queue import requires a stable job ID")?;
+        anyhow::ensure!(!id.is_empty(), "typed queue import job ID cannot be empty");
+        anyhow::ensure!(
+            seen_ids.insert(id.to_owned()),
+            "typed queue import contains duplicate job ID {id}"
+        );
+
+        if let Some(dedupe_key) = &job.dedupe_key {
+            if let Some(other_id) = seen_dedupe.insert(dedupe_key.clone(), id.to_owned()) {
+                anyhow::ensure!(
+                    other_id == id,
+                    "typed queue import reuses dedupe key {dedupe_key} for multiple jobs"
+                );
+            }
+        }
+
+        let key = job_key(id);
+        let proposed = record_from_new(config, job, id.to_owned());
+        let existing = current.get(&key).cloned();
+        let is_new = existing.is_none();
+        expected.insert(key.clone(), existing.clone());
+        let record = if let Some(value) = existing {
+            let record = decode_job(&value)?;
+            anyhow::ensure!(
+                record.kind == proposed.kind
+                    && record.payload_json == proposed.payload_json
+                    && record.dedupe_key == proposed.dedupe_key
+                    && record.max_attempts == proposed.max_attempts,
+                "stable imported queue job ID {id} was reused with a different intent"
+            );
+            record
+        } else {
+            changes.insert(key, Some(encode_job(&proposed)?));
+            proposed
+        };
+
+        if is_new {
+            if let Some(dedupe) = &job.dedupe_key {
+            let dkey = dedupe_state_key(dedupe);
+            let pointer = current.get(&dkey).cloned();
+            expected.insert(dkey.clone(), pointer.clone());
+            if let Some(value) = pointer {
+                let active_id = value.as_str().context("decode queue dedupe pointer")?;
+                if active_id != id {
+                    if let Some(active_value) = current.get(&job_key(active_id)) {
+                        let active = decode_job(active_value)?;
+                        anyhow::ensure!(
+                            !matches!(active.status()?, JobStatus::Ready | JobStatus::Running),
+                            "imported dedupe key {dedupe} is already owned by active job {active_id}"
+                        );
+                    }
+                }
+            }
+            changes.insert(dkey, Some(Value::String(id.to_owned())));
+            }
+        }
+
+        if record.status()? == JobStatus::Ready {
+            publish.push(record);
+        }
+    }
+
+    Ok(StagedImportJobs {
+        expected: expected
+            .into_iter()
+            .map(|(key, value)| StateChange {
+                collection: JOBS.to_owned(),
+                key,
+                value,
+            })
+            .collect(),
+        changes: changes
+            .into_iter()
+            .map(|(key, value)| StateChange {
+                collection: JOBS.to_owned(),
+                key,
+                value,
+            })
+            .collect(),
+        publish,
+    })
+}
+
+/// Publish the queue hints for an import only after its owner-state CAS has
+/// committed. If publication fails, periodic ready-job repair can safely retry
+/// these same stable job IDs.
+pub(crate) async fn publish_import_job_hints_async(
+    config: &MemoryConfig,
+    records: &[JobRecord],
+) -> Result<()> {
+    for record in records {
+        if record.status()? == JobStatus::Ready {
+            enqueue_hint_async(config, record).await?;
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn replace_record(
