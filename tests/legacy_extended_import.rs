@@ -199,7 +199,7 @@ fn read_legacy_batch(root: &Path) -> Result<LegacyImportBatch> {
                             source_weight: row.get(4)?,
                             interaction: row.get(5)?,
                             entity_density: row.get(6)?,
-                            llm_importance: row.get(10)?,
+                            llm_importance: row.get::<_, Option<f32>>(10)?.unwrap_or_default(),
                         },
                         dropped: row.get::<_, i64>(7)? != 0,
                         reason: row.get(8)?,
