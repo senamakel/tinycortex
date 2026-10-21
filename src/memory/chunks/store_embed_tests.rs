@@ -110,13 +110,9 @@ fn seed_summary(cfg: &MemoryConfig, id: &str) {
         "model@3",
     )
     .unwrap();
-    assert!(versioned::commit_if_state_matches(
-        cfg,
-        &staged.expected,
-        &[],
-        &staged.changes,
-    )
-    .unwrap());
+    assert!(
+        versioned::commit_if_state_matches(cfg, &staged.expected, &[], &staged.changes,).unwrap()
+    );
 }
 
 #[test]

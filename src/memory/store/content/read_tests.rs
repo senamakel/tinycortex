@@ -177,19 +177,13 @@ fn resolve_within_content_root_rejects_traversal_and_absolute() {
 fn high_level_chunk_reader_uses_custom_root_and_repairs_checksum() {
     let dir = TempDir::new().unwrap();
     let custom_root = dir.path().join("custom-content");
-    let mut config = crate::memory::MemoryConfig::new(dir.path());
+    let mut config = crate::memory::chunks::test_support::host_config(dir.path());
     config.content_root = Some(custom_root.clone());
     let chunk = sample_chunk();
     let staged =
         crate::memory::store::content::stage_chunks(&custom_root, std::slice::from_ref(&chunk))
             .unwrap();
-    crate::memory::chunks::with_connection(&config, |conn| {
-        let tx = conn.unchecked_transaction()?;
-        crate::memory::chunks::upsert_staged_chunks_tx(&tx, &staged)?;
-        tx.commit()?;
-        Ok(())
-    })
-    .unwrap();
+    crate::memory::chunks::upsert_staged_chunks(&config, &staged).unwrap();
     crate::memory::chunks::update_chunk_content_sha256(&config, &chunk.id, "stale").unwrap();
 
     assert_eq!(read_chunk_body(&config, &chunk.id).unwrap(), chunk.content);
@@ -202,7 +196,7 @@ fn high_level_chunk_reader_uses_custom_root_and_repairs_checksum() {
 #[test]
 fn high_level_chunk_reader_falls_back_to_legacy_content_column() {
     let dir = TempDir::new().unwrap();
-    let config = crate::memory::MemoryConfig::new(dir.path());
+    let config = crate::memory::chunks::test_support::host_config(dir.path());
     let chunk = sample_chunk();
     crate::memory::chunks::upsert_chunks(&config, std::slice::from_ref(&chunk)).unwrap();
 
@@ -212,7 +206,7 @@ fn high_level_chunk_reader_falls_back_to_legacy_content_column() {
 #[test]
 fn high_level_chunk_reader_empty_legacy_content_uses_terminal_error() {
     let dir = TempDir::new().unwrap();
-    let config = crate::memory::MemoryConfig::new(dir.path());
+    let config = crate::memory::chunks::test_support::host_config(dir.path());
     let mut chunk = sample_chunk();
     chunk.content.clear();
     crate::memory::chunks::upsert_chunks(&config, std::slice::from_ref(&chunk)).unwrap();
@@ -228,7 +222,7 @@ fn high_level_chunk_reader_empty_legacy_content_uses_terminal_error() {
 #[test]
 fn high_level_chunk_reader_joins_clamped_raw_references() {
     let dir = TempDir::new().unwrap();
-    let mut config = crate::memory::MemoryConfig::new(dir.path());
+    let mut config = crate::memory::chunks::test_support::host_config(dir.path());
     let root = dir.path().join("raw-root");
     config.content_root = Some(root.clone());
     std::fs::create_dir_all(root.join("raw/source")).unwrap();

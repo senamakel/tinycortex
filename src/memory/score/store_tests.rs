@@ -1,6 +1,6 @@
 use super::*;
 use crate::memory::chunks::test_support::host_config;
-use crate::memory::chunks::{upsert_chunks, Chunk, Metadata, SourceKind};
+use crate::memory::chunks::{upsert_chunks, upsert_chunks_async, Chunk, Metadata, SourceKind};
 use crate::memory::config::MemoryConfig;
 use chrono::{TimeZone, Utc};
 use tempfile::TempDir;
@@ -86,7 +86,9 @@ fn upsert_score_idempotent() {
 async fn queue_score_planner_returns_owner_mutations_without_persisting_them() {
     let (_tmp, cfg) = test_config();
     let row = sample_row("planned-chunk", false);
-    upsert_chunks(&cfg, &[sample_chunk(&row.chunk_id)]).unwrap();
+    upsert_chunks_async(&cfg, &[sample_chunk(&row.chunk_id)])
+        .await
+        .unwrap();
     let result = crate::memory::score::ScoreResult {
         chunk_id: row.chunk_id.clone(),
         total: row.total,
@@ -109,7 +111,10 @@ async fn queue_score_planner_returns_owner_mutations_without_persisting_them() {
         mutation.collection == crate::memory::queue::JobStateCollection::EntityIndex
             && mutation.value.is_some()
     }));
-    assert!(get_score_async(&cfg, "planned-chunk").await.unwrap().is_none());
+    assert!(get_score_async(&cfg, "planned-chunk")
+        .await
+        .unwrap()
+        .is_none());
     assert!(list_entity_ids_for_node_async(&cfg, "planned-chunk")
         .await
         .unwrap()
@@ -135,7 +140,9 @@ async fn queue_score_planner_refuses_missing_or_deleted_chunks() {
             .is_err()
     );
 
-    upsert_chunks(&cfg, &[sample_chunk(&row.chunk_id)]).unwrap();
+    upsert_chunks_async(&cfg, &[sample_chunk(&row.chunk_id)])
+        .await
+        .unwrap();
     crate::memory::chunks::set_chunk_lifecycle_status(&cfg, &row.chunk_id, "deleted").unwrap();
     assert!(
         plan_score_persistence_for_queue(&cfg, &result, 123, Some("source"))
