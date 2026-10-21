@@ -1,9 +1,8 @@
-//! Persistence for sealed summary rows (`mem_tree_summaries`) and their
-//! per-model embedding sidecar (`mem_tree_summary_embeddings`).
+//! Sealed summary records and per-signature embedding sidecars in the
+//! host-bound versioned document owner.
 //!
-//! Summary rows are immutable once emitted. The legacy `embedding` blob column
-//! on `mem_tree_summaries` is always written NULL; vectors live in the
-//! per-signature sidecar table so multiple embedding models can coexist.
+//! Summary rows are immutable once emitted. Embeddings are separate records so
+//! multiple model signatures can coexist without rewriting the summary.
 
 use std::collections::HashMap;
 

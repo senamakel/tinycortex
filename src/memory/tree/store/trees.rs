@@ -1,4 +1,4 @@
-//! Persistence for tree rows in `mem_tree_trees`.
+//! Tree records and scope indexes in the host-bound versioned document owner.
 
 use std::collections::HashMap;
 

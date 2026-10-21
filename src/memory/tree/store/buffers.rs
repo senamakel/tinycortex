@@ -1,4 +1,4 @@
-//! Persistence for unsealed buffers (`mem_tree_buffers`).
+//! Unsealed buffer records in the host-bound versioned document owner.
 
 use anyhow::Result;
 use chrono::{DateTime, Utc};
