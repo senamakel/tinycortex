@@ -105,7 +105,7 @@ fn delete_chunk_by_id_takes_one_chunk_and_leaves_the_source() {
     upsert_chunks(&cfg, &[target.clone(), sibling.clone()]).unwrap();
     index_entity(&cfg, &target.id);
     index_entity(&cfg, &sibling.id);
-    assert!(super::claim_source_ingest(
+    assert!(super::store_sources::claim_source_ingest(
         &cfg,
         SourceKind::Chat,
         "slack:#eng",

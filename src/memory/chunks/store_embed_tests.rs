@@ -25,13 +25,13 @@ use super::{
     GLOBAL_TOPIC_PURGE_MIGRATION_VERSION,
 };
 use crate::memory::config::MemoryConfig;
+use crate::memory::chunks::collections::{CHUNK_REEMBED_SKIPS, SUMMARY_REEMBED_SKIPS};
+use crate::memory::chunks::versioned;
 use crate::memory::store::content::read::{
     LEGACY_EMPTY_CHUNK_CONTENT_REASON_PREFIX, LEGACY_EMPTY_CONTENT_POINTER_REASON_PREFIX,
     LEGACY_NO_CONTENT_POINTER_REASON_PREFIX,
 };
-use crate::memory::tree::store::{
-    insert_summary_tx, insert_tree, SummaryNode, Tree, TreeKind, TreeStatus,
-};
+use crate::memory::tree::store::{Tree, TreeKind, TreeStatus};
 use chrono::{TimeZone, Utc};
 use rusqlite::params;
 use std::sync::Arc;
@@ -111,66 +111,17 @@ fn setting_chunk_embedding_clears_matching_skip_marker() {
 #[test]
 fn summary_reembed_tombstone_roundtrips_and_clears() {
     let (_tmp, cfg) = test_config();
-    let now = Utc::now();
-    insert_tree(
-        &cfg,
-        &Tree {
-            id: "tree-1".into(),
-            kind: TreeKind::Source,
-            scope: "source-1".into(),
-            root_id: None,
-            max_level: 0,
-            status: TreeStatus::Active,
-            created_at: now,
-            last_sealed_at: None,
-            ask: None,
-        },
-    )
-    .unwrap();
-    with_connection(&cfg, |conn| {
-        let tx = conn.unchecked_transaction()?;
-        insert_summary_tx(
-            &tx,
-            &SummaryNode {
-                id: "summary-1".into(),
-                tree_id: "tree-1".into(),
-                tree_kind: TreeKind::Source,
-                level: 1,
-                parent_id: None,
-                child_ids: vec![],
-                content: "summary".into(),
-                token_count: 2,
-                entities: vec![],
-                topics: vec![],
-                time_range_start: now,
-                time_range_end: now,
-                score: 1.0,
-                sealed_at: now,
-                deleted: false,
-                embedding: None,
-                doc_id: None,
-                version_ms: None,
-            },
-            "model@3",
-        )?;
-        tx.commit()?;
-        Ok(())
-    })
-    .unwrap();
     mark_summary_reembed_skipped(&cfg, "summary-1", "model@3", "oversize").unwrap();
-    with_connection(&cfg, |conn| {
-        let count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM mem_tree_summary_reembed_skipped
-             WHERE summary_id='summary-1' AND model_signature='model@3'",
-            [],
-            |row| row.get(0),
-        )?;
-        assert_eq!(count, 1);
-        Ok(())
-    })
-    .unwrap();
+    let stored = versioned::list_state(&cfg, SUMMARY_REEMBED_SKIPS).unwrap();
+    assert_eq!(stored.len(), 1);
+    assert_eq!(stored[0].1["summary_id"], "summary-1");
+    assert_eq!(stored[0].1["model_signature"], "model@3");
+    assert_eq!(stored[0].1["reason"], "oversize");
     clear_summary_reembed_skipped(&cfg, "summary-1", "model@3").unwrap();
     clear_summary_reembed_skipped(&cfg, "summary-1", "model@3").unwrap();
+    assert!(versioned::list_state(&cfg, SUMMARY_REEMBED_SKIPS)
+        .unwrap()
+        .is_empty());
 }
 
 #[test]
@@ -184,65 +135,26 @@ fn clear_reembed_skipped_for_signature_removes_all_tombstones_for_sig() {
     mark_chunk_reembed_skipped(&cfg, &c1.id, &sig, "r1").unwrap();
     mark_chunk_reembed_skipped(&cfg, &c2.id, &sig, "r2").unwrap();
     mark_chunk_reembed_skipped(&cfg, &c1.id, other_sig, "other").unwrap();
-    // Seed a summary + a summary-side tombstone directly via SQL (the tree
-    // store that owns these rows is not part of this slice).
+    // A re-embed tombstone belongs to the model signature and can be cleared
+    // independently of the summary projection that produced it.
     let summary_id = "summary-bulk-clear-test";
-    with_connection(&cfg, |conn| {
-        conn.execute(
-            "INSERT OR IGNORE INTO mem_tree_trees (id, kind, scope, created_at_ms)
-             VALUES ('tree-bulk-clear', 'source', 'bulk-clear', 0)",
-            [],
-        )?;
-        conn.execute(
-            "INSERT INTO mem_tree_summaries (
-                id, tree_id, tree_kind, level, child_ids_json, content, token_count,
-                entities_json, topics_json, time_range_start_ms, time_range_end_ms,
-                score, sealed_at_ms, deleted
-             ) VALUES (?1, 'tree-bulk-clear', 'source', 0, '[]', 'x', 1, '[]', '[]', 0, 0, 0.0, 0, 0)",
-            params![summary_id],
-        )?;
-        conn.execute(
-            "INSERT INTO mem_tree_summary_reembed_skipped (summary_id, model_signature, reason, skipped_at_ms)
-             VALUES (?1, ?2, 'summary tombstone', 0)",
-            params![summary_id, sig],
-        )?;
-        Ok(())
-    })
-    .unwrap();
+    mark_summary_reembed_skipped(&cfg, summary_id, &sig, "summary tombstone").unwrap();
 
     let deleted = clear_reembed_skipped_for_signature(&cfg, &sig).unwrap();
     assert_eq!(deleted, 3);
 
-    let remaining_chunks: i64 = with_connection(&cfg, |conn| {
-        Ok(conn.query_row(
-            "SELECT COUNT(*) FROM mem_tree_chunk_reembed_skipped WHERE model_signature = ?1",
-            params![sig],
-            |r| r.get(0),
-        )?)
-    })
-    .unwrap();
-    assert_eq!(remaining_chunks, 0);
-
-    let remaining_summaries: i64 = with_connection(&cfg, |conn| {
-        Ok(conn.query_row(
-            "SELECT COUNT(*) FROM mem_tree_summary_reembed_skipped WHERE model_signature = ?1",
-            params![sig],
-            |r| r.get(0),
-        )?)
-    })
-    .unwrap();
-    assert_eq!(remaining_summaries, 0);
-
-    let other_kept: i64 = with_connection(&cfg, |conn| {
-        Ok(conn.query_row(
-            "SELECT COUNT(*) FROM mem_tree_chunk_reembed_skipped
-              WHERE chunk_id = ?1 AND model_signature = ?2",
-            params![c1.id, other_sig],
-            |r| r.get(0),
-        )?)
-    })
-    .unwrap();
-    assert_eq!(other_kept, 1);
+    let remaining_chunks = versioned::list_state(&cfg, CHUNK_REEMBED_SKIPS).unwrap();
+    assert!(!remaining_chunks.iter().any(|(_, value)| value["model_signature"] == sig));
+    let remaining_summaries = versioned::list_state(&cfg, SUMMARY_REEMBED_SKIPS).unwrap();
+    assert!(!remaining_summaries.iter().any(|(_, value)| value["model_signature"] == sig));
+    assert_eq!(
+        remaining_chunks
+            .iter()
+            .filter(|(_, value)| value["chunk_id"] == c1.id && value["model_signature"] == other_sig)
+            .count(),
+        1
+    );
+    assert_eq!(clear_reembed_skipped_for_signature(&cfg, &sig).unwrap(), 0);
 }
 
 #[test]
