@@ -1,10 +1,8 @@
 //! Persistence for unsealed buffers (`mem_tree_buffers`).
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use chrono::{DateTime, Utc};
-use rusqlite::{params, Connection, OptionalExtension, Transaction};
 
-use super::common::ms_to_utc;
 use super::types::Buffer;
 use crate::memory::config::MemoryConfig;
 
