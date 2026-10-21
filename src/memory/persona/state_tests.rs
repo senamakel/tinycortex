@@ -75,7 +75,7 @@ async fn raw_state_kv_preserves_pii_in_cursor_text() {
     let store = KvStateStore::from_config(&config).unwrap();
     let key = "transcript:/home/alice@example.com/.agent/sessions/run.jsonl";
     let value = serde_json::json!({
-        "cursor": "Imported transcript belongs to alice@example.com"
+        "cursor": "Imported transcript owner contact +15551234567"
     });
 
     store.set(NAMESPACE, key, &value).await.unwrap();
