@@ -1763,7 +1763,7 @@ async fn bulk_state_values_at_snapshot(
 ) -> tinystoragedrivers_types::Result<HashMap<String, Vec<(String, Value)>>> {
     let mut output = HashMap::with_capacity(collections.len());
     for collection in collections {
-        let mut keys = HashSet::new();
+        let mut latest = HashMap::<String, (u64, Option<Value>)>::new();
         let mut query = Query::filter(Filter::eq("collection", collection.clone()))
             .sort(Sort::asc("key"))
             .limit(PAGE_SIZE);
@@ -1777,8 +1777,29 @@ async fn bulk_state_values_at_snapshot(
                 }
                 let version: StateVersion = serde_json::from_value(row.doc)
                     .map_err(tinystoragedrivers_types::StorageError::from)?;
-                if version.collection == *collection {
-                    keys.insert(version.key);
+                if version.collection != *collection
+                    || version.revision > snapshot.revision
+                    || state_version_id(collection, &version.key, &version.operation_id) != row.id
+                {
+                    continue;
+                }
+                let Some(operation) = visible.get(&version.operation_id) else {
+                    continue;
+                };
+                if operation.revision != version.revision
+                    || !operation.state_writes.contains(&(
+                        collection.clone(),
+                        version.key.clone(),
+                        row.id,
+                    ))
+                {
+                    continue;
+                }
+                if latest
+                    .get(&version.key)
+                    .is_none_or(|(revision, _)| version.revision > *revision)
+                {
+                    latest.insert(version.key, (version.revision, version.value));
                 }
             }
             match page.next {
@@ -1786,15 +1807,14 @@ async fn bulk_state_values_at_snapshot(
                 None => break,
             }
         }
-        let mut values = Vec::new();
-        for key in keys {
-            if let Some(value) = read_state_at(documents, snapshot, collection, &key).await? {
-                values.push((key, value));
-            }
-        }
-        output.insert(collection.clone(), values);
+        output.insert(
+            collection.clone(),
+            latest
+                .into_iter()
+                .filter_map(|(key, (_, value))| value.map(|value| (key, value)))
+                .collect(),
+        );
     }
-    let _ = visible;
     Ok(output)
 }
 
