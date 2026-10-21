@@ -7,7 +7,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::memory::chunks::collections::{CHUNK_LIFECYCLE, ENTITY_INDEX, SCORES};
