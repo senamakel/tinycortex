@@ -8,7 +8,8 @@ use tinycortex::memory::{
     chunks::{
         self, Chunk, LegacyChunkRecord, LegacyContentPointer, LegacyEmbedding, LegacyEntityEdge,
         LegacyEntityOccurrence, LegacyImportBatch, LegacySourceGate, LegacySummaryContent,
-        LegacySummaryEmbedding, RawRef, SourceKind,
+        LegacySummaryEmbedding, LegacyBuffer, LegacyChunkReembedSkip, LegacyHotness,
+        LegacySummaryReembedSkip, RawRef, SourceKind,
     },
     config::MemoryConfig,
     graph,
@@ -22,6 +23,7 @@ use tinycortex::memory::{
 };
 
 const FIXTURE: &str = "tests/fixtures/legacy-v0.1.3-extended-public-writer/memory_tree";
+const STATE_FIXTURE: &str = "tests/fixtures/legacy-v0.1.3-state-public-writer/memory_tree";
 
 /// Import an authentic v0.1.3 database through the typed owner API and verify
 /// every populated record family through the current public readers.
