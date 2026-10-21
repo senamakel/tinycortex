@@ -1480,7 +1480,7 @@ async fn state_change_matches_at(
 ) -> tinystoragedrivers_types::Result<bool> {
     let mut actual =
         read_state_at(documents, snapshot, &condition.collection, &condition.key).await?;
-    if actual.is_none() && condition.collection == CHUNK_LIFECYCLE {
+    if actual.is_none() && condition.collection == CHUNK_LIFECYCLE && condition.value.is_some() {
         let implicit = implicit_chunk_lifecycle_status(documents, snapshot, &condition.key)
             .await?
             .map(|status| serde_json::json!({"status": status}));
