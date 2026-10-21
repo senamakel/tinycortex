@@ -47,6 +47,7 @@ mod recovery;
 
 #[path = "embeddings.rs"]
 mod embeddings;
+mod legacy_import;
 #[path = "embeddings_query.rs"]
 mod embeddings_query;
 #[path = "migrations.rs"]
@@ -105,6 +106,11 @@ pub use types::{
 };
 
 pub use collections::collections;
+pub use legacy_import::{
+    import_legacy_batch, LegacyChunkRecord, LegacyContentPointer, LegacyEmbedding,
+    LegacyEntityEdge, LegacyEntityOccurrence, LegacyImportBatch, LegacyImportCounts,
+    LegacySourceGate,
+};
 pub use connection::{shared_connection, with_connection};
 pub(crate) use embeddings::summary_reembed_skip_key;
 pub use embeddings::{
