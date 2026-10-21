@@ -523,7 +523,7 @@ pub(crate) fn write_chunk_state_changes(
         if !exists {
             return Ok(false);
         }
-        match upsert_chunks_at(config, &snapshot, &[], &[], changes) {
+        match upsert_chunks_at(config, &snapshot, &[], &[], changes, None) {
             Ok(_) => return Ok(true),
             Err(error) if is_storage_conflict(&error) => last_conflict = Some(error),
             Err(error) => return Err(error),
@@ -686,6 +686,7 @@ fn is_current_commit_retry(
     head: &HeadSnapshot,
     chunks: &[Chunk],
     changes: &[StateChange],
+    default_lifecycle_status: Option<&str>,
 ) -> Result<bool> {
     let Some(snapshot) = head.op_id.clone() else {
         return Ok(false);
@@ -693,6 +694,7 @@ fn is_current_commit_retry(
     let documents = config.storage()?.documents().clone();
     let expected = chunks.to_vec();
     let expected_changes = changes.to_vec();
+    let expected_default = default_lifecycle_status.map(str::to_owned);
     config
         .storage_blocking()?
         .run(async move {
@@ -708,7 +710,8 @@ fn is_current_commit_retry(
             }
             let operation: OperationManifest = serde_json::from_value(record.doc)
                 .map_err(tinystoragedrivers_types::StorageError::from)?;
-            if operation.writes.len() != expected.len()
+            if operation.default_lifecycle_status != expected_default
+                || operation.writes.len() != expected.len()
                 || operation
                     .writes
                     .iter()
@@ -872,7 +875,7 @@ pub(crate) fn list_chunk_snapshot_with_head(
             // filtered query scans the collection.
             let manifests = load_operation_manifests(&*documents).await?;
             let visible = visible_operations_at_snapshot(&snapshot, &manifests)?;
-            let mut latest = HashMap::<String, (u64, Chunk)>::new();
+            let mut latest = HashMap::<String, (u64, Chunk, Option<String>)>::new();
             let mut query = Query::all().limit(PAGE_SIZE);
             loop {
                 let page = documents.query(CHUNK_VERSIONS, &query).await?;
@@ -904,9 +907,12 @@ pub(crate) fn list_chunk_snapshot_with_head(
                     }
                     let replace = latest
                         .get(&version.logical_id)
-                        .is_none_or(|(revision, _)| version.revision > *revision);
+                        .is_none_or(|(revision, _, _)| version.revision > *revision);
                     if replace {
-                        latest.insert(version.logical_id, (version.revision, version.chunk));
+                        latest.insert(
+                            version.logical_id,
+                            (version.revision, version.chunk, operation.default_lifecycle_status.clone()),
+                        );
                     }
                 }
                 match page.next {
@@ -932,7 +938,7 @@ pub(crate) fn list_chunk_snapshot_with_head(
             ids.extend(legacy.keys().cloned());
             let mut chunks = Vec::with_capacity(ids.len());
             for id in ids {
-                if let Some((_, chunk)) = latest.remove(&id) {
+                if let Some((_, chunk, _)) = latest.remove(&id) {
                     chunks.push(chunk);
                 } else if let Some(value) = legacy.remove(&id) {
                     chunks.push(
@@ -941,9 +947,10 @@ pub(crate) fn list_chunk_snapshot_with_head(
                     );
                 }
             }
-            let states =
+            let mut states =
                 bulk_state_values_at_snapshot(&*documents, &snapshot, &visible, &state_collections)
                     .await?;
+            add_implicit_lifecycle_states(&latest, &mut states);
             let deleted_ids: HashSet<String> = states
                 .get(CHUNK_LIFECYCLE)
                 .into_iter()
@@ -986,7 +993,7 @@ pub(crate) async fn list_chunk_snapshot_with_head_async(
         .run_async(async move {
             let manifests = load_operation_manifests(&*documents).await?;
             let visible = visible_operations_at_snapshot(&read_snapshot, &manifests)?;
-            let mut latest = HashMap::<String, (u64, Chunk)>::new();
+            let mut latest = HashMap::<String, (u64, Chunk, Option<String>)>::new();
             let mut query = Query::all().limit(PAGE_SIZE);
             loop {
                 let page = documents.query(CHUNK_VERSIONS, &query).await?;
@@ -1015,9 +1022,12 @@ pub(crate) async fn list_chunk_snapshot_with_head_async(
                     }
                     if latest
                         .get(&version.logical_id)
-                        .is_none_or(|(revision, _)| version.revision > *revision)
+                        .is_none_or(|(revision, _, _)| version.revision > *revision)
                     {
-                        latest.insert(version.logical_id, (version.revision, version.chunk));
+                        latest.insert(
+                            version.logical_id,
+                            (version.revision, version.chunk, operation.default_lifecycle_status.clone()),
+                        );
                     }
                 }
                 match page.next {
@@ -1042,7 +1052,7 @@ pub(crate) async fn list_chunk_snapshot_with_head_async(
             ids.extend(legacy.keys().cloned());
             let mut chunks = Vec::with_capacity(ids.len());
             for id in ids {
-                if let Some((_, chunk)) = latest.remove(&id) {
+                if let Some((_, chunk, _)) = latest.remove(&id) {
                     chunks.push(chunk);
                 } else if let Some(value) = legacy.remove(&id) {
                     chunks.push(
@@ -1051,13 +1061,14 @@ pub(crate) async fn list_chunk_snapshot_with_head_async(
                     );
                 }
             }
-            let states = bulk_state_values_at_snapshot(
+            let mut states = bulk_state_values_at_snapshot(
                 &*documents,
                 &read_snapshot,
                 &visible,
                 &state_collections,
             )
             .await?;
+            add_implicit_lifecycle_states(&latest, &mut states);
             Ok::<_, tinystoragedrivers_types::StorageError>((chunks, states))
         })
         .await??;
@@ -1353,7 +1364,7 @@ pub(crate) fn commit_if_state_matches(
         if !matches {
             return Ok(false);
         }
-        match upsert_chunks_at(config, &snapshot, chunks, chunks, changes) {
+        match upsert_chunks_at(config, &snapshot, chunks, chunks, changes, None) {
             Ok(_) => return Ok(true),
             Err(error) if is_storage_conflict(&error) => last_conflict = Some(error),
             Err(error) => return Err(error),
@@ -1400,7 +1411,7 @@ pub(crate) async fn commit_if_state_matches_async(
         if !matches {
             return Ok(false);
         }
-        match upsert_chunks_at_async(config, &snapshot, chunks, chunks, changes).await {
+        match upsert_chunks_at_async(config, &snapshot, chunks, chunks, changes, None).await {
             Ok(_) => return Ok(true),
             Err(error) if is_storage_conflict(&error) => last_conflict = Some(error),
             Err(error) => return Err(error),
@@ -1447,7 +1458,7 @@ pub(crate) async fn commit_if_state_matches_at_snapshot_async(
     if !matches || capture_head_async(config).await? != *snapshot {
         return Ok(false);
     }
-    match upsert_chunks_at_async(config, snapshot, chunks, chunks, changes).await {
+    match upsert_chunks_at_async(config, snapshot, chunks, chunks, changes, None).await {
         Ok(_) => Ok(true),
         Err(error) if is_storage_conflict(&error) => Ok(false),
         Err(error) => Err(error),
@@ -1484,7 +1495,7 @@ pub(crate) fn commit_if_state_matches_at_snapshot(
     if !matches || capture_head(config)? != *snapshot {
         return Ok(false);
     }
-    match upsert_chunks_at(config, snapshot, &[], &[], changes) {
+    match upsert_chunks_at(config, snapshot, &[], &[], changes, None) {
         Ok(_) => Ok(true),
         Err(error) if is_storage_conflict(&error) => Ok(false),
         Err(error) => Err(error),
@@ -1792,6 +1803,7 @@ fn visible_operations_at_snapshot(
                     .into_iter()
                     .map(|write| (write.collection, write.key, write.version_id))
                     .collect(),
+                default_lifecycle_status: manifest.default_lifecycle_status,
             },
         )
     }));
@@ -2111,6 +2123,7 @@ fn make_manifest(
     ancestors: Vec<String>,
     chunks: &[Chunk],
     changes: &[StateChange],
+    default_lifecycle_status: Option<&str>,
 ) -> Result<OperationManifest> {
     let mut digest = Sha256::new();
     digest.update(snapshot.op_id.as_deref().unwrap_or("root").as_bytes());
@@ -2120,6 +2133,7 @@ fn make_manifest(
     for change in changes {
         digest.update(serde_json::to_vec(change)?);
     }
+    digest.update(serde_json::to_vec(&default_lifecycle_status)?);
     let op_id = format!("memory-write:{:x}", digest.finalize());
     Ok(OperationManifest {
         op_id: op_id.clone(),
@@ -2141,6 +2155,7 @@ fn make_manifest(
                 version_id: state_version_id(&change.collection, &change.key, &op_id),
             })
             .collect(),
+        default_lifecycle_status: default_lifecycle_status.map(str::to_owned),
     })
 }
 
