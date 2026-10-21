@@ -103,6 +103,40 @@ fn matching_chunks(
     Vec<Chunk>,
     std::collections::HashMap<String, Vec<(String, serde_json::Value)>>,
 )> {
+    matching_chunks_with_extra(config, query, include_details, &[])
+}
+
+pub(crate) fn list_chunks_with_content_state(
+    config: &MemoryConfig,
+    query: &ListChunksQuery,
+) -> Result<(
+    Vec<Chunk>,
+    std::collections::HashMap<String, Vec<(String, serde_json::Value)>>,
+)> {
+    let (mut chunks, states) = matching_chunks_with_extra(
+        config,
+        query,
+        false,
+        &[
+            super::collections::RAW_REFS,
+            super::collections::CHUNK_CONTENT_POINTERS,
+        ],
+    )?;
+    let offset = query.offset.unwrap_or(0).min(chunks.len());
+    let limit = normalized_limit(query.limit) as usize;
+    chunks = chunks.drain(offset..).take(limit).collect();
+    Ok((chunks, states))
+}
+
+fn matching_chunks_with_extra(
+    config: &MemoryConfig,
+    query: &ListChunksQuery,
+    include_details: bool,
+    extra_collections: &[&str],
+) -> Result<(
+    Vec<Chunk>,
+    std::collections::HashMap<String, Vec<(String, serde_json::Value)>>,
+)> {
     let mut collections = Vec::new();
     if query.exclude_dropped || include_details {
         collections.push(super::collections::CHUNK_LIFECYCLE);
@@ -113,6 +147,11 @@ fn matching_chunks(
     if include_details {
         collections.push(super::collections::CHUNK_EMBEDDINGS);
         collections.push(super::collections::CHUNK_CONTENT_POINTERS);
+    }
+    for collection in extra_collections {
+        if !collections.contains(collection) {
+            collections.push(collection);
+        }
     }
     let (mut chunks, states) = super::versioned::list_chunk_snapshot(config, &collections)?;
     let lifecycle = states
