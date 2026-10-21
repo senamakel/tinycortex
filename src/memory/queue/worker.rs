@@ -316,7 +316,7 @@ async fn settle_planned_job_async(
             // Post-seal rechecks are intentionally kept out of this async
             // path until the tree store exposes its owner-state async read.
             // The staged seal/append plan must carry any follow-up intent in
-            // the same CAS; a synchronous SQLite recheck cannot run on a
+            // the same CAS; a synchronous storage read cannot run on a
             // current-thread executor.
             Ok(())
         }

@@ -267,7 +267,7 @@ fn two_failed_rows_sharing_a_dedupe_key(cfg: &MemoryConfig, chunk: &str) -> (Str
 
 /// The production defect: a single blanket `UPDATE … SET status='ready'` over
 /// two failed rows sharing a `dedupe_key` puts both into the partial unique
-/// index at once, SQLite aborts the whole statement, and NOTHING is requeued —
+/// index at once, the owner batch rejects the whole write, and NOTHING is requeued —
 /// forever, on every boot and every 3h self-heal tick.
 ///
 /// The requeue must succeed and requeue the newest row for the key.

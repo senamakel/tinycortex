@@ -142,7 +142,7 @@ async fn scheduler_tick_recovers_an_expired_running_job() {
 fn backoff_classifies_host_io_error_as_long_backoff() {
     let opts = WorkerLoopConfig::default();
     // EIO (raw OS error 5): a persistent host-filesystem failure surfaced as a
-    // std::io::Error, not a SQLite code. It must take the long host-IO arm, not
+    // std::io::Error. It must take the long host-IO arm, not
     // the generic error_backoff.
     let host_io = anyhow::Error::from(std::io::Error::from_raw_os_error(5));
     assert_eq!(backoff_for(&host_io, &opts), Some(opts.host_io_backoff));

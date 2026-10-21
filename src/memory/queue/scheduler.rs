@@ -38,7 +38,7 @@ pub(crate) async fn enqueue_flush_stale_async(config: &MemoryConfig) -> Result<O
 }
 
 /// Requeue jobs that failed for transient reasons (network blips, timeouts,
-/// SQLITE_BUSY) so chunks never sit unprocessed until the next manual sync.
+/// temporary storage unavailability) so chunks never sit unprocessed until the next manual sync.
 /// Unrecoverable failures stay parked. Returns the number requeued.
 ///
 /// This only touches terminally-`failed` rows. It does **not** itself call
