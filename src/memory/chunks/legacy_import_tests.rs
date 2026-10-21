@@ -199,6 +199,16 @@ async fn typed_import_commits_chunk_adjuncts_tree_entities_and_jobs_together() {
     .await
     .unwrap()
     .is_some());
+    assert_eq!(
+        super::super::get_chunk_embedding_for_signature_async(
+            &config,
+            &chunk_id,
+            "fixture/model@1"
+        )
+        .await
+        .unwrap(),
+        Some(vec![0.25, 0.5])
+    );
     assert!(super::super::versioned::read_state_async(
         &config,
         c::CHUNK_EMBEDDINGS,
