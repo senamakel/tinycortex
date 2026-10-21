@@ -371,7 +371,7 @@ impl VectorStore {
                 return Ok(0);
             }
             match self.documents.atomic_batch(ops).await {
-                Ok(()) => return Ok(inserted),
+                Ok(_) => return Ok(inserted),
                 Err(error) if error.kind() == tinystoragedrivers_types::ErrorKind::Conflict => {
                     // A concurrent identical importer may have won. Re-read
                     // and compare all affected rows before accepting a retry.
