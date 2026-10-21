@@ -5,9 +5,9 @@ use chrono::{DateTime, Utc};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Row};
 use tinycortex::memory::{
     chunks::{
-        self, Chunk, LegacyChunkRecord, LegacyContentPointer, LegacyEmbedding,
-        LegacyEntityEdge, LegacyEntityOccurrence, LegacyImportBatch, LegacySourceGate,
-        LegacySummaryContent, LegacySummaryEmbedding, RawRef, SourceKind,
+        self, Chunk, LegacyChunkRecord, LegacyContentPointer, LegacyEmbedding, LegacyEntityEdge,
+        LegacyEntityOccurrence, LegacyImportBatch, LegacySourceGate, LegacySummaryContent,
+        LegacySummaryEmbedding, RawRef, SourceKind,
     },
     config::MemoryConfig,
     graph,
@@ -24,7 +24,7 @@ const FIXTURE: &str = "fixtures/legacy-v0.1.3-extended-public-writer/memory_tree
 
 /// Import an authentic v0.1.3 database through the typed owner API and verify
 /// every populated record family through the current public readers.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn extended_v013_public_writer_batch_imports_and_reads_back() -> Result<()> {
     let fixture_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(FIXTURE);
     let batch = read_legacy_batch(&fixture_root)?;
@@ -58,15 +58,23 @@ async fn extended_v013_public_writer_batch_imports_and_reads_back() -> Result<()
     assert_eq!(imported.jobs, 1);
 
     let source_chunk = &batch.chunks[0];
-    let actual_chunk = chunks::get_chunk(&config, &source_chunk.chunk.id)?.context("chunk missing")?;
+    let actual_chunk =
+        chunks::get_chunk(&config, &source_chunk.chunk.id)?.context("chunk missing")?;
     assert_eq!(actual_chunk, source_chunk.chunk);
-    assert_eq!(read_chunk_body(&config, &actual_chunk.id)?, actual_chunk.content);
-    let pointer = source_chunk.content.as_ref().context("chunk pointer missing")?;
+    assert_eq!(
+        read_chunk_body(&config, &actual_chunk.id)?,
+        actual_chunk.content
+    );
+    let pointer = source_chunk
+        .content
+        .as_ref()
+        .context("chunk pointer missing")?;
     assert_eq!(
         chunks::get_chunk_content_pointers(&config, &actual_chunk.id)?,
         Some((pointer.path.clone(), pointer.sha256.clone()))
     );
-    let actual_raw_refs = chunks::get_chunk_raw_refs(&config, &actual_chunk.id)?.unwrap_or_default();
+    let actual_raw_refs =
+        chunks::get_chunk_raw_refs(&config, &actual_chunk.id)?.unwrap_or_default();
     assert_eq!(actual_raw_refs, source_chunk.raw_refs);
     assert_eq!(
         chunks::get_chunk_lifecycle_status(&config, &actual_chunk.id)?,
@@ -74,18 +82,24 @@ async fn extended_v013_public_writer_batch_imports_and_reads_back() -> Result<()
     );
 
     let source_score = source_chunk.score.as_ref().context("score missing")?;
-    let actual_score = score::store::get_score(&config, &actual_chunk.id)?
-        .context("score did not import")?;
+    let actual_score =
+        score::store::get_score(&config, &actual_chunk.id)?.context("score did not import")?;
     assert_score_eq(&actual_score, source_score);
 
     let source_tree = &batch.trees[0];
-    assert_eq!(tree::store::get_tree(&config, &source_tree.id)?, Some(source_tree.clone()));
+    assert_eq!(
+        tree::store::get_tree(&config, &source_tree.id)?,
+        Some(source_tree.clone())
+    );
     let source_summary = &batch.summaries[0];
     assert_eq!(
         tree::store::get_summary(&config, &source_summary.id)?,
         Some(source_summary.clone())
     );
-    assert_eq!(read_summary_body(&config, &source_summary.id)?, source_summary.content);
+    assert_eq!(
+        read_summary_body(&config, &source_summary.id)?,
+        source_summary.content
+    );
     let summary_pointer = batch
         .summary_content
         .iter()
@@ -112,7 +126,10 @@ async fn extended_v013_public_writer_batch_imports_and_reads_back() -> Result<()
             .find(|hit| hit.node_id == source_occurrence.node_id)
             .context("entity occurrence did not import")?;
         assert_eq!(imported_hit.node_kind, source_occurrence.node_kind);
-        assert_eq!(imported_hit.entity_kind.as_str(), source_occurrence.entity_kind);
+        assert_eq!(
+            imported_hit.entity_kind.as_str(),
+            source_occurrence.entity_kind
+        );
         assert_eq!(imported_hit.surface, source_occurrence.surface);
         assert_eq!(imported_hit.score, source_occurrence.score);
         assert_eq!(imported_hit.timestamp_ms, source_occurrence.timestamp_ms);
@@ -240,7 +257,10 @@ fn read_legacy_batch(root: &Path) -> Result<LegacyImportBatch> {
                 score: row.get(12)?,
                 sealed_at: datetime(row.get(13)?).map_err(to_sql_error)?,
                 deleted: row.get::<_, i64>(14)? != 0,
-                embedding: embedding.map(decode_f32).transpose().map_err(to_sql_error)?,
+                embedding: embedding
+                    .map(decode_f32)
+                    .transpose()
+                    .map_err(to_sql_error)?,
                 doc_id: row.get(16)?,
                 version_ms: row.get(17)?,
             })
@@ -356,7 +376,14 @@ fn read_legacy_batch(root: &Path) -> Result<LegacyImportBatch> {
     Ok(batch)
 }
 
-fn read_chunk(row: &Row<'_>) -> rusqlite::Result<(Chunk, Option<LegacyContentPointer>, Vec<RawRef>, Option<String>)> {
+fn read_chunk(
+    row: &Row<'_>,
+) -> rusqlite::Result<(
+    Chunk,
+    Option<LegacyContentPointer>,
+    Vec<RawRef>,
+    Option<String>,
+)> {
     let source_kind = SourceKind::parse(&row.get::<_, String>(1)?).map_err(to_sql_error)?;
     let timestamp_ms: i64 = row.get(6)?;
     let source_ref: Option<String> = row.get(4)?;
@@ -420,10 +447,16 @@ fn assert_score_eq(actual: &ScoreRow, expected: &ScoreRow) {
     assert_eq!(actual.total, expected.total);
     assert_eq!(actual.signals.token_count, expected.signals.token_count);
     assert_eq!(actual.signals.unique_words, expected.signals.unique_words);
-    assert_eq!(actual.signals.metadata_weight, expected.signals.metadata_weight);
+    assert_eq!(
+        actual.signals.metadata_weight,
+        expected.signals.metadata_weight
+    );
     assert_eq!(actual.signals.source_weight, expected.signals.source_weight);
     assert_eq!(actual.signals.interaction, expected.signals.interaction);
-    assert_eq!(actual.signals.entity_density, expected.signals.entity_density);
+    assert_eq!(
+        actual.signals.entity_density,
+        expected.signals.entity_density
+    );
     assert_eq!(actual.dropped, expected.dropped);
     assert_eq!(actual.reason, expected.reason);
     assert_eq!(actual.computed_at_ms, expected.computed_at_ms);
@@ -435,7 +468,10 @@ fn datetime(timestamp_ms: i64) -> Result<DateTime<Utc>> {
 }
 
 fn decode_f32(bytes: Vec<u8>) -> Result<Vec<f32>> {
-    anyhow::ensure!(bytes.len() % 4 == 0, "legacy embedding byte length is not divisible by four");
+    anyhow::ensure!(
+        bytes.len() % 4 == 0,
+        "legacy embedding byte length is not divisible by four"
+    );
     Ok(bytes
         .chunks_exact(4)
         .map(|part| f32::from_le_bytes([part[0], part[1], part[2], part[3]]))
